@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+langgraph
+langchain
+chromadb
+groq
+arize-phoenix
+ragas
+streamlit
+faker
