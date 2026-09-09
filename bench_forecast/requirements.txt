@@ -1,11 +1,33 @@
-fastapi
-uvicorn
-pydantic
-langgraph
-langchain
-chromadb
-groq
-arize-phoenix
-ragas
-streamlit
-faker
+# Core Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# LangChain & Agents
+langgraph>=0.0.60
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-groq>=0.1.0
+langchain-ollama>=0.1.0
+
+# Vector & Search
+chromadb>=0.4.0
+
+# LLM Providers
+groq>=0.4.0
+ollama>=0.1.0
+
+# Observability
+arize-phoenix>=3.0.0
+
+# Evaluation & Testing
+ragas>=0.1.0
+
+# Frontend (Person 2, but included for completeness)
+streamlit>=1.28.0
+
+# Utilities
+python-dotenv>=1.0.0
+faker>=20.0.0
+
