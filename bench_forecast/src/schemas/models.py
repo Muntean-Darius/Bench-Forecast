@@ -5,19 +5,20 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 class Employee(BaseModel):
     """Employee record with skills and availability."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     id: str = Field(..., min_length=1, description="Unique employee ID")
     name: str = Field(..., min_length=1, description="Employee name")
     skills: List[str] = Field(default_factory=list, description="List of technical skills")
     current_project: Optional[str] = Field(None, description="Current project assignment")
-    available_from: date = Field(..., description="Date when employee becomes available")
+    available_from: date = Field(..., description="Date when employee becomes available (forecast trigger)")
     experience_years: float = Field(..., ge=0, description="Years of experience")
+    cost_rate: Optional[float] = Field(None, ge=0, description="Hourly cost rate in EUR")
     profile_text: Optional[str] = Field(None, description="Unstructured CV/profile for RAG")
 
     @field_validator("skills")
@@ -29,19 +30,24 @@ class Employee(BaseModel):
 
 class Demand(BaseModel):
     """Open role/project demand."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     id: str = Field(..., min_length=1, description="Unique demand ID")
     role: str = Field(..., min_length=1, description="Job title/role name")
     required_skills: List[str] = Field(default_factory=list, description="Required skills")
     project_id: str = Field(..., min_length=1, description="Project identifier")
     start_date: date = Field(..., description="Role start date")
     headcount: int = Field(default=1, ge=1, description="Number of positions available")
+    # win_probability filters high-confidence pipeline opportunities
+    win_probability: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="Pipeline win probability [0.0, 1.0] — filter low-confidence deals"
+    )
     description: Optional[str] = Field(None, description="Unstructured role description for RAG")
 
     @field_validator("required_skills")
@@ -53,13 +59,13 @@ class Demand(BaseModel):
 
 class MatchJustification(BaseModel):
     """AI-generated justification for a skill match (enforced JSON from LLM)."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     employee_id: str = Field(..., description="Matched employee ID")
     demand_id: str = Field(..., description="Matched demand ID")
     match_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score [0.0, 1.0]")
@@ -68,17 +74,21 @@ class MatchJustification(BaseModel):
     training_recommendation: Optional[str] = Field(
         None, description="Suggested training if applicable"
     )
+    rag_passages: List[str] = Field(
+        default_factory=list,
+        description="Retrieved ChromaDB passages that grounded this match decision"
+    )
 
 
 class Reallocation(BaseModel):
     """Approved reallocation action."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     employee_id: str = Field(..., min_length=1)
     target_project_id: str = Field(..., min_length=1)
     role: str = Field(..., min_length=1)
@@ -87,13 +97,13 @@ class Reallocation(BaseModel):
 
 class Training(BaseModel):
     """Proposed training intervention."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     employee_id: str = Field(..., min_length=1)
     target_skills: List[str] = Field(default_factory=list, min_length=1)
     duration_weeks: int = Field(..., ge=1, le=52)
@@ -101,13 +111,13 @@ class Training(BaseModel):
 
 class Hiring(BaseModel):
     """Required new hire specification."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     role: str = Field(..., min_length=1)
     required_skills: List[str] = Field(default_factory=list, min_length=1)
     headcount: int = Field(..., ge=1)
@@ -115,21 +125,23 @@ class Hiring(BaseModel):
 
 class AllocationRecommendation(BaseModel):
     """Complete allocation forecast recommendation (output of planning node)."""
-    
+
     model_config = ConfigDict(
         strict=True,
         validate_assignment=True,
         extra="forbid"
     )
-    
+
     recommendation_id: str = Field(default_factory=lambda: __import__("uuid").uuid4().hex)
     reallocations: List[Reallocation] = Field(default_factory=list)
     trainings: List[Training] = Field(default_factory=list)
     hirings: List[Hiring] = Field(default_factory=list)
     confidence_score: float = Field(..., ge=0.0, le=1.0)
     reasoning: str = Field(..., min_length=20)
+    # Tracks revision history for HITL feedback loop
+    revision_note: Optional[str] = Field(
+        None, description="Manager feedback that triggered this revision (if any)"
+    )
     created_at: str = Field(
         default_factory=lambda: __import__("datetime").datetime.utcnow().isoformat()
     )
-
-

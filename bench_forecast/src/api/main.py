@@ -1,74 +1,99 @@
 """FastAPI backend for Bench Forecast allocation recommendations.
 
-Three core endpoints:
-1. POST /api/v1/forecast/generate - Run forecast workflow and pause for human review
-2. POST /api/v1/forecast/execute - Resume workflow with human approval/rejection
-3. POST /api/v1/forecast/feedback - Submit human review feedback
+Endpoints:
+1. POST /api/v1/forecast/generate  — Run forecast workflow; pause for human review
+2. POST /api/v1/forecast/execute   — Resume: approve (→ DB) or reject with feedback (→ revise)
+3. POST /api/v1/forecast/feedback  — Submit audit notes
+4. GET  /api/v1/health             — Health check
 
-The workflow pauses after forecast planning, allowing a human manager to review
-recommendations before execution updates the database.
+New features:
+- horizon_days: configurable forecast window (default 90d)
+- min_win_probability: pipeline filter threshold (default 0.75)
+- HITL rejection feedback: manager's feedback triggers LLM revision instead of terminating
 """
 
 import logging
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
+from langgraph.types import Command
 
 from src.core.config import Config
 from src.core.tracing import setup_phoenix_tracing, get_tracer
-from src.schemas.models import AllocationRecommendation
 from src.agents.graph import build_forecast_graph
+from src.database.vector_store import VectorStoreManager
 
 
 logger = logging.getLogger(__name__)
 
-
-# Initialize FastAPI app
 app = FastAPI(
     title="Bench Forecast API",
-    version="1.0.0",
-    description="Agentic workforce allocation recommendation engine",
+    version="2.0.0",
+    description="Agentic workforce allocation engine with RAG matching and HITL feedback loop",
 )
 
-# Initialize tracing
 setup_phoenix_tracing()
 
-# Build and compile the LangGraph workflow at startup
+# Compiled workflow — interrupt_before=["human_review"] for true HITL pause/resume
 FORECAST_GRAPH = build_forecast_graph()
 
-# Store active workflows by thread_id for pause/resume capability
-ACTIVE_WORKFLOWS: Dict[str, Dict[str, Any]] = {}
+# recommendation_id → thread_id mapping so UI can resume by rec_id
+RECOMMENDATION_THREAD_MAP: Dict[str, str] = {}
 
+
+# ---------------------------------------------------------------------------
+# Request / Response schemas
+# ---------------------------------------------------------------------------
 
 class GenerateForecastRequest(BaseModel):
     """Request to generate a forecast."""
     department_id: str = Field(default="ALL", description="Department to forecast for")
     thread_id: str = Field(
         default_factory=lambda: __import__("uuid").uuid4().hex,
-        description="Unique thread ID for this workflow invocation (for pause/resume)",
+        description="Unique thread ID for this workflow invocation",
+    )
+    horizon_days: int = Field(
+        default=90, ge=30, le=365,
+        description="Forecast horizon in days — employees finishing projects within this window",
+    )
+    min_win_probability: float = Field(
+        default=0.75, ge=0.0, le=1.0,
+        description="Minimum pipeline win probability to include a demand in matching",
     )
 
 
 class ExecuteForecastRequest(BaseModel):
-    """Request to execute an approved forecast."""
-    recommendation_id: str = Field(..., description="Recommendation ID to execute")
-    thread_id: str = Field(..., description="Thread ID of the paused workflow")
-    approved: bool = Field(..., description="Whether human approved the recommendation")
+    """Request to execute or reject an approved forecast."""
+    recommendation_id: str = Field(..., description="Recommendation ID to act on")
+    thread_id: str = Field(default="", description="Thread ID of the paused workflow")
+    approved: bool = Field(..., description="True = approve and execute; False = reject")
     approver_name: str = Field(default="unknown", description="Name of human reviewer")
+    rejection_feedback: Optional[str] = Field(
+        default=None,
+        description=(
+            "Manager's reason for rejection and guidance for revision. "
+            "Required when approved=False if you want a revised plan instead of termination."
+        ),
+    )
 
 
 class FeedbackRequest(BaseModel):
-    """Submit feedback on a recommendation."""
+    """Submit audit notes on a recommendation."""
     recommendation_id: str = Field(..., description="Recommendation ID")
     feedback: str = Field(..., description="Human feedback/review notes")
     approved: bool = Field(default=False, description="Whether feedback is approval")
 
 
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
 @app.on_event("startup")
 async def startup():
-    """Initialize on app startup."""
+    """Initialize on app startup: validate config and auto-seed ChromaDB."""
     logger.info("=" * 60)
-    logger.info("🚀 Bench Forecast API Starting")
+    logger.info("🚀 Bench Forecast API v2.0 Starting")
     logger.info("=" * 60)
     logger.info(f"LLM Provider: {Config.LLM_PROVIDER}")
     if Config.LLM_PROVIDER == "groq":
@@ -80,6 +105,25 @@ async def startup():
     logger.info("=" * 60)
     Config.validate()
 
+    # Auto-seed ChromaDB from mock_data.json if empty
+    try:
+        mock_data_path = Path(__file__).resolve().parents[2] / "data" / "mock_data.json"
+        if mock_data_path.exists():
+            vector_mgr = VectorStoreManager()
+            if vector_mgr.collection.count() == 0:
+                count = vector_mgr.load_and_index_mock_data(str(mock_data_path))
+                logger.info(f"✓ ChromaDB auto-seeded: {count} employee profiles indexed")
+            else:
+                logger.info(f"✓ ChromaDB already seeded ({vector_mgr.collection.count()} profiles)")
+        else:
+            logger.warning(f"mock_data.json not found at {mock_data_path}")
+    except Exception as e:
+        logger.warning(f"ChromaDB seeding failed (non-fatal): {e}")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/forecast/generate
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/api/v1/forecast/generate",
@@ -87,24 +131,19 @@ async def startup():
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def generate_forecast(payload: GenerateForecastRequest):
-    """Trigger agentic bench forecast generation and pause for human review.
-    
-    This endpoint:
-    1. Runs the workflow through forecast planning
-    2. Pauses before execution (HITL breakpoint)
-    3. Returns recommendations for human review
-    4. Stores workflow state for resume via /execute
-    
-    Args:
-        payload: GenerateForecastRequest with department_id and thread_id
-        
-    Returns:
-        HTTP 202 (Accepted) with recommendations and thread_id for later execution
+    """Run the forecast workflow and pause for human review.
+
+    Streams data_extractor → skill_matcher (RAG) → forecast_planner,
+    then pauses natively at interrupt_before=["human_review"].
+
+    Returns HTTP 202 with recommendations and thread_id for later /execute call.
     """
-    logger.info(f"📊 GENERATE FORECAST: thread_id={payload.thread_id}")
-    
+    logger.info(
+        f"📊 GENERATE FORECAST: thread_id={payload.thread_id} "
+        f"horizon={payload.horizon_days}d win_prob>={payload.min_win_probability:.0%}"
+    )
+
     try:
-        # Stream the workflow until it pauses (before execution node)
         input_state = {
             "employees": [],
             "demands": [],
@@ -112,53 +151,56 @@ async def generate_forecast(payload: GenerateForecastRequest):
             "recommendations": None,
             "human_approved": False,
             "human_feedback": None,
+            "rejection_feedback": None,
+            "revision_count": 0,
             "execution_status": None,
+            # Pass config params into state for data_extractor_node to read
+            "horizon_days": payload.horizon_days,
+            "min_win_probability": payload.min_win_probability,
         }
-        
-        # Use streaming to run until pause
+
+        cfg = {"configurable": {"thread_id": payload.thread_id}}
         final_state = None
-        for output in FORECAST_GRAPH.stream(
-            input_state,
-            config={"configurable": {"thread_id": payload.thread_id}},
-        ):
-            logger.debug(f"  Step: {output}")
-            final_state = output
-        
+        for chunk in FORECAST_GRAPH.stream(input_state, config=cfg, stream_mode="values"):
+            logger.debug(f"  Stream chunk: {list(chunk.keys())}")
+            final_state = chunk
+
         if not final_state:
             raise ValueError("Workflow produced no output")
-        
-        # Extract the actual state dictionary from the streaming output
-        # LangGraph stream returns a dict of {node_name: state_update}
-        state_update = final_state[list(final_state.keys())[-1]] if final_state else {}
-        
-        # Merge with existing workflow state
-        workflow_state = {**input_state, **state_update}
-        
-        # Store workflow state for later execution
-        ACTIVE_WORKFLOWS[payload.thread_id] = workflow_state
-        
-        recommendations = workflow_state.get("recommendations", {})
-        
+
+        recommendations = final_state.get("recommendations") or {}
+        rec_id = recommendations.get("recommendation_id", "unknown")
+
+        # Store mapping for UI to resolve thread_id by rec_id
+        RECOMMENDATION_THREAD_MAP[rec_id] = payload.thread_id
+
         logger.info(
-            f"✓ Forecast generated: {len(recommendations.get('reallocations', []))} reallocations, "
-            f"paused for human review (thread_id={payload.thread_id})"
+            f"✓ Forecast paused for review: "
+            f"{len(recommendations.get('reallocations', []))} reallocations "
+            f"(thread_id={payload.thread_id}, rec_id={rec_id})"
         )
-        
+
         return {
             "status": "paused_for_review",
             "thread_id": payload.thread_id,
-            "recommendation_id": recommendations.get("recommendation_id", "unknown"),
+            "recommendation_id": rec_id,
+            "horizon_days": payload.horizon_days,
+            "min_win_probability": payload.min_win_probability,
             "recommendations": recommendations,
-            "next_step": "POST /api/v1/forecast/execute with approval decision",
+            "next_step": "POST /api/v1/forecast/execute — set approved=true to commit or approved=false with rejection_feedback to revise",
         }
-        
+
     except Exception as e:
-        logger.error(f"✗ Forecast generation failed: {e}")
+        logger.error(f"✗ Forecast generation failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Forecast generation failed: {str(e)}",
         )
 
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/forecast/execute
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/api/v1/forecast/execute",
@@ -166,80 +208,128 @@ async def generate_forecast(payload: GenerateForecastRequest):
     status_code=status.HTTP_200_OK,
 )
 async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
-    """Execute approved allocation actions (resume paused workflow).
-    
-    This endpoint:
-    1. Resumes the workflow from the HITL pause point
-    2. Sets human_approved flag based on approval decision
-    3. Continues to execution node
-    4. Returns execution status and audit trail
-    
-    This is where human approval flows into deterministic database updates.
-    
-    Args:
-        payload: ExecuteForecastRequest with thread_id and approval decision
-        
-    Returns:
-        Execution status and results
+    """Resume the paused workflow with an approval or rejection decision.
+
+    Approval (approved=True):
+        → Runs execution_engine_node → writes to SQLite → returns "completed"
+
+    Rejection with feedback (approved=False + rejection_feedback):
+        → Runs revision_planner_node (LLM generates revised plan)
+        → Pauses again at human_review interrupt
+        → Returns "revised_for_review" with new recommendations
+
+    Rejection without feedback (approved=False, no rejection_feedback):
+        → Routes to END with no DB writes
+        → Returns "rejected_terminated"
     """
     logger.info(
-        f"⚡ EXECUTE FORECAST: thread_id={payload.thread_id}, "
-        f"approved={payload.approved}, approver={payload.approver_name}"
+        f"⚡ EXECUTE FORECAST: rec_id={payload.recommendation_id} "
+        f"approved={payload.approved} approver={payload.approver_name}"
     )
-    
+
     try:
-        # Retrieve paused workflow state
-        if payload.thread_id not in ACTIVE_WORKFLOWS:
+        # Resolve thread_id from rec_id if not provided
+        thread_id = payload.thread_id
+        if not thread_id and payload.recommendation_id in RECOMMENDATION_THREAD_MAP:
+            thread_id = RECOMMENDATION_THREAD_MAP[payload.recommendation_id]
+            logger.info(f"  Resolved thread_id={thread_id} from rec_id")
+
+        if not thread_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No active workflow with thread_id={payload.thread_id}. "
-                f"Call /generate first.",
+                detail=(
+                    f"No active workflow for recommendation_id={payload.recommendation_id}. "
+                    "Call /generate first."
+                ),
             )
-        
-        workflow_state = ACTIVE_WORKFLOWS[payload.thread_id]
-        
-        # Set human approval flag and feedback
-        workflow_state["human_approved"] = payload.approved
-        workflow_state["human_feedback"] = payload.approver_name
-        
+
         tracer = get_tracer()
         tracer.log_allocation_decision(
             recommendation_id=payload.recommendation_id,
             approved=payload.approved,
             approver=payload.approver_name,
         )
-        
-        # Resume workflow (will execute only if approved)
-        for output in FORECAST_GRAPH.stream(
-            workflow_state,
-            config={"configurable": {"thread_id": payload.thread_id}},
-        ):
-            logger.debug(f"  Resume step: {output}")
-            workflow_state = {**workflow_state, **output[list(output.keys())[-1]]}
-        
-        execution_status = workflow_state.get("execution_status", "unknown")
-        
-        logger.info(f"✓ Execution complete: {execution_status}")
-        
-        # Clean up workflow state
-        del ACTIVE_WORKFLOWS[payload.thread_id]
-        
-        return {
-            "status": "completed",
-            "approved": payload.approved,
-            "execution_status": execution_status,
-            "recommendations": workflow_state.get("recommendations", {}),
+
+        cfg = {"configurable": {"thread_id": thread_id}}
+
+        # Build resume payload — LangGraph merges this into state before human_review_node runs
+        resume_payload: Dict[str, Any] = {
+            "human_approved": payload.approved,
+            "human_feedback": payload.approver_name,
         }
-        
+        if not payload.approved and payload.rejection_feedback:
+            resume_payload["rejection_feedback"] = payload.rejection_feedback
+
+        final_state = None
+        for chunk in FORECAST_GRAPH.stream(
+            Command(resume=resume_payload),
+            config=cfg,
+            stream_mode="values",
+        ):
+            logger.debug(f"  Resume chunk: {list(chunk.keys())}")
+            final_state = chunk
+
+        if not final_state:
+            raise ValueError("Resume produced no output")
+
+        execution_status = final_state.get("execution_status")
+        new_recommendations = final_state.get("recommendations", {})
+        new_rec_id = new_recommendations.get("recommendation_id", "unknown")
+
+        # Determine response based on what happened
+        if payload.approved:
+            # Workflow completed — clean up
+            RECOMMENDATION_THREAD_MAP.pop(payload.recommendation_id, None)
+            logger.info(f"✓ Execution complete: {execution_status}")
+            return {
+                "status": "completed",
+                "approved": True,
+                "execution_status": execution_status,
+                "recommendations": new_recommendations,
+            }
+
+        elif payload.rejection_feedback and final_state.get("revision_count", 0) > 0:
+            # Revision generated — graph paused again; update thread mapping
+            RECOMMENDATION_THREAD_MAP.pop(payload.recommendation_id, None)
+            RECOMMENDATION_THREAD_MAP[new_rec_id] = thread_id
+            logger.info(
+                f"✓ Revision complete: new rec_id={new_rec_id} "
+                f"(revision {final_state.get('revision_count')}/2)"
+            )
+            return {
+                "status": "revised_for_review",
+                "thread_id": thread_id,
+                "recommendation_id": new_rec_id,
+                "revision_count": final_state.get("revision_count", 1),
+                "revision_feedback_applied": payload.rejection_feedback,
+                "recommendations": new_recommendations,
+                "next_step": "POST /api/v1/forecast/execute with new recommendation_id",
+            }
+
+        else:
+            # Rejected with no feedback — terminated
+            RECOMMENDATION_THREAD_MAP.pop(payload.recommendation_id, None)
+            logger.info("✓ Workflow terminated (rejected, no feedback)")
+            return {
+                "status": "rejected_terminated",
+                "approved": False,
+                "execution_status": "skipped_no_approval",
+                "recommendations": new_recommendations,
+            }
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"✗ Execution failed: {e}")
+        logger.error(f"✗ Execution failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Execution failed: {str(e)}",
         )
 
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/forecast/feedback
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/api/v1/forecast/feedback",
@@ -247,22 +337,10 @@ async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
     status_code=status.HTTP_200_OK,
 )
 async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
-    """Submit human-in-the-loop review feedback and decision.
-    
-    This is an alternative endpoint for storing feedback before execution.
-    Can be used by the Streamlit UI to capture human reasoning.
-    
-    Args:
-        payload: FeedbackRequest with recommendation_id and feedback text
-        
-    Returns:
-        Feedback confirmation
-    """
+    """Submit audit notes on a recommendation (separate from HITL decision)."""
     logger.info(
-        f"💬 FEEDBACK: recommendation_id={payload.recommendation_id}, "
-        f"approved={payload.approved}"
+        f"💬 FEEDBACK: recommendation_id={payload.recommendation_id} approved={payload.approved}"
     )
-    
     try:
         tracer = get_tracer()
         tracer.log_allocation_decision(
@@ -270,14 +348,12 @@ async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
             approved=payload.approved,
             approver="feedback_api",
         )
-        
         return {
             "status": "feedback_recorded",
             "recommendation_id": payload.recommendation_id,
             "approved": payload.approved,
             "feedback_length": len(payload.feedback),
         }
-        
     except Exception as e:
         logger.error(f"✗ Feedback submission failed: {e}")
         raise HTTPException(
@@ -286,29 +362,37 @@ async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
         )
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/health  &  GET /
+# ---------------------------------------------------------------------------
+
 @app.get("/api/v1/health", status_code=status.HTTP_200_OK)
 async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy",
+        "version": "2.0.0",
         "llm_provider": Config.LLM_PROVIDER,
         "phoenix_enabled": Config.ENABLE_PHOENIX,
+        "active_workflows": len(RECOMMENDATION_THREAD_MAP),
     }
 
 
 @app.get("/", status_code=status.HTTP_200_OK)
 async def root():
-    """Root endpoint with API documentation."""
+    """Root endpoint with API overview."""
     return {
         "title": "Bench Forecast API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
-            "generate": "POST /api/v1/forecast/generate - Start forecast workflow",
-            "execute": "POST /api/v1/forecast/execute - Execute approved allocations",
-            "feedback": "POST /api/v1/forecast/feedback - Submit human feedback",
-            "health": "GET /api/v1/health - Health check",
-            "docs": "GET /docs - Interactive API documentation (Swagger UI)",
+            "generate": "POST /api/v1/forecast/generate — Start forecast (horizon_days, min_win_probability)",
+            "execute":  "POST /api/v1/forecast/execute  — Approve (→ DB) or Reject+feedback (→ revise)",
+            "feedback": "POST /api/v1/forecast/feedback — Submit audit notes",
+            "health":   "GET  /api/v1/health            — Health check",
+            "docs":     "GET  /docs                     — Swagger UI",
         },
-        "workflow": "data_extractor → skill_matcher → forecast_planner → [PAUSE] → execution_engine",
+        "workflow": (
+            "data_extractor[horizon] → skill_matcher[RAG] → forecast_planner → "
+            "[INTERRUPT] → human_review → {execute | revise+loop | end}"
+        ),
     }
-
