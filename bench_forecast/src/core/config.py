@@ -7,7 +7,14 @@ Handles environment variables with sensible defaults:
 """
 
 import os
+from pathlib import Path
 from typing import Literal
+
+from dotenv import load_dotenv
+
+# Load .env from the bench_forecast directory (one level above src/)
+_env_path = Path(__file__).resolve().parents[2] / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 
 class Config:
