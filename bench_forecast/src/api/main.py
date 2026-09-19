@@ -363,6 +363,31 @@ async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/v1/employees & GET /api/v1/demands
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/employees", status_code=status.HTTP_200_OK)
+async def get_employees(horizon_days: int = 90):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_bench_forecast(horizon_days=horizon_days)
+    except Exception as e:
+        logger.error(f"Failed to fetch employees: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/demands", status_code=status.HTTP_200_OK)
+async def get_demands(min_win_probability: float = 0.75):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_open_demands(min_win_probability=min_win_probability)
+    except Exception as e:
+        logger.error(f"Failed to fetch demands: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
 # GET /api/v1/health  &  GET /
 # ---------------------------------------------------------------------------
 

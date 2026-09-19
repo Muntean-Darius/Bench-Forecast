@@ -1,0 +1,117 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+    font-feature-settings: "kern" 1, "liga" 1;
+  }
+
+  /* Tabular numerics for all mono-font spans */
+  .tabnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+}
+
+@layer components {
+  /* ─── Card shell ─────────────────────────────────────────── */
+  .card {
+    @apply bg-white border border-gray-200 rounded-none;
+  }
+
+  /* ─── Table base ─────────────────────────────────────────── */
+  .data-table {
+    @apply w-full text-sm border-collapse;
+  }
+  .data-table thead th {
+    @apply px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider
+           border-b border-gray-200 bg-gray-50 select-none whitespace-nowrap;
+  }
+  .data-table tbody td {
+    @apply px-3 py-2.5 border-b border-gray-100 text-gray-800;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr:hover td {
+    @apply bg-gray-50;
+  }
+
+  /* ─── Status badges ──────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium font-mono;
+  }
+  .badge-green  { @apply bg-green-50  text-green-700  ring-1 ring-green-200; }
+  .badge-yellow { @apply bg-yellow-50 text-yellow-700 ring-1 ring-yellow-200; }
+  .badge-red    { @apply bg-red-50    text-red-700    ring-1 ring-red-200; }
+  .badge-blue   { @apply bg-blue-50   text-blue-700   ring-1 ring-blue-200; }
+  .badge-gray   { @apply bg-gray-100  text-gray-600   ring-1 ring-gray-200; }
+
+  /* ─── KPI card ───────────────────────────────────────────── */
+  .kpi-card {
+    @apply card p-5 flex flex-col gap-1;
+  }
+  .kpi-value {
+    @apply text-2xl font-semibold tabnum tracking-tight;
+  }
+  .kpi-label {
+    @apply text-xs font-medium text-gray-500 uppercase tracking-wider;
+  }
+  .kpi-delta {
+    @apply text-xs font-mono;
+  }
+
+  /* ─── Button variants ────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium
+           rounded border transition-colors focus-visible:outline-none
+           focus-visible:ring-2 focus-visible:ring-offset-1 disabled:opacity-50 disabled:pointer-events-none;
+  }
+  .btn-primary {
+    @apply btn bg-gray-900 text-white border-gray-900
+           hover:bg-gray-700 hover:border-gray-700
+           focus-visible:ring-gray-900;
+  }
+  .btn-success {
+    @apply btn bg-green-700 text-white border-green-700
+           hover:bg-green-800 hover:border-green-800
+           focus-visible:ring-green-700;
+  }
+  .btn-warning {
+    @apply btn bg-yellow-600 text-white border-yellow-600
+           hover:bg-yellow-700 hover:border-yellow-700
+           focus-visible:ring-yellow-600;
+  }
+  .btn-danger {
+    @apply btn bg-red-600 text-white border-red-600
+           hover:bg-red-700 hover:border-red-700
+           focus-visible:ring-red-600;
+  }
+  .btn-ghost {
+    @apply btn bg-transparent text-gray-600 border-gray-200
+           hover:bg-gray-100 hover:text-gray-900
+           focus-visible:ring-gray-400;
+  }
+
+  /* ─── Nav item ───────────────────────────────────────────── */
+  .nav-item {
+    @apply flex items-center gap-3 px-3 py-2.5 text-sm font-medium text-gray-600
+           rounded transition-colors cursor-pointer select-none
+           hover:bg-gray-100 hover:text-gray-900;
+  }
+  .nav-item.active {
+    @apply bg-gray-900 text-white hover:bg-gray-800 hover:text-white;
+  }
+
+  /* ─── Section header ─────────────────────────────────────── */
+  .section-header {
+    @apply flex items-center justify-between px-4 py-3 border-b border-gray-200;
+  }
+  .section-title {
+    @apply text-sm font-semibold text-gray-800 tracking-tight;
+  }
+}
