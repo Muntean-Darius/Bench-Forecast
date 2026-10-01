@@ -75,9 +75,20 @@ def _log_state_exit(node_name: str, updates: Dict[str, Any]) -> None:
 
 
 def _get_db():
-    """Lazy import of PostgresManager to avoid circular imports at module load time."""
-    from src.database.postgres_db import PostgresManager
-    return PostgresManager()
+    """Return operational database manager: PostgresManager if configured, else SQLiteManager."""
+    from src.core.config import Config
+    if Config.USE_POSTGRES:
+        try:
+            from src.database.postgres_db import PostgresManager
+            return PostgresManager()
+        except Exception as e:
+            logger.warning(
+                f"PostgreSQL connection failed ({e}), falling back to SQLiteManager"
+            )
+            from src.database.sql_db import SQLiteManager
+            return SQLiteManager()
+    from src.database.sql_db import SQLiteManager
+    return SQLiteManager()
 
 
 # ===========================================================================

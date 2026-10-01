@@ -34,6 +34,7 @@ class Config:
     # -----------------------------------------------------------------------
     # PostgreSQL Configuration (migrated from SQLite)
     # -----------------------------------------------------------------------
+    USE_POSTGRES: bool = os.getenv("USE_POSTGRES", "false").lower() in ("true", "1", "yes")
     POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "localhost")
     POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "bench_forecast")
