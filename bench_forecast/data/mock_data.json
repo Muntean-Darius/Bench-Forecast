@@ -1,266 +1,336 @@
 {
   "employees": [
     {
-      "id": "EMP-001",
-      "name": "Alexandru Popescu",
-      "available_from": "2026-09-15",
-      "experience_years": 6.5,
-      "current_project": "FinTech Legacy Maintenance",
-      "skills": ["Java", "Spring Boot", "Microservices", "PostgreSQL", "Docker", "Apache Kafka"],
-      "bio": "Inginer Backend Senior cu peste 6 ani experiență concentrată pe ecosistemul Java. A coordonat migrarea a două aplicații monolit enterprise la arhitectură de microservicii folosind Spring Boot 3, Spring Cloud și Apache Kafka pentru procesare asincronă a tranzacțiilor. Competențe solide în baze de date relaționale (PostgreSQL, tuning de queries) și containerizare Docker pe platforme AWS."
+      "id": "a1b2c3d4-0001-0001-0001-000000000001",
+      "full_name": "Alexandru Popescu",
+      "primary_role": "Backend Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 65.00,
+      "bench_start_date": "2026-09-20",
+      "cv_document_uri": "cvs/alexandru_popescu.pdf",
+      "profile_text": "Senior Backend Engineer with 6.5 years of experience in the Java ecosystem. Led the migration of two enterprise monolithic applications to microservices architecture using Spring Boot 3, Spring Cloud, and Apache Kafka for asynchronous transaction processing. Strong skills in relational databases (PostgreSQL, query tuning) and Docker containerization on AWS. Familiar with CI/CD pipelines using Jenkins and GitHub Actions. Currently finishing a FinTech legacy maintenance project."
     },
     {
-      "id": "EMP-002",
-      "name": "Elena Radu",
-      "available_from": "2026-10-01",
-      "experience_years": 4.0,
-      "current_project": "Retail Analytics Internal",
-      "skills": ["Python", "FastAPI", "Pandas", "Scikit-Learn", "Docker", "LangChain"],
-      "bio": "Dezvoltatoare Backend și AI/Data Specialist cu 4 ani experiență. Specializată în construirea de servicii RESTful de mare viteză cu FastAPI și integrarea de modele predictive. Experiență practică în pipeline-uri de prelucrare a datelor cu Pandas, vectorizare documente folosind ChromaDB și orchestrare de fluxuri LLM prin LangChain."
+      "id": "a1b2c3d4-0002-0002-0002-000000000002",
+      "full_name": "Elena Radu",
+      "primary_role": "AI/ML Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 55.00,
+      "bench_start_date": "2026-10-01",
+      "cv_document_uri": "cvs/elena_radu.pdf",
+      "profile_text": "Backend and AI/Data Specialist with 4 years of experience. Expert in building high-performance RESTful services with FastAPI and integrating predictive models. Hands-on experience with data processing pipelines using Pandas, document vectorization with ChromaDB, and LLM workflow orchestration through LangChain. Has built a RAG-based document Q&A system for a retail analytics product. Finishing current project in October 2026."
     },
     {
-      "id": "EMP-003",
-      "name": "Mihai Ionescu",
-      "available_from": "2026-09-20",
-      "experience_years": 5.0,
-      "current_project": "Logistics Portal Revamp",
-      "skills": ["TypeScript", "React", "Next.js", "Tailwind CSS", "GraphQL", "Node.js"],
-      "bio": "Software Engineer Frontend/Fullstack cu accent pe React și TypeScript. A condus dezvoltarea unor dashboard-uri analitice complexe în timp real cu Next.js, Redux Toolkit și Tailwind CSS. Integrează frecvent API-uri GraphQL și RESTful, punând accent pe performanța de randare și accesibilitate."
+      "id": "a1b2c3d4-0003-0003-0003-000000000003",
+      "full_name": "Mihai Ionescu",
+      "primary_role": "Frontend Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 60.00,
+      "bench_start_date": "2026-09-25",
+      "cv_document_uri": "cvs/mihai_ionescu.pdf",
+      "profile_text": "Full-stack Software Engineer specializing in React and TypeScript. Led development of complex real-time analytical dashboards with Next.js, Redux Toolkit, and Tailwind CSS. Frequently integrates GraphQL and RESTful APIs with a focus on render performance and accessibility. Has 5 years of frontend leadership experience on logistics and retail portal projects."
     },
     {
-      "id": "EMP-004",
-      "name": "Cristian Vasile",
-      "available_from": "2026-09-10",
-      "experience_years": 3.5,
-      "current_project": "Telco Cloud Migration",
-      "skills": ["Python", "AWS", "Terraform", "Kubernetes", "CI/CD", "Linux"],
-      "bio": "DevOps & Cloud Engineer cu experiență în automatizarea infrastructurii prin Terraform și managementul clusterelor Kubernetes (EKS). A proiectat și menținut pipeline-uri robuste de CI/CD în GitHub Actions și GitLab CI, asigurând conformitatea securității în medii cloud AWS."
+      "id": "a1b2c3d4-0004-0004-0004-000000000004",
+      "full_name": "Cristian Vasile",
+      "primary_role": "DevOps Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 50.00,
+      "bench_start_date": "2026-09-15",
+      "cv_document_uri": "cvs/cristian_vasile.pdf",
+      "profile_text": "DevOps and Cloud Engineer with 3.5 years of experience automating infrastructure with Terraform and managing Kubernetes clusters (EKS). Designed and maintained robust CI/CD pipelines in GitHub Actions and GitLab CI, ensuring security compliance in AWS cloud environments. Currently on bench after completing a Telco Cloud Migration project."
     },
     {
-      "id": "EMP-005",
-      "name": "Andreea Dumitrescu",
-      "available_from": "2026-10-10",
-      "experience_years": 5.5,
-      "current_project": "Supply Chain Visibility",
-      "skills": ["Python", "PySpark", "Apache Kafka", "Airflow", "Snowflake", "SQL"],
-      "bio": "Data Engineer cu peste 5 ani experiență în construirea de pipeline-uri de date scalabile (ETL/ELT). A proiectat fluxuri de ingestie în timp real cu Apache Kafka și PySpark, orchestrate prin Apache Airflow, încărcând date agregate în depozite Snowflake pentru raportare analitică de volum mare."
+      "id": "a1b2c3d4-0005-0005-0005-000000000005",
+      "full_name": "Andreea Dumitrescu",
+      "primary_role": "Data Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 70.00,
+      "bench_start_date": "2026-10-10",
+      "cv_document_uri": "cvs/andreea_dumitrescu.pdf",
+      "profile_text": "Data Engineer with 5.5 years of experience building scalable data pipelines (ETL/ELT). Designed real-time ingestion flows with Apache Kafka and PySpark, orchestrated by Apache Airflow, loading aggregated data into Snowflake data warehouses for large-volume analytical reporting. Expert in supply chain data modelling and financial transaction anomaly detection."
     },
     {
-      "id": "EMP-006",
-      "name": "Vlad Georgescu",
-      "available_from": "2026-09-25",
-      "experience_years": 7.0,
-      "current_project": "Insurance Claims Core",
-      "skills": ["C#", ".NET Core", "Azure", "Entity Framework", "Microservices", "SQL Server"],
-      "bio": "Senior .NET Developer cu 7 ani experiență pe arhitecturi cloud native în Microsoft Azure. Expert în ASP.NET Core Web API, Domain-Driven Design (DDD) și baze de date Microsoft SQL Server. A implementat servicii asincrone cu Azure Service Bus și containere Azure Kubernetes Service (AKS)."
+      "id": "a1b2c3d4-0006-0006-0006-000000000006",
+      "full_name": "Vlad Georgescu",
+      "primary_role": ".NET Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 68.00,
+      "bench_start_date": "2026-09-28",
+      "cv_document_uri": "cvs/vlad_georgescu.pdf",
+      "profile_text": "Senior .NET Developer with 7 years of experience on cloud-native architectures in Microsoft Azure. Expert in ASP.NET Core Web API, Domain-Driven Design (DDD), and Microsoft SQL Server databases. Implemented asynchronous services with Azure Service Bus and Azure Kubernetes Service (AKS) containers. Delivered 3 large insurance and banking projects."
     },
     {
-      "id": "EMP-007",
-      "name": "Ioana Moraru",
-      "available_from": "2026-10-05",
-      "experience_years": 4.5,
-      "current_project": "Banking Mobile Upgrade",
-      "skills": ["Flutter", "Dart", "iOS", "Android", "REST APIs", "Firebase"],
-      "bio": "Mobile Application Developer specializată pe dezvoltare cross-platform cu Flutter și Dart. A lansat și menținut 3 aplicații bancare în Google Play și Apple App Store, implementând autentificare biometrică securizată, integrări cu gateway-uri de plată și sincronizări offline prin SQLite."
+      "id": "a1b2c3d4-0007-0007-0007-000000000007",
+      "full_name": "Ioana Moraru",
+      "primary_role": "Mobile Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 52.00,
+      "bench_start_date": "2026-10-05",
+      "cv_document_uri": "cvs/ioana_moraru.pdf",
+      "profile_text": "Mobile Application Developer specializing in cross-platform development with Flutter and Dart. Launched and maintained 3 banking apps on Google Play and Apple App Store, implementing secure biometric authentication, payment gateway integrations, and offline data synchronization via SQLite. 4.5 years of mobile development experience in the financial sector."
     },
     {
-      "id": "EMP-008",
-      "name": "Dan Stanescu",
-      "available_from": "2026-09-18",
-      "experience_years": 6.0,
-      "current_project": "FinTech QA Stream",
-      "skills": ["Python", "Playwright", "Selenium", "Postman", "CI/CD", "JMeter"],
-      "bio": "Senior QA Automation Engineer concentrat pe testare automată end-to-end și de performanță. A dezvoltat framework-uri de testare de la zero în Python cu Playwright și PyTest, integrate în pipeline-uri de CI/CD. Experiență extinsă în testare de API-uri REST și teste de sarcină cu Apache JMeter."
+      "id": "a1b2c3d4-0008-0008-0008-000000000008",
+      "full_name": "Dan Stanescu",
+      "primary_role": "QA Automation Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 55.00,
+      "bench_start_date": "2026-09-18",
+      "cv_document_uri": "cvs/dan_stanescu.pdf",
+      "profile_text": "Senior QA Automation Engineer focused on end-to-end and performance testing. Built testing frameworks from scratch in Python with Playwright and PyTest, integrated into CI/CD pipelines. Extensive experience in REST API testing and load testing with Apache JMeter. 6 years experience across FinTech and SaaS products. Currently on bench."
     },
     {
-      "id": "EMP-009",
-      "name": "Simona Nistor",
-      "available_from": "2026-10-20",
-      "experience_years": 3.0,
-      "current_project": "Internal Admin UI",
-      "skills": ["Angular", "TypeScript", "RxJS", "SCSS", "REST APIs", "Jest"],
-      "bio": "Frontend Developer cu expertiză în Angular (versiunile 14-17) și TypeScript. A conceput interfețe de utilizator reactive folosind RxJS și arhitectură modulară bazată pe componente standalone. Riguroasă în scrierea testelor unitare cu Jest și optimizarea performanței de încărcare a paginilor."
+      "id": "a1b2c3d4-0009-0009-0009-000000000009",
+      "full_name": "Simona Nistor",
+      "primary_role": "Frontend Engineer",
+      "seniority": "Junior",
+      "hourly_cost_rate": 38.00,
+      "bench_start_date": "2026-10-20",
+      "cv_document_uri": "cvs/simona_nistor.pdf",
+      "profile_text": "Frontend Developer with expertise in Angular (versions 14-17) and TypeScript. Designed reactive user interfaces using RxJS and modular standalone component architecture. Diligent in writing unit tests with Jest and optimizing page load performance. 3 years of experience on internal enterprise admin portals."
     },
     {
-      "id": "EMP-010",
-      "name": "Bogdan Enache",
-      "available_from": "2026-09-30",
-      "experience_years": 8.0,
-      "current_project": "Enterprise ERP Connector",
-      "skills": ["Java", "Spring Boot", "Hibernate", "Oracle DB", "Docker", "RabbitMQ"],
-      "bio": "Arhitect Software și Backend Engineer cu 8 ani de experiență enterprise. A proiectat integrări complexe între sisteme ERP (SAP) și platforme web moderne folosind Spring Boot și mesagerie RabbitMQ. Expert în modelarea datelor relaționale pe Oracle DB și bune practici de scalabilitate orizontală."
+      "id": "a1b2c3d4-0010-0010-0010-000000000010",
+      "full_name": "Bogdan Enache",
+      "primary_role": "Backend Engineer",
+      "seniority": "Principal",
+      "hourly_cost_rate": 95.00,
+      "bench_start_date": "2026-09-30",
+      "cv_document_uri": "cvs/bogdan_enache.pdf",
+      "profile_text": "Software Architect and Backend Engineer with 8 years of enterprise experience. Designed complex integrations between ERP systems (SAP) and modern web platforms using Spring Boot and RabbitMQ messaging. Expert in relational data modelling on Oracle DB and horizontal scalability best practices. Available for tech lead or principal architect roles."
     },
     {
-      "id": "EMP-011",
-      "name": "Maria Teodorescu",
-      "available_from": "2026-10-15",
-      "experience_years": 4.0,
-      "current_project": "Document AI Research",
-      "skills": ["Python", "PyTorch", "HuggingFace", "NLP", "FastAPI", "Docker"],
-      "bio": "Machine Learning Engineer axată pe procesarea limbajului natural (NLP) și modele Transformer. A antrenat și ajustat (fine-tuning) modele de extragere de entități din documente nestructurate (PDF-uri medicale și financiare). Expune modelele prin microservicii optimizate în FastAPI cu accelerare GPU."
+      "id": "a1b2c3d4-0011-0011-0011-000000000011",
+      "full_name": "Maria Teodorescu",
+      "primary_role": "AI/ML Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 60.00,
+      "bench_start_date": "2026-10-15",
+      "cv_document_uri": "cvs/maria_teodorescu.pdf",
+      "profile_text": "Machine Learning Engineer focused on Natural Language Processing (NLP) and Transformer models. Trained and fine-tuned entity extraction models from unstructured documents (medical and financial PDFs). Exposes models via GPU-accelerated FastAPI microservices. 4 years of experience in document AI and LLM fine-tuning with PyTorch and HuggingFace."
     },
     {
-      "id": "EMP-012",
-      "name": "Radu Cernat",
-      "available_from": "2026-09-12",
-      "experience_years": 5.0,
-      "current_project": "Retail Cloud Platform",
-      "skills": ["Go", "Kubernetes", "gRPC", "Docker", "PostgreSQL", "Prometheus"],
-      "bio": "Systems & Backend Engineer cu accent pe Go (Golang) și arhitecturi distribuite de joasă latență. A implementat microservicii gRPC de înaltă frecvență pentru comenzi e-commerce, monitorizate prin Prometheus și Grafana, orchestrate în containere pe Kubernetes."
+      "id": "a1b2c3d4-0012-0012-0012-000000000012",
+      "full_name": "Radu Cernat",
+      "primary_role": "Backend Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 72.00,
+      "bench_start_date": "2026-09-12",
+      "cv_document_uri": "cvs/radu_cernat.pdf",
+      "profile_text": "Systems and Backend Engineer specializing in Go (Golang) and low-latency distributed architectures. Implemented high-frequency gRPC microservices for e-commerce order processing, monitored with Prometheus and Grafana, orchestrated in Kubernetes. 5 years of Go experience. Currently on bench after completing a Retail Cloud Platform project."
     },
     {
-      "id": "EMP-013",
-      "name": "Gabriela Stan",
-      "available_from": "2026-10-25",
-      "experience_years": 3.5,
-      "current_project": "Customer Service Portal",
-      "skills": ["Vue.js", "JavaScript", "Pinia", "Node.js", "Express", "MongoDB"],
-      "bio": "Fullstack Developer cu focus pe Vue.js 3 și ecosistemul Node.js. A dezvoltat portaluri pentru clienți cu design receptiv, management de stare prin Pinia și backend-uri modulare în Express cu persistență pe MongoDB. Pasionată de experiența utilizatorului (UX) și design accesibil."
+      "id": "a1b2c3d4-0013-0013-0013-000000000013",
+      "full_name": "Gabriela Stan",
+      "primary_role": "Fullstack Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 48.00,
+      "bench_start_date": "2026-10-25",
+      "cv_document_uri": "cvs/gabriela_stan.pdf",
+      "profile_text": "Fullstack Developer focused on Vue.js 3 and the Node.js ecosystem. Developed customer portals with responsive design, state management via Pinia, and modular Express backends with MongoDB persistence. 3.5 years of experience building customer-facing applications in retail and insurance verticals."
     },
     {
-      "id": "EMP-014",
-      "name": "Lucian Petrescu",
-      "available_from": "2026-09-28",
-      "experience_years": 7.5,
-      "current_project": "Global Security Auditing",
-      "skills": ["Cybersecurity", "Python", "Linux", "DevSecOps", "Docker", "OWASP"],
-      "bio": "Security Engineer și consultant DevSecOps cu peste 7 ani experiență în auditul aplicațiilor enterprise. Integrează scanere automate de vulnerabilități (SAST/DAST) în pipeline-urile de CI/CD, implementează conformitatea OWASP Top 10 și auditează configurații de rețea și securitate cloud."
+      "id": "a1b2c3d4-0014-0014-0014-000000000014",
+      "full_name": "Lucian Petrescu",
+      "primary_role": "Security Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 80.00,
+      "bench_start_date": "2026-09-28",
+      "cv_document_uri": "cvs/lucian_petrescu.pdf",
+      "profile_text": "Security Engineer and DevSecOps consultant with 7.5 years of experience auditing enterprise applications. Integrates automated vulnerability scanners (SAST/DAST) in CI/CD pipelines, implements OWASP Top 10 compliance, and audits cloud network security configurations. Python scripting for automated penetration testing and security reporting."
     },
     {
-      "id": "EMP-015",
-      "name": "Alina Dobre",
-      "available_from": "2026-10-08",
-      "experience_years": 4.5,
-      "current_project": "Marketing Automation Engine",
-      "skills": ["PHP", "Laravel", "MySQL", "Redis", "Docker", "REST APIs"],
-      "bio": "Senior PHP Developer specializată pe framework-ul Laravel. A dezvoltat module de automatizare a campaniilor de marketing cu cozi de procesare asincronă pe Redis și baze de date MySQL optimizate. Experiență amplă în integrarea API-urilor terțe (Salesforce, HubSpot, Stripe)."
+      "id": "a1b2c3d4-0015-0015-0015-000000000015",
+      "full_name": "Alina Dobre",
+      "primary_role": "Backend Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 45.00,
+      "bench_start_date": "2026-10-08",
+      "cv_document_uri": "cvs/alina_dobre.pdf",
+      "profile_text": "Senior PHP Developer specializing in the Laravel framework. Built marketing campaign automation modules with asynchronous processing queues on Redis and optimized MySQL databases. Extensive experience integrating third-party APIs (Salesforce, HubSpot, Stripe). 4.5 years working on SaaS marketing automation platforms."
     },
     {
-      "id": "EMP-016",
-      "name": "Florin Diaconu",
-      "available_from": "2026-11-01",
-      "experience_years": 5.0,
-      "current_project": "Data Governance Portal",
-      "skills": ["SQL", "PostgreSQL", "dbt", "BigQuery", "Python", "Tableau"],
-      "bio": "Analytics Engineer specializat în transformarea datelor corporative cu dbt și Google BigQuery. Convertește cerințe de business complexe în modele de date dimensionale curate și optimizate, alimentând tablouri de bord executive în Tableau și PowerBI."
+      "id": "a1b2c3d4-0016-0016-0016-000000000016",
+      "full_name": "Florin Diaconu",
+      "primary_role": "Analytics Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 58.00,
+      "bench_start_date": "2026-11-01",
+      "cv_document_uri": "cvs/florin_diaconu.pdf",
+      "profile_text": "Analytics Engineer specializing in corporate data transformation with dbt and Google BigQuery. Converts complex business requirements into clean, optimized dimensional data models feeding executive dashboards in Tableau and PowerBI. 5 years of experience in data governance, data quality, and SQL-based analytics for financial services."
     },
     {
-      "id": "EMP-017",
-      "name": "Carmen Oprea",
-      "available_from": "2026-09-19",
-      "experience_years": 6.0,
-      "current_project": "Smart Energy Gateway",
-      "skills": ["C++", "Embedded Linux", "MQTT", "Python", "Docker", "IoT"],
-      "bio": "Embedded Software Engineer cu experiență în dezvoltarea firmware-ului pentru dispozitive IoT industriale. A programat drivere de comunicare și protocoale MQTT/CoAP pe sisteme Embedded Linux, asigurând consum redus de energie și transmisie criptată a telemetriei."
+      "id": "a1b2c3d4-0017-0017-0017-000000000017",
+      "full_name": "Carmen Oprea",
+      "primary_role": "Embedded Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 62.00,
+      "bench_start_date": "2026-09-19",
+      "cv_document_uri": "cvs/carmen_oprea.pdf",
+      "profile_text": "Embedded Software Engineer with experience developing firmware for industrial IoT devices. Programmed communication drivers and MQTT/CoAP protocols on Embedded Linux systems, ensuring low power consumption and encrypted telemetry transmission. 6 years of IoT and edge computing experience in energy and industrial automation sectors."
     },
     {
-      "id": "EMP-018",
-      "name": "Tudor Munteanu",
-      "available_from": "2026-10-12",
-      "experience_years": 4.0,
-      "current_project": "Mobile Banking Modernization",
-      "skills": ["Swift", "iOS", "SwiftUI", "Combine", "REST APIs", "CoreData"],
-      "bio": "Native iOS Developer cu peste 4 ani experiență în dezvoltarea aplicațiilor pentru ecosistemul Apple. Stăpânește SwiftUI, arhitectura MVVM și managementul stărilor asincrone cu Combine. Integrează plăți Apple Pay și servicii de securitate Keychain."
+      "id": "a1b2c3d4-0018-0018-0018-000000000018",
+      "full_name": "Tudor Munteanu",
+      "primary_role": "Mobile Engineer",
+      "seniority": "Mid",
+      "hourly_cost_rate": 50.00,
+      "bench_start_date": "2026-10-12",
+      "cv_document_uri": "cvs/tudor_munteanu.pdf",
+      "profile_text": "Native iOS Developer with 4 years of experience in Apple ecosystem application development. Proficient in SwiftUI, MVVM architecture, and asynchronous state management with Combine. Integrates Apple Pay payments and Keychain security services. Delivered mobile banking modernization projects with high-security compliance requirements."
     },
     {
-      "id": "EMP-019",
-      "name": "Diana Voinea",
-      "available_from": "2026-10-18",
-      "experience_years": 3.0,
-      "current_project": "Cloud Infrastructure Baseline",
-      "skills": ["GCP", "Terraform", "Kubernetes", "Python", "Bash", "GitHub Actions"],
-      "bio": "Cloud Infrastructure Engineer cu certificare Google Cloud Professional. A implementat infrastructură declarativă folosind Terraform pe GCP (Google Kubernetes Engine, Cloud SQL, IAM). Automatizează task-uri administrative prin scripturi Python și pipeline-uri CI/CD."
+      "id": "a1b2c3d4-0019-0019-0019-000000000019",
+      "full_name": "Diana Voinea",
+      "primary_role": "DevOps Engineer",
+      "seniority": "Junior",
+      "hourly_cost_rate": 35.00,
+      "bench_start_date": "2026-10-18",
+      "cv_document_uri": "cvs/diana_voinea.pdf",
+      "profile_text": "Cloud Infrastructure Engineer with Google Cloud Professional certification. Implemented declarative infrastructure using Terraform on GCP (Google Kubernetes Engine, Cloud SQL, IAM). Automates administrative tasks through Python scripts and CI/CD pipelines with GitHub Actions. 3 years of cloud infrastructure experience."
     },
     {
-      "id": "EMP-020",
-      "name": "George Neagu",
-      "available_from": "2026-09-22",
-      "experience_years": 5.5,
-      "current_project": "Streaming Video Platform",
-      "skills": ["TypeScript", "Node.js", "Express", "Redis", "WebSockets", "MongoDB"],
-      "bio": "Backend Engineer axat pe Node.js și TypeScript pentru aplicații cu concurență ridicată. A proiectat arhitectura camerelor de chat live și a notificărilor în timp real folosind WebSockets și cluster Redis Pub/Sub, capabilă să gestioneze zeci de mii de utilizatori simultani."
+      "id": "a1b2c3d4-0020-0020-0020-000000000020",
+      "full_name": "George Neagu",
+      "primary_role": "Backend Engineer",
+      "seniority": "Senior",
+      "hourly_cost_rate": 67.00,
+      "bench_start_date": "2026-09-22",
+      "cv_document_uri": "cvs/george_neagu.pdf",
+      "profile_text": "Backend Engineer focused on Node.js and TypeScript for high-concurrency applications. Designed the architecture for live chat rooms and real-time notifications using WebSockets and Redis Pub/Sub clusters, capable of handling tens of thousands of simultaneous users. 5.5 years of experience in streaming video and social platforms."
     }
   ],
-  "demands": [
+  "projects": [
     {
-      "id": "DEM-101",
-      "project_id": "PRJ-BANK-MIGRATION",
-      "role": "Senior Java Microservices Engineer",
-      "start_date": "2026-10-01",
-      "headcount": 1,
-      "win_probability": 0.85,
-      "required_skills": ["Java", "Spring Boot", "Kafka", "AWS"],
-      "description": "Căutăm un inginer backend experimentat capabil să conducă migrarea unui sistem bancar monolitic masiv către microservicii Spring Boot. Rolul presupune decuplarea serviciilor existente, implementarea de arhitecturi event-driven prin Apache Kafka pentru fluxuri financiare asincrone și orchestrarea serviciilor în containere pe infrastructură cloud AWS."
+      "id": "p0000001-0001-0001-0001-000000000001",
+      "name": "Core Banking Migration",
+      "status": "Active",
+      "probability": 95,
+      "target_margin": 32.00,
+      "total_budget": 1200000.00
     },
     {
-      "id": "DEM-102",
-      "project_id": "PRJ-AI-HEALTHCARE",
-      "role": "Python AI & Backend Developer",
-      "start_date": "2026-10-15",
-      "headcount": 1,
-      "win_probability": 0.90,
-      "required_skills": ["Python", "FastAPI", "Vector Databases", "LLM Orchestration"],
-      "description": "Avem nevoie de un dezvoltator Python capabil să construiască un API scalabil în FastAPI pentru un asistent medical inteligent. Candidatul ideal are experiență în procesarea textelor medicale, căutare semantică vectorială prin baze de date de embeddings și conectarea modelelor mari de limbaj cu baze de date interne prin RAG."
+      "id": "p0000001-0002-0002-0002-000000000002",
+      "name": "AI Healthcare Assistant",
+      "status": "Active",
+      "probability": 90,
+      "target_margin": 28.00,
+      "total_budget": 450000.00
     },
     {
-      "id": "DEM-103",
-      "project_id": "PRJ-FINTECH-STREAM",
-      "role": "Data Platform & Streaming Engineer",
-      "start_date": "2026-10-20",
-      "headcount": 1,
-      "win_probability": 0.80,
-      "required_skills": ["Python", "PySpark", "Kafka", "Airflow", "Data Warehousing"],
-      "description": "Proiect pentru dezvoltarea unei platforme enterprise de analiză a tranzacțiilor financiare în timp real. Candidatul va construi fluxuri de procesare cu latență scăzută prin Apache Kafka și PySpark, orchestrate de Airflow, stocând date agregate într-un depozit Snowflake pentru detectarea anomaliilor de plată."
+      "id": "p0000001-0003-0003-0003-000000000003",
+      "name": "FinTech Real-Time Analytics Platform",
+      "status": "Pipeline",
+      "probability": 80,
+      "target_margin": 35.00,
+      "total_budget": 780000.00
     },
     {
-      "id": "DEM-104",
-      "project_id": "PRJ-INSURANCE-CLOUD",
-      "role": "Senior .NET Azure Cloud Specialist",
-      "start_date": "2026-10-01",
-      "headcount": 2,
-      "win_probability": 0.88,
-      "required_skills": ["C#", ".NET Core", "Azure", "Microservices", "Service Bus"],
-      "description": "Dezvoltarea noii generații a portalului de gestionare a daunelor de asigurări pe platforma Microsoft Azure. Proiectul solicită competențe avansate în ASP.NET Core, arhitectură bazată pe microservicii decuplate prin Azure Service Bus și baze de date relaționale SQL Server de mare disponibilitate."
+      "id": "p0000001-0004-0004-0004-000000000004",
+      "name": "Insurance Claims Cloud Portal",
+      "status": "Active",
+      "probability": 88,
+      "target_margin": 30.00,
+      "total_budget": 960000.00
     },
     {
-      "id": "DEM-105",
-      "project_id": "PRJ-RETAIL-PORTAL",
-      "role": "Senior React & TypeScript Frontend Lead",
-      "start_date": "2026-09-25",
-      "headcount": 1,
-      "win_probability": 0.92,
-      "required_skills": ["TypeScript", "React", "Next.js", "Tailwind CSS", "GraphQL"],
-      "description": "Construirea interfeței web responsive pentru un gigant internațional de retail. Se cere experiență solidă în React 18, Next.js cu server-side rendering, management predictibil al stării și integrare fluidă a catalogului de produse prin interogări GraphQL optimizate."
+      "id": "p0000001-0005-0005-0005-000000000005",
+      "name": "Retail E-Commerce Replatform",
+      "status": "Active",
+      "probability": 92,
+      "target_margin": 25.00,
+      "total_budget": 550000.00
     },
     {
-      "id": "DEM-106",
-      "project_id": "PRJ-INFRA-SECURITY",
-      "role": "DevOps & Cloud Infrastructure Architect",
-      "start_date": "2026-10-10",
-      "headcount": 1,
-      "win_probability": 0.78,
-      "required_skills": ["AWS", "Terraform", "Kubernetes", "CI/CD", "Security"],
-      "description": "Modernizarea infrastructurii critice a unei companii de telecomunicații. Rolul implică automatizarea completă a provizionării resurselor prin module reutilizabile de Terraform pe AWS, configurarea clusterelor Kubernetes EKS pentru producție și securizarea pipeline-urilor CI/CD."
+      "id": "p0000001-0006-0006-0006-000000000006",
+      "name": "Telco Cloud Security Modernization",
+      "status": "Pipeline",
+      "probability": 78,
+      "target_margin": 38.00,
+      "total_budget": 670000.00
     },
     {
-      "id": "DEM-107",
-      "project_id": "PRJ-BANKING-MOBILE",
-      "role": "Mobile Engineer (Cross-Platform Flutter)",
-      "start_date": "2026-10-15",
-      "headcount": 1,
-      "win_probability": 0.85,
-      "required_skills": ["Flutter", "Dart", "Mobile Security", "REST APIs"],
-      "description": "Actualizarea suitei de aplicații mobile bancare pentru clienți individuali și corporate. Sunt necesare cunoștințe profunde de Flutter și Dart, integrare de autentificare biometrică cu standarde ridicate de securitate financiară și sincronizare de date offline."
+      "id": "p0000001-0007-0007-0007-000000000007",
+      "name": "Mobile Banking Suite Upgrade",
+      "status": "Active",
+      "probability": 85,
+      "target_margin": 27.00,
+      "total_budget": 390000.00
     },
     {
-      "id": "DEM-108",
-      "project_id": "PRJ-QA-PLATFORM",
-      "role": "Lead QA Automation Engineer",
-      "start_date": "2026-10-05",
-      "headcount": 1,
-      "win_probability": 0.82,
-      "required_skills": ["Python", "Playwright", "Test Automation", "CI/CD", "JMeter"],
-      "description": "Crearea unui cadru unificat de testare automată pentru serviciile cloud ale unui fintech internațional. Candidatul va implementa suite de teste end-to-end în Python cu Playwright, teste de încărcare cu Apache JMeter și le va integra în porțile de calitate din pipeline-ul de release."
+      "id": "p0000001-0008-0008-0008-000000000008",
+      "name": "Enterprise QA Automation Framework",
+      "status": "Pipeline",
+      "probability": 82,
+      "target_margin": 40.00,
+      "total_budget": 280000.00
+    }
+  ],
+  "project_roles": [
+    {
+      "id": "r0000001-0001-0001-0001-000000000001",
+      "project_id": "p0000001-0001-0001-0001-000000000001",
+      "title": "Senior Java Microservices Engineer",
+      "target_bill_rate": 110.00,
+      "status": "Open",
+      "description": "We need an experienced backend engineer to lead migration of a massive monolithic banking system to Spring Boot microservices. The role involves decoupling existing services, implementing event-driven architectures through Apache Kafka for asynchronous financial flows, and orchestrating services in containers on AWS cloud infrastructure. Must have production experience with Spring Boot 3, Apache Kafka, PostgreSQL, Docker, and AWS."
+    },
+    {
+      "id": "r0000001-0002-0002-0002-000000000002",
+      "project_id": "p0000001-0002-0002-0002-000000000002",
+      "title": "Python AI and Backend Developer",
+      "target_bill_rate": 95.00,
+      "status": "Open",
+      "description": "We need a Python developer to build a scalable FastAPI backend for an intelligent medical assistant. The ideal candidate has experience in medical text processing, vector semantic search through embedding databases, and connecting large language models to internal databases via RAG (Retrieval-Augmented Generation). LangChain and ChromaDB experience highly valued."
+    },
+    {
+      "id": "r0000001-0003-0003-0003-000000000003",
+      "project_id": "p0000001-0003-0003-0003-000000000003",
+      "title": "Data Platform and Streaming Engineer",
+      "target_bill_rate": 105.00,
+      "status": "Open",
+      "description": "Enterprise project for developing a real-time financial transaction analytics platform. The candidate will build low-latency processing flows through Apache Kafka and PySpark, orchestrated by Airflow, storing aggregated data in a Snowflake warehouse for payment anomaly detection. Data engineering expertise and financial domain knowledge required."
+    },
+    {
+      "id": "r0000001-0004-0004-0004-000000000004",
+      "project_id": "p0000001-0004-0004-0004-000000000004",
+      "title": "Senior .NET Azure Cloud Specialist",
+      "target_bill_rate": 115.00,
+      "status": "Open",
+      "description": "Development of the next generation insurance claims management portal on Microsoft Azure. The project requires advanced skills in ASP.NET Core, microservices architecture decoupled through Azure Service Bus, and high-availability SQL Server relational databases. DDD knowledge and cloud-native patterns essential."
+    },
+    {
+      "id": "r0000001-0005-0005-0005-000000000005",
+      "project_id": "p0000001-0005-0005-0005-000000000005",
+      "title": "Senior React and TypeScript Frontend Lead",
+      "target_bill_rate": 100.00,
+      "status": "Open",
+      "description": "Building the responsive web interface for an international retail giant. Requires solid experience in React 18, Next.js with server-side rendering, predictable state management, and smooth product catalog integration through optimized GraphQL queries. Must lead a team of 2 junior frontend engineers."
+    },
+    {
+      "id": "r0000001-0006-0006-0006-000000000006",
+      "project_id": "p0000001-0006-0006-0006-000000000006",
+      "title": "DevOps and Cloud Infrastructure Architect",
+      "target_bill_rate": 120.00,
+      "status": "Open",
+      "description": "Modernization of critical infrastructure for a telecommunications company. The role involves fully automating resource provisioning through reusable Terraform modules on AWS, configuring production-grade Kubernetes EKS clusters, and securing CI/CD pipelines with DevSecOps practices. Security certification preferred."
+    },
+    {
+      "id": "r0000001-0007-0007-0007-000000000007",
+      "project_id": "p0000001-0007-0007-0007-000000000007",
+      "title": "Mobile Engineer — Cross-Platform Flutter",
+      "target_bill_rate": 90.00,
+      "status": "Open",
+      "description": "Upgrade of the banking mobile app suite for individual and corporate clients. Deep knowledge of Flutter and Dart required, along with biometric authentication integration with high financial security standards and offline data synchronization. Experience with banking-grade security (certificate pinning, jailbreak detection) is a strong plus."
+    },
+    {
+      "id": "r0000001-0008-0008-0008-000000000008",
+      "project_id": "p0000001-0008-0008-0008-000000000008",
+      "title": "Lead QA Automation Engineer",
+      "target_bill_rate": 85.00,
+      "status": "Open",
+      "description": "Creating a unified automated testing framework for the cloud services of an international fintech. The candidate will implement end-to-end test suites in Python with Playwright, load tests with Apache JMeter, and integrate them into release pipeline quality gates. Must be able to mentor junior QA engineers and define testing strategy."
     }
   ]
 }

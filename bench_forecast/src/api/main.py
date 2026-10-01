@@ -252,7 +252,7 @@ async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
 
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # Build resume payload — LangGraph merges this into state before human_review_node runs
+        # Build resume payload — explicitly update state in checkpointer
         resume_payload: Dict[str, Any] = {
             "human_approved": payload.approved,
             "human_feedback": payload.approver_name,
@@ -260,9 +260,11 @@ async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
         if not payload.approved and payload.rejection_feedback:
             resume_payload["rejection_feedback"] = payload.rejection_feedback
 
+        FORECAST_GRAPH.update_state(cfg, resume_payload)
+
         final_state = None
         for chunk in FORECAST_GRAPH.stream(
-            Command(resume=resume_payload),
+            None,
             config=cfg,
             stream_mode="values",
         ):
@@ -361,6 +363,31 @@ async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
             detail=f"Feedback submission failed: {str(e)}",
         )
 
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/employees & GET /api/v1/demands
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/employees", status_code=status.HTTP_200_OK)
+async def get_employees(horizon_days: int = 90):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_bench_forecast(horizon_days=horizon_days)
+    except Exception as e:
+        logger.error(f"Failed to fetch employees: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/demands", status_code=status.HTTP_200_OK)
+async def get_demands(min_win_probability: float = 0.75):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_open_demands(min_win_probability=min_win_probability)
+    except Exception as e:
+        logger.error(f"Failed to fetch demands: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
 # GET /api/v1/health  &  GET /
