@@ -1,5 +1,8 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom'
 import clsx from 'clsx'
+import { AuthProvider, useAuth } from './contexts/AuthContext'
+import Login from './pages/Login'
+import EmployeePortal from './pages/EmployeePortal'
 import Dashboard from './pages/Dashboard'
 import BenchPipeline from './pages/BenchPipeline'
 import ActionQueue from './pages/ActionQueue'
@@ -38,6 +41,9 @@ const NAV_ITEMS = [
 
 function Sidebar() {
   const { pathname } = useLocation()
+  const { user, logout } = useAuth()
+
+  const initials = user?.full_name?.split(' ').map(n => n[0]).join('') || '??'
 
   return (
     <aside className="fixed inset-y-0 left-0 z-30 w-56 bg-white border-r border-gray-200 flex flex-col">
@@ -73,37 +79,87 @@ function Sidebar() {
 
       {/* Footer */}
       <div className="px-3 py-3 border-t border-gray-200">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center shrink-0">
-            <span className="text-xs font-semibold text-gray-600">DM</span>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-7 h-7 rounded-full bg-gray-200 flex items-center justify-center shrink-0">
+              <span className="text-xs font-semibold text-gray-600">{initials}</span>
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-gray-800 truncate">{user?.full_name}</p>
+              <p className="text-[10px] text-gray-400 font-mono capitalize">{user?.role}</p>
+            </div>
           </div>
-          <div className="min-w-0">
-            <p className="text-xs font-medium text-gray-800 truncate">Darius Muntean</p>
-            <p className="text-[10px] text-gray-400 font-mono">Resource Manager</p>
-          </div>
+          <button
+            onClick={logout}
+            className="text-gray-400 hover:text-gray-600 transition-colors"
+            title="Sign out"
+          >
+            <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4">
+              <path fillRule="evenodd" d="M3 3a1 1 0 00-1 1v12a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H3zm11 4.414l-4.293 4.293a1 1 0 01-1.414-1.414L11.586 7H7a1 1 0 110-2h4.586L8.293 1.707a1 1 0 011.414-1.414L14 4.586V3a1 1 0 112 0v4a1 1 0 01-1 1h-1z" clipRule="evenodd" />
+            </svg>
+          </button>
         </div>
       </div>
     </aside>
   )
 }
 
+// ─── Manager Layout ───────────────────────────────────────────────────────────
+
+function ManagerLayout() {
+  return (
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar />
+      <main className="flex-1 ml-56 overflow-y-auto bg-gray-50">
+        <Routes>
+          <Route path="/"          element={<Dashboard />} />
+          <Route path="/bench"     element={<BenchPipeline />} />
+          <Route path="/queue"     element={<ActionQueue />} />
+          <Route path="/queue/:id" element={<HITLApproval />} />
+          <Route path="/settings"  element={<Settings />} />
+        </Routes>
+      </main>
+    </div>
+  )
+}
+
 // ─── App shell ────────────────────────────────────────────────────────────────
+
+function AppContent() {
+  const { user, isLoading } = useAuth()
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="flex items-center gap-3">
+          <div className="w-6 h-6 bg-gray-900 rounded flex items-center justify-center animate-pulse">
+            <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
+              <path d="M8 1L1 5v6l7 4 7-4V5L8 1zm0 2.18L13.09 6 8 8.82 2.91 6 8 3.18zM3 7.27l4.5 2.57v3.9L3 11.17V7.27zm5.5 6.47v-3.9L13 7.27v3.9l-4.5 2.57z"/>
+            </svg>
+          </div>
+          <p className="text-sm text-gray-500">Loading...</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return <Login />
+  }
+
+  if (user.role === 'employee') {
+    return <EmployeePortal />
+  }
+
+  return <ManagerLayout />
+}
 
 export default function App() {
   return (
     <BrowserRouter>
-      <div className="flex h-screen overflow-hidden">
-        <Sidebar />
-        <main className="flex-1 ml-56 overflow-y-auto bg-gray-50">
-          <Routes>
-            <Route path="/"          element={<Dashboard />} />
-            <Route path="/bench"     element={<BenchPipeline />} />
-            <Route path="/queue"     element={<ActionQueue />} />
-            <Route path="/queue/:id" element={<HITLApproval />} />
-            <Route path="/settings"  element={<Settings />} />
-          </Routes>
-        </main>
-      </div>
+      <AuthProvider>
+        <AppContent />
+      </AuthProvider>
     </BrowserRouter>
   )
 }
