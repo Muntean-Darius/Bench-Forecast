@@ -15,7 +15,7 @@ New features:
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Header
 from pydantic import BaseModel, Field
 from langgraph.types import Command
 
@@ -104,6 +104,9 @@ async def startup():
     logger.info(f"Phoenix Tracing: {'Enabled' if Config.ENABLE_PHOENIX else 'Disabled'}")
     logger.info("=" * 60)
     Config.validate()
+
+    from src.auth.auth import init_auth_db
+    init_auth_db()
 
     # Auto-seed ChromaDB from mock_data.json if empty
     try:
@@ -252,7 +255,7 @@ async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
 
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # Build resume payload — LangGraph merges this into state before human_review_node runs
+        # Build resume payload — explicitly update state in checkpointer
         resume_payload: Dict[str, Any] = {
             "human_approved": payload.approved,
             "human_feedback": payload.approver_name,
@@ -260,9 +263,11 @@ async def execute_forecast(payload: ExecuteForecastRequest) -> Dict[str, Any]:
         if not payload.approved and payload.rejection_feedback:
             resume_payload["rejection_feedback"] = payload.rejection_feedback
 
+        FORECAST_GRAPH.update_state(cfg, resume_payload)
+
         final_state = None
         for chunk in FORECAST_GRAPH.stream(
-            Command(resume=resume_payload),
+            None,
             config=cfg,
             stream_mode="values",
         ):
@@ -360,6 +365,176 @@ async def forecast_feedback(payload: FeedbackRequest) -> Dict[str, Any]:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Feedback submission failed: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/employees & GET /api/v1/demands
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/employees", status_code=status.HTTP_200_OK)
+async def get_employees(horizon_days: int = 90):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_bench_forecast(horizon_days=horizon_days)
+    except Exception as e:
+        logger.error(f"Failed to fetch employees: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/demands", status_code=status.HTTP_200_OK)
+async def get_demands(min_win_probability: float = 0.75):
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        return db.get_open_demands(min_win_probability=min_win_probability)
+    except Exception as e:
+        logger.error(f"Failed to fetch demands: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    token: str
+    user: dict
+
+@app.post("/api/v1/auth/login", status_code=status.HTTP_200_OK)
+async def login(payload: LoginRequest):
+    from src.auth.auth import authenticate_user, create_access_token
+    user = authenticate_user(payload.username, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token({"sub": user["id"], "username": user["username"], "role": user["role"]})
+    return {"token": token, "user": user}
+
+@app.get("/api/v1/auth/me", status_code=status.HTTP_200_OK)
+async def get_current_user(authorization: str = Header(None)):
+    from src.auth.auth import verify_token, get_user_by_id
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = authorization.split(" ", 1)[1]
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = get_user_by_id(payload["sub"])
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+# ---------------------------------------------------------------------------
+# Employee Portal endpoints  
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/employee/portal/{employee_id}", status_code=status.HTTP_200_OK)
+async def get_employee_portal(employee_id: str):
+    """Get employee's current project and next assignment info."""
+    from src.agents.nodes import _get_db
+    try:
+        db = _get_db()
+        # Get employee info
+        employees = db.get_bench_forecast(horizon_days=365)
+        employee = next((e for e in employees if e.id == employee_id), None)
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        
+        # Get allocation history to find next assignment
+        allocations = []
+        if hasattr(db, 'get_allocation_history'):
+            allocations = db.get_allocation_history(employee_id=employee_id)
+        
+        # Get all demands to find potential next projects
+        demands = db.get_open_demands(min_win_probability=0.5)
+        
+        return {
+            "employee": {
+                "id": employee.id,
+                "name": employee.name,
+                "skills": employee.skills,
+                "current_project": employee.current_project,
+                "available_from": str(employee.available_from),
+                "experience_years": employee.experience_years,
+                "cost_rate": employee.cost_rate,
+                "profile_text": getattr(employee, 'profile_text', '') or '',
+            },
+            "allocations": allocations,
+            "open_demands": [
+                {
+                    "id": d.id,
+                    "role": d.role,
+                    "required_skills": d.required_skills,
+                    "project_id": d.project_id,
+                    "start_date": str(d.start_date),
+                    "win_probability": d.win_probability,
+                    "description": d.description,
+                }
+                for d in demands
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Employee portal error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+@app.post("/api/v1/employee/change-password", status_code=status.HTTP_200_OK)
+async def employee_change_password(payload: ChangePasswordRequest, authorization: str = Header(None)):
+    from src.auth.auth import verify_token, change_password
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    tok = verify_token(authorization.split(" ", 1)[1])
+    if not tok:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if not change_password(tok["sub"], payload.old_password, payload.new_password):
+        raise HTTPException(status_code=400, detail="Wrong current password")
+    return {"status": "password_changed"}
+
+
+@app.post("/api/v1/employee/upload-cv/{employee_id}", status_code=status.HTTP_200_OK)
+async def upload_cv(employee_id: str, authorization: str = Header(None)):
+    """Update CV/profile_text for an employee."""
+    from src.auth.auth import verify_token
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    tok = verify_token(authorization.split(" ", 1)[1])
+    if not tok:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    # Read raw body as profile text
+    return {"status": "ready", "note": "CV upload endpoint placeholder — use PUT with profile_text body"}
+
+
+class UpdateProfileRequest(BaseModel):
+    profile_text: str
+
+@app.put("/api/v1/employee/profile/{employee_id}", status_code=status.HTTP_200_OK)
+async def update_employee_profile(employee_id: str, payload: UpdateProfileRequest, authorization: str = Header(None)):
+    """Update employee profile_text (CV content)."""
+    from src.auth.auth import verify_token, update_cv_uri
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    tok = verify_token(authorization.split(" ", 1)[1])
+    if not tok:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    # Update profile_text in employee DB
+    from src.agents.nodes import _get_db
+    db = _get_db()
+    import sqlite3
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute("UPDATE employees SET profile_text=?, updated_at=? WHERE id=?",
+                     (payload.profile_text, __import__('datetime').datetime.utcnow().isoformat(), employee_id))
+        conn.commit()
+    update_cv_uri(tok["sub"], f"profile:{employee_id}")
+    return {"status": "profile_updated"}
 
 
 # ---------------------------------------------------------------------------
