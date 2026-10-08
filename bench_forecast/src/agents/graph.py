@@ -34,6 +34,8 @@ from typing import Any
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+_GLOBAL_CHECKPOINTER = MemorySaver()
+
 from src.agents.state import MAX_REVISIONS, State
 from src.agents.nodes import (
     allocation_decider_node,
@@ -163,7 +165,7 @@ def build_forecast_graph() -> Any:
     # - MemorySaver: persists checkpoints across interrupt/resume cycles
     # - interrupt_before=["human_review"]: pauses BEFORE human_review each time
     graph = workflow.compile(
-        checkpointer=MemorySaver(),
+        checkpointer=_GLOBAL_CHECKPOINTER,
         interrupt_before=["human_review"],
     )
 

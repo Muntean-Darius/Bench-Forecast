@@ -30,6 +30,9 @@ class Config:
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama2")
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Embedding model served by Ollama — used by the Phase 2 ingestion pipeline.
+    # Pull with: ollama pull nomic-embed-text
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
     # -----------------------------------------------------------------------
     # PostgreSQL Configuration (migrated from SQLite)
@@ -103,10 +106,33 @@ class Config:
                 "LangSmith traces will not be recorded."
             )
 
+    # -----------------------------------------------------------------------
+    # ChromaDB server-mode connection (docker-compose service "chromadb")
+    # -----------------------------------------------------------------------
+    CHROMA_HOST: str = os.getenv("CHROMA_HOST", "localhost")
+    CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8200"))
+
+    # -----------------------------------------------------------------------
+    # MinIO / S3 object storage
+    # -----------------------------------------------------------------------
+    MINIO_ENDPOINT: str = os.getenv("MINIO_ENDPOINT", "localhost:9000")
+    MINIO_ACCESS_KEY: str = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    MINIO_SECRET_KEY: str = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    MINIO_BUCKET: str = os.getenv("MINIO_BUCKET", "bench-docs")
+    MINIO_USE_SSL: bool = os.getenv("MINIO_USE_SSL", "false").lower() == "true"
+
     @classmethod
     def get_postgres_dsn(cls) -> str:
-        """Build a SQLAlchemy-compatible PostgreSQL DSN from config fields."""
+        """Build a SQLAlchemy-compatible PostgreSQL DSN (sync, psycopg2)."""
         return (
             f"postgresql+psycopg2://{cls.POSTGRES_USER}:{cls.POSTGRES_PASSWORD}"
+            f"@{cls.POSTGRES_HOST}:{cls.POSTGRES_PORT}/{cls.POSTGRES_DB}"
+        )
+
+    @classmethod
+    def get_async_postgres_dsn(cls) -> str:
+        """Build a SQLAlchemy-compatible PostgreSQL DSN (async, asyncpg)."""
+        return (
+            f"postgresql+asyncpg://{cls.POSTGRES_USER}:{cls.POSTGRES_PASSWORD}"
             f"@{cls.POSTGRES_HOST}:{cls.POSTGRES_PORT}/{cls.POSTGRES_DB}"
         )

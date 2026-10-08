@@ -28,6 +28,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field, field_validator, model_validator
+from openinference.instrumentation.langchain import LangChainInstrumentor
+
+# Instrument LangChain for Phoenix Tracing
+LangChainInstrumentor().instrument()
 
 from src.core.config import Config
 
@@ -72,7 +76,7 @@ class AllocationDecision(BaseModel):
         ),
     )
     projected_margin: float = Field(
-        ...,
+        0.0,
         description=(
             "Projected gross margin % for this allocation. "
             "Formula: (bill_rate - cost_rate) / bill_rate * 100. "
