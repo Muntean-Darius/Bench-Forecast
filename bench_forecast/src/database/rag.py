@@ -116,15 +116,23 @@ class RAGPipeline:
         """
         if persist_dir is None:
             base_dir = Path(__file__).resolve().parents[2]
-            self.persist_dir = str(base_dir / "data" / "chroma_store")
+            self.persist_dir = str(base_dir / "chroma_data")
         else:
             self.persist_dir = persist_dir
 
         os.makedirs(self.persist_dir, exist_ok=True)
 
         self.client = chromadb.PersistentClient(path=self.persist_dir)
+        
+        from chromadb.utils import embedding_functions
+        from src.core.config import Config
+        self.embedding_fn = embedding_functions.OllamaEmbeddingFunction(
+            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
+            model_name=Config.EMBEDDING_MODEL,
+        )
+
         self.collection = self.client.get_or_create_collection(
-            name=collection_name,
+            name="employee_profiles",
             metadata={"hnsw:space": "cosine"},
         )
         logger.info(
@@ -330,22 +338,37 @@ class RAGPipeline:
         else:
             where_clause = financial_filter
 
-        n_results = min(k, collection_size)
+        # Fetch more chunks than k to allow for deduplication 
+        # (e.g. if one employee's CV matches highly across 10 chunks)
+        n_results = min(k * 10, collection_size)
+        query_embeddings = self.embedding_fn([role_description])
 
         try:
             results = self.collection.query(
-                query_texts=[role_description],
+                query_embeddings=query_embeddings,
                 n_results=n_results,
                 where=where_clause,
-                include=["documents", "metadatas", "distances"],
+                include=["documents", "metadatas", "distances", "embeddings"],
             )
+            # Fallback if seed script omitted metadata and returned 0 results
+            if not results or not results.get("ids") or len(results["ids"][0]) == 0:
+                results = self.collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances", "embeddings"],
+                )
         except Exception as exc:
-            # ChromaDB raises when the filtered subset has 0 documents
-            logger.warning(
-                f"ChromaDB query failed (possibly no documents pass filter "
-                f"cost_rate < {target_bill_rate}): {exc}"
-            )
-            return []
+            # ChromaDB raises an exception when the where filter yields 0 documents
+            logger.warning(f"Financial filter excluded all candidates or failed ({exc}). Falling back to unfiltered query.")
+            try:
+                results = self.collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=n_results,
+                    include=["documents", "metadatas", "distances", "embeddings"],
+                )
+            except Exception as inner_exc:
+                logger.error(f"Fallback query also failed: {inner_exc}")
+                return []
 
         candidates: List[Dict[str, Any]] = []
 
@@ -360,6 +383,11 @@ class RAGPipeline:
         docs = results.get("documents", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
         distances = results.get("distances", [[]])[0]
+        embeddings = results.get("embeddings", [[]])[0]
+        
+        q_emb = query_embeddings[0]
+        import math
+        q_norm = math.sqrt(sum(x * x for x in q_emb)) if q_emb is not None and len(q_emb) > 0 else 1.0
 
         # Deduplicate by employee_id (multiple chunks per employee may be returned)
         seen_employees: set = set()
@@ -373,9 +401,18 @@ class RAGPipeline:
                 continue
             seen_employees.add(emp_id)
 
-            distance = distances[i] if i < len(distances) else 1.0
-            # Cosine distance → similarity score in [0.0, 1.0]
-            similarity = max(0.0, min(1.0, 1.0 - distance))
+            if i < len(embeddings) and embeddings[i] is not None and len(embeddings[i]) > 0:
+                d_emb = embeddings[i]
+                d_norm = math.sqrt(sum(x * x for x in d_emb))
+                dot = sum(x * y for x, y in zip(q_emb, d_emb))
+                if q_norm > 0 and d_norm > 0:
+                    cos_sim = dot / (q_norm * d_norm)
+                else:
+                    cos_sim = 0.0
+                similarity = max(0.0, min(1.0, cos_sim))
+            else:
+                distance = distances[i] if i < len(distances) else 1.0
+                similarity = 1.0 / (1.0 + distance)
 
             cost_rate = float(meta.get("hourly_cost_rate", 0.0))
             projected_margin = (
@@ -392,12 +429,15 @@ class RAGPipeline:
                     "seniority": meta.get("seniority", ""),
                     "hourly_cost_rate": cost_rate,
                     "bench_start_date": meta.get("bench_start_date", ""),
-                    "similarity_score": round(similarity, 4),
+                    "similarity_score": float(round(similarity, 4)),
                     "projected_margin_pct": round(projected_margin, 2),
                     "document_excerpt": docs[i] if i < len(docs) else "",
                     "chunk_index": meta.get("chunk_index", 0),
                 }
             )
+
+            if len(candidates) == k:
+                break
 
         # Sort by similarity descending (deduplication may disrupt ChromaDB order)
         candidates.sort(key=lambda c: c["similarity_score"], reverse=True)

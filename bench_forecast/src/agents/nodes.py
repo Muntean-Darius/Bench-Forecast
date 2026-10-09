@@ -23,6 +23,10 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
+from sqlalchemy import select, or_
+from src.database.database import AsyncSessionLocal
+from src.database.models import Employee, ProjectDemand, BenchStatusEnum, DemandStatusEnum, ForecastRun, Allocation, AllocationStatusEnum
+
 from src.agents.state import MAX_REVISIONS, State
 from src.database.vector_store import VectorStoreManager
 from src.database.rag import RAGPipeline
@@ -91,43 +95,102 @@ def _get_db():
     return SQLiteManager()
 
 
+from sqlalchemy.orm import selectinload
+
 # ===========================================================================
 # Node 1 — Data Extractor (Deterministic)
 # ===========================================================================
 
-def data_extractor_node(state: State) -> Dict[str, Any]:
-    """Deterministic extraction of bench talent and open project demands.
-
-    Queries:
-    - get_bench_forecast(horizon_days): employees finishing within N days.
-    - get_open_demands(min_win_probability): high-confidence pipeline roles.
-
-    Args:
-        state: Current workflow state (reads horizon_days, min_win_probability).
-
-    Returns:
-        State delta: employees, demands, initialised revision fields.
+async def data_extractor_node(state: State) -> Dict[str, Any]:
+    """Deterministic extraction of bench talent and open project demands using AsyncSession.
     """
     _log_state_entry("data_extractor_node", state)
 
-    db = _get_db()
     horizon_days: int = state.get("horizon_days", 90)
     min_win_prob: float = state.get("min_win_probability", 0.75)
 
     try:
-        employees = db.get_bench_forecast(horizon_days=horizon_days)
-        demands = db.get_open_demands(min_win_probability=min_win_prob)
-        logger.info(
-            f"data_extractor_node: fetched {len(employees)} employees "
-            f"(horizon={horizon_days}d), {len(demands)} demands (p>={min_win_prob:.0%})"
-        )
+        async with AsyncSessionLocal() as db:
+            # Query active employees on bench or upcoming_bench with their costs
+            emp_stmt = select(Employee).options(
+                selectinload(Employee.employee_costs)
+            ).where(
+                Employee.is_active == True,
+                Employee.bench_status.in_([BenchStatusEnum.bench, BenchStatusEnum.upcoming_bench])
+            )
+            emp_res = await db.execute(emp_stmt)
+            employees_db = emp_res.scalars().all()
+
+            employees = []
+            for emp in employees_db:
+                emp_dict = {
+                    "id": str(emp.id),
+                    "name": f"{emp.first_name} {emp.last_name}",
+                    "skills": getattr(emp, "skills") or [], # Legacy fallback or use empty
+                    "profile_text": emp.profile_text,
+                    "bench_status": emp.bench_status.value
+                }
+                
+                # Attach financial data
+                if emp.employee_costs:
+                    # Use the most recent cost (assuming order or just take the first)
+                    latest_cost = emp.employee_costs[0]
+                    emp_dict["hourly_cost"] = float(latest_cost.internal_hourly_cost)
+                    emp_dict["daily_cost"] = float(latest_cost.internal_daily_cost)
+                else:
+                    emp_dict["hourly_cost"] = 0.0
+                    emp_dict["daily_cost"] = 0.0
+                
+                employees.append(emp_dict)
+
+            # Query open demands with their projects
+            dem_stmt = select(ProjectDemand).options(
+                selectinload(ProjectDemand.project)
+            ).where(
+                ProjectDemand.status == DemandStatusEnum.open,
+                or_(ProjectDemand.win_probability >= min_win_prob, ProjectDemand.win_probability == None)
+            )
+            dem_res = await db.execute(dem_stmt)
+            demands_db = dem_res.scalars().all()
+
+            demands = []
+            for d in demands_db:
+                proj = d.project
+                # required_skills is a JSONB column — may be a dict, a list, or None.
+                # Normalise to list so downstream code can safely call join() on it.
+                raw_skills = d.required_skills or []
+                if isinstance(raw_skills, dict):
+                    # Support both {"skills": [...]} and {"Python": true, ...} shapes
+                    raw_skills = raw_skills.get("skills", list(raw_skills.keys()))
+                if not isinstance(raw_skills, list):
+                    raw_skills = []
+
+                dem_dict = {
+                    "id": str(d.id),
+                    "project_id": str(d.project_id),
+                    "role": d.role,
+                    "description": d.description,
+                    "required_skills": raw_skills
+                }
+                
+                # Attach financial data, falling back to project if not explicitly set on demand
+                dem_dict["target_bill_rate"] = float(d.target_bill_rate) if d.target_bill_rate else 0.0
+                dem_dict["target_margin"] = float(d.target_margin) if d.target_margin else (float(proj.target_margin) if proj and proj.target_margin else 25.0)
+                dem_dict["win_probability"] = float(d.win_probability) if d.win_probability else (float(proj.probability)/100.0 if proj else 0.5)
+                
+                demands.append(dem_dict)
+
+            logger.info(
+                f"data_extractor_node: fetched {len(employees)} employees "
+                f"(horizon={horizon_days}d), {len(demands)} demands (p>={min_win_prob:.0%})"
+            )
     except Exception:
         logger.exception("data_extractor_node: database query failed")
         employees, demands = [], []
 
     updates = {
-        "employees": employees,
-        "demands": demands,
+        "bench_employees": employees,
+        "open_demands": demands,
         "revision_count": state.get("revision_count", 0),
         "rejection_feedback": state.get("rejection_feedback", None),
     }
@@ -140,24 +203,11 @@ def data_extractor_node(state: State) -> Dict[str, Any]:
 # ===========================================================================
 
 def skill_matcher_node(state: State) -> Dict[str, Any]:
-    """RAG-augmented semantic matching of employee profiles against demands.
-
-    TRUE RAG implementation:
-    1. Query ChromaDB with the demand's narrative description.
-    2. Retrieve top-k semantically similar employee profile passages.
-    3. Inject those passages into the LLM prompt as grounding evidence.
-    4. The LLM cites specific passages in its reasoning.
-
-    Args:
-        state: Workflow state with employees and demands populated.
-
-    Returns:
-        State delta: skill_matches (each match includes rag_passages).
-    """
+    """RAG-augmented semantic matching of employee profiles against demands."""
     _log_state_entry("skill_matcher_node", state)
 
-    employees = state.get("employees", [])
-    demands = state.get("demands", [])
+    employees = state.get("bench_employees", [])
+    demands = state.get("open_demands", [])
 
     if not employees or not demands:
         logger.warning("skill_matcher_node: no employees or demands — skipping matching")
@@ -170,23 +220,22 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
     all_matches: List[Dict[str, Any]] = []
 
     for demand in demands:
-        rag_query = f"{demand.role} {demand.description or ''}"
+        rag_query = f"{demand.get('role', '')} {demand.get('description') or ''}"
         rag_results: List[Dict[str, Any]] = []
 
         try:
             rag_results = vector_mgr.similarity_search(rag_query, k=3)
             if rag_results:
                 logger.debug(
-                    f"skill_matcher: '{demand.role}' RAG top match: "
+                    f"skill_matcher: '{demand.get('role')}' RAG top match: "
                     f"{rag_results[0].get('name')} "
                     f"(score={rag_results[0].get('similarity_score', 0):.2f})"
                 )
         except Exception:
             logger.exception(
-                f"skill_matcher_node: ChromaDB query failed for '{demand.role}'"
+                f"skill_matcher_node: ChromaDB query failed for '{demand.get('role')}'"
             )
 
-        # Build passage lookup per employee_id
         rag_passages_by_emp: Dict[str, List[str]] = {}
         candidate_ids = set()
         for r in rag_results:
@@ -197,31 +246,27 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
             if emp_id and excerpt:
                 rag_passages_by_emp.setdefault(emp_id, []).append(excerpt)
 
-        # Only evaluate candidates retrieved by ChromaDB (O(Demands * K) vs O(Demands * Employees))
-        candidates = [emp for emp in employees if emp.id in candidate_ids]
-        
-        # Fallback to random 3 if vector search fails or returns nothing
+        candidates = [emp for emp in employees if emp.get("id") in candidate_ids]
         if not candidates:
             candidates = employees[:3]
 
         for employee in candidates:
             try:
-                emp_rag = rag_passages_by_emp.get(employee.id, [])
-                # Prepend the employee's own profile text as the primary passage
-                if employee.profile_text and employee.profile_text not in emp_rag:
-                    emp_rag = [employee.profile_text] + emp_rag
+                emp_rag = rag_passages_by_emp.get(employee.get("id"), [])
+                if employee.get("profile_text") and employee.get("profile_text") not in emp_rag:
+                    emp_rag = [employee.get("profile_text")] + emp_rag
 
                 sys_msg, human_msg = MatchPromptBuilder.build_matching_prompt(
                     employee_profile=(
-                        employee.profile_text
-                        or f"{employee.name}: {', '.join(employee.skills)}"
+                        employee.get("profile_text")
+                        or f"{employee.get('name')}: {', '.join(employee.get('skills') or [])}"
                     ),
                     job_description=(
-                        demand.description
-                        or f"{demand.role} requiring: {', '.join(demand.required_skills)}"
+                        demand.get("description")
+                        or f"{demand.get('role')} requiring: {', '.join(demand.get('required_skills') or [])}"
                     ),
-                    required_skills=demand.required_skills,
-                    employee_skills=employee.skills,
+                    required_skills=demand.get("required_skills") or [],
+                    employee_skills=employee.get("skills") or [],
                     rag_passages=emp_rag[:3],
                 )
 
@@ -229,8 +274,8 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
                 match_json = LLMFactory.parse_json_response(response.content)
 
                 match = MatchJustification(
-                    employee_id=employee.id,
-                    demand_id=demand.id,
+                    employee_id=str(employee.get("id")),
+                    demand_id=str(demand.get("id")),
                     match_score=float(match_json.get("match_score", 0.0)),
                     reasoning=match_json.get("reasoning") or "No reasoning provided",
                     missing_skills=match_json.get("missing_skills", []),
@@ -239,26 +284,17 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
                 )
 
                 match_dict = match.model_dump()
-                match_dict["target_project_id"] = demand.project_id
+                match_dict["target_project_id"] = demand.get("project_id")
                 all_matches.append(match_dict)
-
-                logger.debug(
-                    f"  {employee.name} → {demand.role}: "
-                    f"score={match.match_score:.2f} passages={len(emp_rag)}"
-                )
 
             except Exception:
                 logger.exception(
                     f"skill_matcher_node: error matching "
-                    f"employee={getattr(employee, 'name', '?')} "
-                    f"demand={demand.role}"
+                    f"employee={employee.get('name', '?')} "
+                    f"demand={demand.get('role')}"
                 )
 
     all_matches.sort(key=lambda x: x["match_score"], reverse=True)
-    logger.info(
-        f"skill_matcher_node: generated {len(all_matches)} RAG-grounded matches"
-    )
-
     updates = {"skill_matches": all_matches}
     _log_state_exit("skill_matcher_node", updates)
     return updates
@@ -269,28 +305,13 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
 # ===========================================================================
 
 def allocation_decider_node(state: State) -> Dict[str, Any]:
-    """Per-role financial optimization using the RAGPipeline financial pre-filter.
-
-    For each demand:
-    1. Call RAGPipeline.retrieve_candidates() with financial pre-filter
-       (cost_rate < target_bill_rate) to obtain only profitable candidates.
-    2. Build FinancialMatchPrompts.build_role_evaluation_prompt() injecting
-       target_bill_rate and target_margin.
-    3. Parse and validate the LLM output against AllocationDecision schema.
-    4. Store per-role decisions in state for the planning node.
-
-    Args:
-        state: Workflow state with demands populated.
-
-    Returns:
-        State delta: allocation_decisions (list of per-role decision dicts).
-    """
+    """Per-role financial optimization using the RAGPipeline financial pre-filter."""
     _log_state_entry("allocation_decider_node", state)
 
-    demands = state.get("demands", [])
+    demands = state.get("open_demands", [])
     if not demands:
         logger.warning("allocation_decider_node: no demands — skipping")
-        updates = {"allocation_decisions": []}
+        updates = {"decisions": []}
         _log_state_exit("allocation_decider_node", updates)
         return updates
 
@@ -299,17 +320,15 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     decisions: List[Dict[str, Any]] = []
 
     for demand in demands:
-        role_title = getattr(demand, "role", "Unknown Role")
-        role_description = getattr(demand, "description", "") or role_title
+        role_title = demand.get("role", "Unknown Role")
+        role_description = demand.get("description", "") or role_title
 
-        # Resolve billing rate: use target_bill_rate if present (new schema),
-        # else derive a heuristic from win_probability
         target_bill_rate = float(
-            getattr(demand, "target_bill_rate", None)
-            or (getattr(demand, "win_probability", 0.5) * 200)
+            demand.get("target_bill_rate")
+            or (demand.get("win_probability", 0.5) * 200)
             or 100.0
         )
-        target_margin = float(getattr(demand, "target_margin", None) or 25.0)
+        target_margin = float(demand.get("target_margin") or 25.0)
 
         logger.info(
             f"allocation_decider: evaluating '{role_title}' "
@@ -317,7 +336,6 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
         )
 
         try:
-            # Step 1: Financially filtered ChromaDB retrieval
             candidates = rag.retrieve_candidates(
                 role_description=role_description,
                 target_bill_rate=target_bill_rate,
@@ -328,7 +346,6 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 f"{len(candidates)} returned"
             )
 
-            # Step 2: LLM evaluation with financial context
             sys_msg, human_msg = FinancialMatchPrompts.build_role_evaluation_prompt(
                 role_title=role_title,
                 role_description=role_description,
@@ -340,15 +357,14 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
             response = llm.invoke([sys_msg, human_msg])
             raw_json = LLMFactory.parse_json_response(response.content)
 
-            # Step 3: Validate against AllocationDecision Pydantic schema
             decision = AllocationDecision(**raw_json)
 
             decision_dict = decision.model_dump()
             decision_dict.update(
                 {
-                    "role_id": getattr(demand, "id", ""),
+                    "role_id": demand.get("id", ""),
                     "role_title": role_title,
-                    "target_project_id": getattr(demand, "project_id", ""),
+                    "target_project_id": demand.get("project_id", ""),
                     "target_bill_rate": target_bill_rate,
                     "target_margin": target_margin,
                     "candidate_count": len(candidates),
@@ -367,7 +383,6 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
             logger.exception(
                 f"allocation_decider_node: failed to evaluate role '{role_title}'"
             )
-            # Safe fallback: recommend hiring when evaluation fails
             decisions.append(
                 {
                     "action_type": "hire",
@@ -378,16 +393,16 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                         "External hiring recommended as safe fallback."
                     ),
                     "upskilling_path": None,
-                    "role_id": getattr(demand, "id", ""),
+                    "role_id": demand.get("id", ""),
                     "role_title": role_title,
-                    "target_project_id": getattr(demand, "project_id", ""),
+                    "target_project_id": demand.get("project_id", ""),
                     "target_bill_rate": target_bill_rate,
                     "target_margin": target_margin,
                     "candidate_count": 0,
                 }
             )
 
-    updates = {"allocation_decisions": decisions}
+    updates = {"decisions": decisions}
     _log_state_exit("allocation_decider_node", updates)
     return updates
 
@@ -411,8 +426,8 @@ def forecast_planner_node(state: State) -> Dict[str, Any]:
     _log_state_entry("forecast_planner_node", state)
 
     matches = state.get("skill_matches", [])
-    employees = state.get("employees", [])
-    demands = state.get("demands", [])
+    employees = state.get("bench_employees", [])
+    demands = state.get("open_demands", [])
 
     if not matches:
         logger.warning("forecast_planner_node: no skill matches — returning empty plan")
@@ -573,8 +588,8 @@ def revision_planner_node(state: State) -> Dict[str, Any]:
     feedback = state.get("rejection_feedback") or "No specific feedback provided."
     previous_plan = state.get("recommendations", {})
     matches = state.get("skill_matches", [])
-    employees = state.get("employees", [])
-    demands = state.get("demands", [])
+    employees = state.get("bench_employees", [])
+    demands = state.get("open_demands", [])
     revision_count = state.get("revision_count", 0)
 
     logger.info(
@@ -633,19 +648,8 @@ def revision_planner_node(state: State) -> Dict[str, Any]:
 # Node 7 — Execution Engine (Deterministic write to DB)
 # ===========================================================================
 
-def execution_engine_node(state: State) -> Dict[str, Any]:
-    """Deterministic execution of human-approved allocations.
-
-    Writes approved allocation records to the operational database.
-    Bridges to SQLiteManager for backward compatibility with existing data;
-    production deployments should use the PostgreSQL models from models.py.
-
-    Args:
-        state: Workflow state with human_approved=True and recommendations.
-
-    Returns:
-        State delta: execution_status.
-    """
+async def execution_engine_node(state: State) -> Dict[str, Any]:
+    """Deterministic execution of human-approved allocations using AsyncSession."""
     _log_state_entry("execution_engine_node", state)
 
     if not state.get("human_approved"):
@@ -656,6 +660,7 @@ def execution_engine_node(state: State) -> Dict[str, Any]:
 
     recommendations = state.get("recommendations", {})
     reallocations = recommendations.get("reallocations", [])
+    forecast_run_id = state.get("forecast_run_id")
 
     if not reallocations:
         logger.info("execution_engine_node: no reallocations to execute")
@@ -663,45 +668,100 @@ def execution_engine_node(state: State) -> Dict[str, Any]:
         _log_state_exit("execution_engine_node", updates)
         return updates
 
-    db = _get_db()
     executed_count = 0
 
-    for reallocation in reallocations:
-        try:
-            emp_id = (
-                reallocation.get("employee_id")
-                or reallocation.get("id", "unknown")
-            )
-            project_id = (
-                reallocation.get("target_project_id")
-                or reallocation.get("project_id", "unknown")
-            )
-            role = reallocation.get("role", "Unspecified")
-            match_score = float(reallocation.get("match_score", 0.0))
+    try:
+        async with AsyncSessionLocal() as db:
+            for reallocation in reallocations:
+                # Resolve employee ID
+                emp_id_str = reallocation.get("employee_id") or reallocation.get("id")
+                if not emp_id_str:
+                    continue
+                emp_id = uuid.UUID(emp_id_str)
+                
+                # Resolve project and role info
+                project_id_str = reallocation.get("target_project_id") or reallocation.get("project_id")
+                role = reallocation.get("role", "Unspecified")
+                role_id_str = reallocation.get("role_id") or reallocation.get("demand_id")
+                match_score = float(reallocation.get("match_score", 0.0))
 
-            allocation_id = db.update_allocation(
-                recommendation_id=recommendations.get("recommendation_id", "unknown"),
-                employee_id=emp_id,
-                target_project_id=project_id,
-                role=role,
-                match_score=match_score,
-                approved_by=state.get("human_feedback") or "system",
-            )
-            logger.info(
-                f"  execution_engine: allocated {emp_id} → {project_id} "
-                f"role='{role}' score={match_score:.2f} allocation_id={allocation_id}"
-            )
-            executed_count += 1
+                demand_uuid = None
+                demand = None
+                
+                # First try to find by role_id / demand_id
+                if role_id_str:
+                    dem_stmt = select(ProjectDemand).where(
+                        ProjectDemand.id == uuid.UUID(role_id_str),
+                        ProjectDemand.status == DemandStatusEnum.open
+                    )
+                    dem_res = await db.execute(dem_stmt)
+                    demand = dem_res.scalars().first()
+                
+                # Fallback to project_id and role
+                if not demand and project_id_str:
+                    dem_stmt = select(ProjectDemand).where(
+                        ProjectDemand.project_id == uuid.UUID(project_id_str),
+                        ProjectDemand.role == role,
+                        ProjectDemand.status == DemandStatusEnum.open
+                    )
+                    dem_res = await db.execute(dem_stmt)
+                    demand = dem_res.scalars().first()
+                    
+                if demand:
+                    demand_uuid = demand.id
 
-        except Exception:
-            logger.exception(
-                f"execution_engine_node: failed reallocation for "
-                f"{reallocation.get('employee_id', '?')}"
-            )
+                    # F5: Guard the floor at 0 to prevent negative headcount on retry.
+                    if demand.headcount_needed > 0:
+                        demand.headcount_needed -= 1
+                    if demand.headcount_needed <= 0:
+                        demand.status = DemandStatusEnum.filled
 
-    status = f"executed_{executed_count}_of_{len(reallocations)}"
-    logger.info(f"execution_engine_node: {status}")
+                # forecast_run_id is stored as str in state (MemorySaver serialisation).
+                # Cast back to UUID for the FK column.
+                forecast_run_uuid = uuid.UUID(forecast_run_id) if forecast_run_id else None
 
-    updates = {"execution_status": status}
+                # Create allocation record
+                allocation = Allocation(
+                    employee_id=emp_id,
+                    demand_id=demand_uuid,
+                    role_on_project=role,
+                    allocation_pct=100.0,
+                    status=AllocationStatusEnum.active,
+                    ai_match_score=match_score,
+                    forecast_run_id=forecast_run_uuid,
+                )
+                db.add(allocation)
+
+                # Update employee bench status
+                emp_stmt = select(Employee).where(Employee.id == emp_id)
+                emp_res = await db.execute(emp_stmt)
+                employee = emp_res.scalars().first()
+                if employee:
+                    employee.bench_status = BenchStatusEnum.on_project
+                    employee.bench_start_date = None
+
+                logger.info(f"  execution_engine: allocated {emp_id} → demand {demand_uuid} role='{role}' score={match_score:.2f}")
+                executed_count += 1
+
+            # Update forecast run status
+            if forecast_run_id:
+                run_uuid = uuid.UUID(forecast_run_id)
+                run_stmt = select(ForecastRun).where(ForecastRun.id == run_uuid)
+                run_res = await db.execute(run_stmt)
+                run_rec = run_res.scalars().first()
+                if run_rec:
+                    run_rec.status = "completed"
+
+            await db.commit()
+    except Exception:
+        logger.exception("execution_engine_node: failed reallocation batch")
+        updates = {"execution_status": "failed"}
+        _log_state_exit("execution_engine_node", updates)
+        return updates
+
+    status_msg = f"executed_{executed_count}_of_{len(reallocations)}"
+    logger.info(f"execution_engine_node: {status_msg}")
+
+    updates = {"execution_status": status_msg}
     _log_state_exit("execution_engine_node", updates)
     return updates

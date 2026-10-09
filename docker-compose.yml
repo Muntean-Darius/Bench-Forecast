@@ -1,0 +1,142 @@
+# =============================================================================
+# Bench Forecast — Infrastructure Services
+#
+# Services:
+#   postgres   — PostgreSQL 16 (relational data: HR, projects, allocations, KPIs)
+#   chromadb   — ChromaDB 0.5 persistent (employee profile embeddings)
+#   minio      — MinIO S3-compatible (CV PDFs, cert files, contracts)
+#   phoenix    — Arize Phoenix (agent + RAG + LLM trace observability)
+#
+# Usage:
+#   docker compose up -d            # start all services
+#   docker compose down -v          # stop + remove volumes (fresh state)
+#   docker compose logs -f postgres # stream logs for a specific service
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 — relational source of truth
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: bench_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bench_forecast
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bench_forecast"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - bench_net
+
+  # ---------------------------------------------------------------------------
+  # ChromaDB 0.5 — persistent vector store for employee profile embeddings
+  # Embeddings: nomic-embed-text (768-dim) via Ollama
+  # Collections: employee_profiles
+  # ---------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: bench_chromadb
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+      CHROMA_SERVER_HTTP_PORT: "8200"
+    ports:
+      - "8200:8200"
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8200/api/v1/heartbeat || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - bench_net
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object store for binary documents
+  # Buckets: bench-docs/{cv,certifications,contracts}
+  # Console: http://localhost:9001  (minioadmin / minioadmin)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: elestio/minio:latest
+    container_name: bench_minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - bench_net
+
+  # ---------------------------------------------------------------------------
+  # Arize Phoenix — agent / RAG / LLM trace observability
+  # Dashboard:  http://localhost:6006
+  # OTLP gRPC:  localhost:4317
+  # OTLP HTTP:  localhost:4318
+  # ---------------------------------------------------------------------------
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: bench_phoenix
+    restart: unless-stopped
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    ports:
+      - "6006:6006"   # Phoenix UI
+      - "4317:4317"   # OTLP gRPC (LangChain → Phoenix)
+      - "4318:4318"   # OTLP HTTP
+    volumes:
+      - phoenix_data:/mnt/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6006 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - bench_net
+
+# =============================================================================
+# Named volumes (persist across container restarts)
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  chroma_data:
+    driver: local
+  minio_data:
+    driver: local
+  phoenix_data:
+    driver: local
+
+# =============================================================================
+# Internal network — services communicate by container name
+# e.g. POSTGRES_HOST=postgres, CHROMA_HOST=chromadb
+# =============================================================================
+networks:
+  bench_net:
+    driver: bridge

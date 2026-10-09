@@ -4,6 +4,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import chromadb
 from chromadb.config import Settings
+from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
+
+# Instrument ChromaDB for Phoenix Tracing
+ChromaInstrumentor().instrument()
 
 
 class VectorStoreManager:
@@ -15,14 +19,22 @@ class VectorStoreManager:
         collection_name: str = "employee_profiles",
     ) -> None:
         if persist_dir is None:
-            # Default to data/chroma_store relative to bench_forecast root
+            # Default to chroma_data relative to bench_forecast root (matches seed script)
             base_dir = Path(__file__).resolve().parents[2]
-            self.persist_dir = str(base_dir / "data" / "chroma_store")
+            self.persist_dir = str(base_dir / "chroma_data")
         else:
             self.persist_dir = persist_dir
 
         os.makedirs(self.persist_dir, exist_ok=True)
         self.client = chromadb.PersistentClient(path=self.persist_dir)
+        
+        from chromadb.utils import embedding_functions
+        from src.core.config import Config
+        self.embedding_fn = embedding_functions.OllamaEmbeddingFunction(
+            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
+            model_name=Config.EMBEDDING_MODEL,
+        )
+
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
@@ -68,10 +80,13 @@ class VectorStoreManager:
         count = self.collection.count()
         n_results = min(k, count)
 
+        # Compute embedding manually using Ollama to bypass ChromaDB's internal default
+        query_embeddings = self.embedding_fn([query])
+
         results = self.collection.query(
-            query_texts=[query],
+            query_embeddings=query_embeddings,
             n_results=n_results,
-            include=["documents", "metadatas", "distances"],
+            include=["documents", "metadatas", "distances", "embeddings"],
         )
 
         matches: List[Dict[str, Any]] = []
@@ -82,11 +97,25 @@ class VectorStoreManager:
         docs = results["documents"][0] if results["documents"] else []
         metas = results["metadatas"][0] if results["metadatas"] else []
         distances = results["distances"][0] if results["distances"] else []
+        embeddings = results.get("embeddings", [[]])[0]
+
+        q_emb = query_embeddings[0]
+        import math
+        q_norm = math.sqrt(sum(x * x for x in q_emb)) if q_emb is not None and len(q_emb) > 0 else 1.0
 
         for i in range(len(ids)):
-            # Convert cosine distance to similarity score (0.0 to 1.0)
-            distance = distances[i] if i < len(distances) else 1.0
-            similarity = max(0.0, min(1.0, 1.0 - distance))
+            if i < len(embeddings) and embeddings[i] is not None and len(embeddings[i]) > 0:
+                d_emb = embeddings[i]
+                d_norm = math.sqrt(sum(x * x for x in d_emb))
+                dot = sum(x * y for x, y in zip(q_emb, d_emb))
+                if q_norm > 0 and d_norm > 0:
+                    cos_sim = dot / (q_norm * d_norm)
+                else:
+                    cos_sim = 0.0
+                similarity = max(0.0, min(1.0, cos_sim))
+            else:
+                distance = distances[i] if i < len(distances) else 1.0
+                similarity = max(0.0, min(1.0, 1.0 - distance))
 
             matches.append({
                 "id": ids[i],
@@ -95,7 +124,7 @@ class VectorStoreManager:
                 "experience_years": metas[i].get("experience_years", 0.0) if i < len(metas) else 0.0,
                 "current_project": metas[i].get("current_project", "") if i < len(metas) else "",
                 "available_from": metas[i].get("available_from", "") if i < len(metas) else "",
-                "similarity_score": round(similarity, 4),
+                "similarity_score": float(round(similarity, 4)),
                 "document_excerpt": docs[i] if i < len(docs) else "",
             })
 
