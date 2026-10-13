@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -20,11 +20,23 @@ function allocationToProposal(a: any) {
   const matchScore = a.ai_match_score ? Number(a.ai_match_score) : 0
   const margin = a.ai_projected_margin ? Number(a.ai_projected_margin) : 0
 
-  let cat: ProposalCategory = 'direct'
-  if (a.ai_upskilling_path || (matchScore < 0.75 && matchScore > 0)) {
-    cat = 'training'
-  } else if (matchScore === 0) {
+  // Classification rules:
+  //   • 'hiring' is reserved strictly for unassigned roles (no employee_id) or
+  //     explicitly external hires. An assigned employee is NEVER a hiring rec.
+  //   • An assigned employee is 'training' when the backend flagged a skill gap
+  //     (an upskilling path / training recommendation was produced) — training
+  //     is driven by missing skills, not by the match score alone.
+  //   • Otherwise an assigned employee is a 'direct' allocation.
+  const hasAssignedEmployee = Boolean(a.employee_id)
+  const isExternalHire = a.role_on_project === 'External Hire'
+
+  let cat: ProposalCategory
+  if (!hasAssignedEmployee || isExternalHire) {
     cat = 'hiring'
+  } else if (a.ai_upskilling_path) {
+    cat = 'training'
+  } else {
+    cat = 'direct'
   }
 
   const empName = a.employee
@@ -36,6 +48,20 @@ function allocationToProposal(a: any) {
     : ''
   const primaryRole = a.employee?.job_title || ''
 
+  const skills: string[] = a.employee?.skills
+    ? (typeof a.employee.skills === 'string' ? a.employee.skills.split(',') : a.employee.skills)
+    : []
+
+  // Derive skill gaps from the demand's required skills vs. the employee's
+  // skills so the HITL view can list exactly what training is needed.
+  const requiredSkills: string[] = Array.isArray(a.project_demand?.required_skills)
+    ? a.project_demand.required_skills
+    : []
+  const empSkillsLower = skills.map((s: string) => s.trim().toLowerCase())
+  const missingSkills: string[] = requiredSkills.filter(
+    (r: string) => r && !empSkillsLower.some((e: string) => e && (e === r.trim().toLowerCase() || e.includes(r.trim().toLowerCase()) || r.trim().toLowerCase().includes(e))),
+  )
+
   return {
     id: String(a.id),
     category: cat,
@@ -44,6 +70,9 @@ function allocationToProposal(a: any) {
       seniority: seniority,
       primary_role: primaryRole,
       id: String(a.employee_id),
+      hourly_cost_rate: Number(a.employee?.hourly_cost_rate ?? a.employee?.cost_rate ?? 0),
+      experience_years: Number(a.employee?.experience_years ?? 0),
+      skills: skills,
     },
     role: {
       title: a.role_on_project || a.project_demand?.role || 'Engineer',
@@ -51,7 +80,7 @@ function allocationToProposal(a: any) {
       start_date: new Date().toISOString(),
       headcount: a.project_demand?.headcount_needed ?? 1,
       target_bill_rate: a.project_demand?.target_bill_rate ? Number(a.project_demand.target_bill_rate) : 100,
-      required_skills: null,
+      required_skills: requiredSkills.length > 0 ? requiredSkills.join(', ') : null,
       project_id: String(a.project_id || ''),
       status: 'Open' as const,
     },
@@ -65,8 +94,10 @@ function allocationToProposal(a: any) {
     },
     match_score: matchScore,
     projected_margin: margin,
-    missing_skills: [] as string[],
+    missing_skills: missingSkills,
     reasoning: a.ai_justification ?? 'AI-generated allocation recommendation.',
+    training_recommendation: a.ai_upskilling_path ?? null,
+    ai_upskilling_path: a.ai_upskilling_path ?? null,
     rag_passages: [] as string[],
     created_at: a.created_at || new Date().toISOString(),
     revision_count: 0,
@@ -75,15 +106,64 @@ function allocationToProposal(a: any) {
   }
 }
 
+// ─── Deduplicate proposals: at most one card per employee (newest wins) ───────
+//
+// Pending allocations can accumulate across forecast runs. Without this, the
+// same employee can appear twice — e.g. a direct allocation from an old run and
+// a training allocation from a newer run.
+function dedupeProposals<
+  T extends { id: string; employee?: { id?: string }; created_at?: string },
+>(list: T[]): T[] {
+  const byKey = new Map<string, T>()
+  for (const p of list) {
+    // External-hire / unassigned proposals have no employee id — key them by
+    // their own proposal id so distinct hires are never collapsed together.
+    const key = p.employee?.id ? `emp:${p.employee.id}` : `prop:${p.id}`
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, p)
+      continue
+    }
+
+    // Prefer a DB-backed proposal over a synthetic `decision-*` one, since only
+    // the former can actually be approved/rejected against the allocations API.
+    const existingIsDecision = existing.id.startsWith('decision-')
+    const incomingIsDecision = p.id.startsWith('decision-')
+    if (existingIsDecision && !incomingIsDecision) {
+      byKey.set(key, p)
+      continue
+    }
+    if (!existingIsDecision && incomingIsDecision) continue
+
+    // Otherwise keep the most recent proposal for this employee.
+    const existingTs = new Date(existing.created_at || 0).getTime() || 0
+    const incomingTs = new Date(p.created_at || 0).getTime() || 0
+    if (incomingTs >= existingTs) byKey.set(key, p)
+  }
+  return Array.from(byKey.values())
+}
+
+// Module-level flag: distinguishes a fresh page load (start with an empty
+// queue) from in-app navigation back to the queue (restore this session's run).
+let queueHydratedThisSession = false
+
 export default function ActionQueue() {
   const navigate = useNavigate()
   const [catFilter, setCatFilter] = useState<ProposalCategory | 'all'>('all')
+  // The queue must be EMPTY on a fresh load — proposals only appear after the
+  // user runs a forecast. We never load pending allocations from the DB on
+  // mount, so proposals from previous runs never show up unprompted. Within the
+  // same session we restore the last run's proposals (so reviewing multiple
+  // proposals and navigating back works).
   const [proposals, setProposals] = useState<ReturnType<typeof allocationToProposal>[]>(() => {
+    if (!queueHydratedThisSession) {
+      queueHydratedThisSession = true
+      sessionStorage.removeItem('bf_cached_proposals')
+      return []
+    }
     try {
       const cached = sessionStorage.getItem('bf_cached_proposals')
-      if (cached) {
-        return JSON.parse(cached)
-      }
+      if (cached) return JSON.parse(cached)
     } catch (e) {
       console.error('Failed to parse cached proposals:', e)
     }
@@ -93,52 +173,7 @@ export default function ActionQueue() {
     return sessionStorage.getItem('bf_cached_forecast_run_id') || ''
   })
   const [loading, setLoading] = useState(false)
-  const [fetchingPending, setFetchingPending] = useState(true)
   const [error, setError] = useState<string | null>(null)
-
-  // Load pending allocations on mount and merge with any active forecast proposals
-  useEffect(() => {
-    async function loadPending() {
-      try {
-        const data = await api.getPendingAllocations()
-        if (data && data.length > 0) {
-          const dbProposals = data.map(allocationToProposal)
-          setProposals((prev) => {
-            if (!prev || prev.length === 0) {
-              sessionStorage.setItem('bf_cached_proposals', JSON.stringify(dbProposals))
-              return dbProposals
-            }
-
-            // Merge: preserve proposals from forecast decisions (e.g. hiring recommendations)
-            // and update existing matching DB items
-            const dbMap = new Map(dbProposals.map((p) => [p.id, p]))
-            const merged: ReturnType<typeof allocationToProposal>[] = []
-
-            for (const p of prev) {
-              if (dbMap.has(p.id)) {
-                merged.push(dbMap.get(p.id)!)
-                dbMap.delete(p.id)
-              } else if (p.id.startsWith('decision-') || p.category === 'hiring') {
-                merged.push(p)
-              }
-            }
-
-            for (const remaining of dbMap.values()) {
-              merged.push(remaining)
-            }
-
-            sessionStorage.setItem('bf_cached_proposals', JSON.stringify(merged))
-            return merged
-          })
-        }
-      } catch (e) {
-        console.error('Failed to load pending allocations:', e)
-      } finally {
-        setFetchingPending(false)
-      }
-    }
-    loadPending()
-  }, [])
 
   async function handleRunForecast() {
     setLoading(true)
@@ -153,28 +188,43 @@ export default function ActionQueue() {
       // Fetch pending allocations from DB
       const pendingData = await api.getPendingAllocations()
       const dbProposals = (pendingData && pendingData.length > 0)
-        ? pendingData.map(allocationToProposal)
+        ? dedupeProposals(pendingData.map(allocationToProposal))
         : []
 
       // Also get decisions from state_metadata (which includes hiring recommendations)
       const decisions = res.state_metadata?.decisions ?? []
       const decisionProposals = decisions.map((d: any, i: number) => {
         const actType = d.action_type || d.category || 'allocate'
-        const cat: ProposalCategory =
-          actType === 'train' || actType === 'training'
-            ? 'training'
-            : actType === 'hire' || actType === 'hiring'
-            ? 'hiring'
-            : 'direct'
+
+        // An assigned employee is never a hiring recommendation.
+        let cat: ProposalCategory
+        if (!d.employee_id) {
+          cat = 'hiring'
+        } else if (
+          actType === 'train' ||
+          actType === 'training' ||
+          d.upskilling_path ||
+          (Array.isArray(d.missing_skills) && d.missing_skills.length > 0)
+        ) {
+          cat = 'training'
+        } else {
+          cat = 'direct'
+        }
 
         return {
           id: `decision-${i}`,
           category: cat,
           employee: {
-            full_name: d.employee_id ? `Employee ${String(d.employee_id).substring(0, 8)}` : 'External Hire',
+            full_name: d.full_name
+              || (d.employee_id ? `Employee ${String(d.employee_id).substring(0, 8)}` : 'External Hire'),
             seniority: d.seniority || 'Mid',
             primary_role: d.role_title || 'Engineer',
             id: String(d.employee_id ?? ''),
+            hourly_cost_rate: d.hourly_cost_rate ?? 0,
+            experience_years: d.experience_years ?? 3,
+            skills: d.skills
+              ? (typeof d.skills === 'string' ? d.skills.split(',') : d.skills)
+              : [],
           },
           role: {
             title: String(d.role_title ?? d.role ?? 'Engineer'),
@@ -194,10 +244,12 @@ export default function ActionQueue() {
             target_margin: d.target_margin ?? 30,
             total_budget: 0,
           },
-          match_score: d.match_score ?? 0.85,
+          match_score: d.match_score ?? d.similarity_score ?? 0.85,
           projected_margin: d.projected_margin ?? 28.5,
           missing_skills: (d.missing_skills || []) as string[],
           reasoning: d.justification ?? 'AI recommendation from allocation optimization engine.',
+          training_recommendation: d.upskilling_path ?? null,
+          ai_upskilling_path: d.upskilling_path ?? null,
           rag_passages: [] as string[],
           created_at: new Date().toISOString(),
           revision_count: res.state_metadata?.revision_count ?? 0,
@@ -213,6 +265,9 @@ export default function ActionQueue() {
       } else {
         combinedProposals = decisionProposals
       }
+
+      // Guard against duplicate employee cards across runs/categories.
+      combinedProposals = dedupeProposals(combinedProposals)
 
       setProposals(combinedProposals)
       sessionStorage.setItem('bf_cached_proposals', JSON.stringify(combinedProposals))
@@ -309,9 +364,7 @@ export default function ActionQueue() {
 
       {/* Proposals list */}
       <div className="card divide-y divide-gray-100">
-        {fetchingPending && proposals.length === 0 ? (
-          <p className="px-4 py-8 text-sm text-center text-gray-400">Loading pending allocations…</p>
-        ) : filtered.length === 0 ? (
+        {filtered.length === 0 ? (
           <div className="px-4 py-8 text-center">
             <p className="text-sm text-gray-400">No proposals in this category.</p>
             <p className="text-xs text-gray-400 mt-1 font-mono">Click "Run Forecast" to trigger the AI allocation engine.</p>

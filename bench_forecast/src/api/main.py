@@ -276,9 +276,11 @@ async def update_employee_profile(employee_id: str, payload: UpdateProfileReques
 # GET /api/v1/health  &  GET /
 # ---------------------------------------------------------------------------
 
+@app.get("/health", status_code=status.HTTP_200_OK)
+@app.get("/api/health", status_code=status.HTTP_200_OK)
 @app.get("/api/v1/health", status_code=status.HTTP_200_OK)
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint (available at /health, /api/health and /api/v1/health)."""
     return {
         "status": "healthy",
         "version": "2.0.0",
@@ -298,6 +300,35 @@ async def root():
             "health":   "GET  /api/v1/health",
             "docs":     "GET  /docs",
         }
+    }
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible model listing (compatibility shim)
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/models", status_code=status.HTTP_200_OK)
+@app.get("/models", status_code=status.HTTP_200_OK)
+async def list_models():
+    """OpenAI-compatible ``/v1/models`` endpoint.
+
+    Some LLM clients/tools probe ``/v1/models`` on whatever base URL they are
+    configured with. When the Bench Forecast API is (mis)pointed at as an
+    OpenAI-compatible endpoint, returning the active model here avoids the
+    spurious ``404 Not Found`` in the server logs.
+    """
+    model_id = (
+        Config.GROQ_MODEL if Config.LLM_PROVIDER == "groq" else Config.OLLAMA_MODEL
+    )
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": Config.LLM_PROVIDER,
+            }
+        ],
     }
 
 # ---------------------------------------------------------------------------

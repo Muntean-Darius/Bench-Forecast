@@ -395,6 +395,13 @@ export default function HITLApproval() {
                 {proposal.training_recommendation}
               </div>
             )}
+            {proposal.ai_upskilling_path &&
+              proposal.ai_upskilling_path !== proposal.training_recommendation && (
+              <div className="mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800">
+                <span className="font-semibold">Recommended Upskilling Path: </span>
+                {proposal.ai_upskilling_path}
+              </div>
+            )}
           </div>
         </div>
       </div>

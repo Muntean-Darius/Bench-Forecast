@@ -1,14 +1,17 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from src.database.models import (
     Allocation,
     AllocationStatusEnum,
+    Employee,
     HitlReviewEvent,
     HitlDecisionEnum,
 )
@@ -91,7 +94,7 @@ class HITLService:
             select(Allocation)
             .options(
                 joinedload(Allocation.project_demand),
-                joinedload(Allocation.employee),
+                joinedload(Allocation.employee).selectinload(Employee.employee_costs),
             )
             .where(
                 Allocation.status.in_([
@@ -102,4 +105,51 @@ class HITLService:
             .order_by(Allocation.created_at.desc())
         )
         result = await self.session.execute(stmt)
-        return list(result.scalars().all())
+        allocations = list(result.scalars().all())
+
+        # Resolve each employee's most recent hourly cost rate so the HITL UI can
+        # render cost rate / margin without empty fields. Fallback chain:
+        # employee_costs (latest) → legacy hourly_cost_rate → seniority default.
+        sen_defaults = {
+            "junior": 40.0,
+            "mid": 65.0,
+            "senior": 95.0,
+            "lead": 125.0,
+            "principal": 160.0,
+        }
+        for allocation in allocations:
+            employee = allocation.employee
+            if employee is None:
+                continue
+
+            cost_rate = None
+            employee_costs = getattr(employee, "employee_costs", None) or []
+            if employee_costs:
+                latest = sorted(
+                    employee_costs,
+                    key=lambda c: getattr(c, "effective_date", None) or date.min,
+                    reverse=True,
+                )[0]
+                if latest.internal_hourly_cost:
+                    cost_rate = latest.internal_hourly_cost
+
+            if cost_rate is None and employee.hourly_cost_rate:
+                cost_rate = employee.hourly_cost_rate
+
+            if cost_rate is None:
+                sen = str(
+                    employee.experience_level.value
+                    if hasattr(employee.experience_level, "value")
+                    else (employee.experience_level or "mid")
+                ).lower()
+                cost_rate = Decimal(str(sen_defaults.get(sen, 65.0)))
+
+            cost_dec = Decimal(str(cost_rate))
+            # Attach the resolved value for serialisation without marking the
+            # mapped column dirty (this is a read-only GET endpoint; get_db
+            # commits on success, so a plain assignment would persist a derived
+            # value into the legacy column).
+            set_committed_value(employee, "hourly_cost_rate", cost_dec)
+            employee.cost_rate = cost_dec
+
+        return allocations

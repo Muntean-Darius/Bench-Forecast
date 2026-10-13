@@ -42,7 +42,7 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Config
@@ -518,6 +518,19 @@ async def list_employee_documents(
     ]
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/documents/employee/{employee_id}/download
+# ---------------------------------------------------------------------------
+
+# CVs are mutable (a new upload overwrites the previous file), so responses
+# must never be cached by the browser / PDF viewer plugin.
+_CV_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @router.get(
     "/employee/{employee_id}/download",
     summary="Download CV document for an employee",
@@ -569,6 +582,7 @@ async def download_employee_cv(
                 media_type="application/pdf",
                 filename=filename,
                 content_disposition_type="inline",
+                headers=_CV_NO_CACHE_HEADERS,
             )
 
     # If no file exists but profile_text exists, generate PDF dynamically
@@ -591,13 +605,17 @@ async def download_employee_cv(
                 media_type="application/pdf",
                 filename=f"{employee.first_name}_{employee.last_name}_CV.pdf",
                 content_disposition_type="inline",
+                headers=_CV_NO_CACHE_HEADERS,
             )
         except Exception as e:
             logger.warning(f"Could not generate PDF on the fly: {e}")
             return Response(
                 content=employee.profile_text,
                 media_type="text/plain",
-                headers={"Content-Disposition": f"inline; filename={employee.first_name}_{employee.last_name}_CV.txt"}
+                headers={
+                    "Content-Disposition": f"inline; filename={employee.first_name}_{employee.last_name}_CV.txt",
+                    **_CV_NO_CACHE_HEADERS,
+                },
             )
 
     raise HTTPException(status_code=404, detail="No CV document found for this employee")

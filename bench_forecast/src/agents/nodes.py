@@ -19,6 +19,7 @@ using logging.info so every transition is fully traceable in production.
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
@@ -81,6 +82,223 @@ def _log_state_exit(node_name: str, updates: Dict[str, Any]) -> None:
 from sqlalchemy.orm import selectinload
 
 # ===========================================================================
+# Skill-matching helpers (deterministic, explainable scoring)
+# ===========================================================================
+
+def _normalize_skill_list(raw: Any) -> List[str]:
+    """Coerce a skills value (comma string / list / dict / None) into a list."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    if isinstance(raw, dict):
+        # Support {"skills": [...]} and {"Python": true, "SQL": true} shapes
+        if "skills" in raw and isinstance(raw["skills"], (list, tuple, set, str)):
+            return _normalize_skill_list(raw["skills"])
+        return [str(k).strip() for k in raw.keys() if str(k).strip()]
+    if isinstance(raw, (list, tuple, set)):
+        out: List[str] = []
+        for item in raw:
+            out.extend(_normalize_skill_list(item))
+        return out
+    return [str(raw).strip()]
+
+
+# Curated skill vocabulary used to recover skills from free-text CVs when the
+# structured ``employees.skills`` column is empty (common in seeded data).
+SKILL_VOCABULARY: List[str] = [
+    # Languages
+    "Python", "Java", "JavaScript", "TypeScript", "C", "C++", "C#", "Go", "Rust",
+    "Ruby", "PHP", "Scala", "Kotlin", "Swift", "Perl", "R", "MATLAB", "SQL",
+    "Bash", "Shell", "PowerShell", "VBA", "Dart", "Elixir", "Haskell", "Lua",
+    # Web / frontend
+    "React", "Angular", "Vue", "Next.js", "Node.js", "Express", "Django",
+    "Flask", "FastAPI", "Spring", "Spring Boot", "Rails", "Laravel", ".NET",
+    "ASP.NET", "HTML", "CSS", "SASS", "Tailwind", "Redux", "GraphQL", "REST",
+    "RESTful", "jQuery", "Bootstrap",
+    # Data / ML
+    "Machine Learning", "Deep Learning", "NLP", "TensorFlow", "PyTorch",
+    "scikit-learn", "Pandas", "NumPy", "Spark", "Hadoop", "Kafka", "Airflow",
+    "dbt", "ETL", "Data Warehouse", "Data Science", "Statistics", "Tableau",
+    "Power BI", "Looker", "Excel", "Big Data", "Computer Vision", "LLM",
+    # Databases
+    "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch", "Oracle",
+    "SQL Server", "SQLite", "Cassandra", "DynamoDB", "Snowflake", "BigQuery",
+    "Neo4j",
+    # Cloud / DevOps
+    "AWS", "Azure", "GCP", "Docker", "Kubernetes", "Terraform", "Ansible",
+    "Jenkins", "CI/CD", "Git", "GitHub", "GitLab", "Linux", "Unix", "Nginx",
+    "Prometheus", "Grafana", "Serverless", "Microservices", "DevOps",
+    # Testing / QA
+    "Selenium", "Cypress", "Playwright", "JUnit", "PyTest", "Jest", "Mocha",
+    "TestNG", "Postman", "JMeter", "QA", "Test Automation", "Manual Testing",
+    "Cucumber", "BDD", "TDD",
+    # Security / Networking
+    "Cybersecurity", "Penetration Testing", "Firewall", "TCP/IP", "Networking",
+    "Active Directory", "SIEM", "SOC", "Encryption", "OAuth", "SSO",
+    # ERP / enterprise
+    "SAP", "Salesforce", "Workday", "ServiceNow", "SharePoint", "Jira",
+    "Confluence", "PeopleSoft", "Oracle ERP",
+    # Business / soft skills
+    "Agile", "Scrum", "Kanban", "Project Management", "Product Management",
+    "Business Analysis", "Stakeholder Management", "Leadership", "Communication",
+    "Customer Service", "Accounting", "Finance", "Marketing", "Sales",
+    "Recruiting", "HR", "Payroll", "Compliance", "HIPAA", "Data Analysis",
+]
+
+# Pre-compiled lookups for case-insensitive, word-boundary skill detection.
+_SKILL_LOOKUP = {s.lower(): s for s in SKILL_VOCABULARY}
+
+
+def _skill_mentioned(haystack: str, skill: str) -> bool:
+    """Return True if *skill* appears in *haystack* as a whole word/token.
+
+    Word boundaries prevent false positives such as ``R`` matching
+    "develope**r**" or ``Go`` matching "Djan**go**", while still allowing
+    ``Java`` to match "Java 8" and ``C`` to match "C++"/"C#".
+    """
+    if not haystack or not skill:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(str(skill).lower()) + r"(?![a-z0-9])"
+    return re.search(pattern, str(haystack).lower()) is not None
+
+
+def _extract_skills_from_text(text: Optional[str]) -> List[str]:
+    """Recover known skills mentioned in free-text CV content.
+
+    Matches whole words only (so "Java" does not match "JavaScript") and
+    returns canonical vocabulary casing, ordered by first appearance.
+    """
+    if not text:
+        return []
+    lowered = str(text).lower()
+    found: List[str] = []
+    for key, canonical in _SKILL_LOOKUP.items():
+        pattern = r"(?<![a-z0-9])" + re.escape(key) + r"(?![a-z0-9])"
+        if re.search(pattern, lowered):
+            found.append(canonical)
+    return found
+
+
+def _employee_skill_profile(employee: Dict[str, Any]) -> List[str]:
+    """Combine structured skills, CV-extracted skills and the job title."""
+    skills = _normalize_skill_list(employee.get("skills"))
+    skills += _extract_skills_from_text(employee.get("profile_text"))
+    skills += _extract_skills_from_text(employee.get("job_title"))
+    out: List[str] = []
+    seen: set = set()
+    for s in skills:
+        key = s.lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def _match_skills(employee_skills: List[str], required_skills: List[str]) -> tuple:
+    """Return ``(matched, missing, coverage)`` for an employee vs. a role.
+
+    Matching is case-insensitive and also treats substring matches as hits
+    (e.g. role requires "Java" and the employee lists "Java 8"). ``coverage``
+    is the fraction of required skills matched (``None`` when the role has no
+    explicit required skills).
+    """
+    emp = [s.strip() for s in employee_skills if s and s.strip()]
+    required = [r for r in required_skills if r and str(r).strip()]
+    matched: List[str] = []
+    missing: List[str] = []
+    for req in required:
+        req_str = str(req).strip()
+        if any(
+            _skill_mentioned(e, req_str) or _skill_mentioned(req_str, e)
+            for e in emp
+        ):
+            matched.append(req_str)
+        else:
+            missing.append(req_str)
+    coverage = (len(matched) / len(required)) if required else None
+    return matched, missing, coverage
+
+
+def _derive_required_skills(
+    role_title: str,
+    role_description: str,
+    employees: List[Dict[str, Any]],
+) -> List[str]:
+    """Derive required skills from the role text when a demand has none.
+
+    Scans the free-text role title/description for known skills so scoring and
+    gap detection still work for demands without an explicit ``required_skills``.
+    """
+    return _extract_skills_from_text(f"{role_title or ''} {role_description or ''}")
+
+
+def _build_upskilling_path(missing_skills: List[str], role_title: str) -> str:
+    """Generate a concrete training recommendation naming the missing skills."""
+    skills = ", ".join(missing_skills)
+    primary = missing_skills[0]
+    if len(missing_skills) == 1:
+        return (
+            f"Recommended training: complete a {primary} course to build the "
+            f"{primary} proficiency required for the {role_title} role."
+        )
+    return (
+        f"Recommended training: enrol in a structured programme covering {skills} "
+        f"(start with a {primary} course) to close the skill gap for the {role_title} role."
+    )
+
+
+def _build_match_justification(
+    full_name: Optional[str],
+    role_title: str,
+    matched: List[str],
+    missing: List[str],
+    llm_text: Optional[str],
+    action: Optional[str] = None,
+    candidate_skills: Optional[List[str]] = None,
+) -> str:
+    """Build a justification that cites the specific skills driving the match.
+
+    The LLM's own text is appended only when it is specific and consistent with
+    the final action — generic phrases ("high semantic similarity") and
+    contradictory statements are dropped.
+    """
+    name = full_name or "This candidate"
+    parts: List[str] = []
+    if matched:
+        parts.append(
+            f"{name} has {', '.join(matched)}, directly matching the skills required "
+            f"for the {role_title} role."
+        )
+    if missing:
+        parts.append(
+            f"Identified skill gap: {', '.join(missing)} — a targeted upskilling "
+            f"plan is recommended before full allocation."
+        )
+    if not parts:
+        skills = candidate_skills or []
+        if skills:
+            parts.append(
+                f"{name}'s profile highlights {', '.join(skills[:5])}, providing "
+                f"relevant experience for the {role_title} role."
+            )
+        else:
+            parts.append(f"{name} was evaluated against the {role_title} role.")
+
+    if llm_text and str(llm_text).strip():
+        text = str(llm_text).strip()
+        lower = text.lower()
+        generic = any(
+            g in lower
+            for g in ("semantic similarity", "high similarity", "similarity score", "match score")
+        )
+        contradicts = action == "allocate" and ("train" in lower or "upskill" in lower)
+        if not generic and not contradicts:
+            parts.append(text)
+
+    return " ".join(parts)
+
+# ===========================================================================
 # Node 1 — Data Extractor (Deterministic)
 # ===========================================================================
 
@@ -140,7 +358,12 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
                     "id": str(emp.id),
                     "name": f"{emp.first_name} {emp.last_name}".strip(),
                     "full_name": f"{emp.first_name} {emp.last_name}".strip(),
-                    "skills": getattr(emp, "skills") or [], # Legacy fallback or use empty
+                    "job_title": getattr(emp, "job_title", "") or "",
+                    "skills": _employee_skill_profile({
+                        "skills": getattr(emp, "skills"),
+                        "profile_text": emp.profile_text,
+                        "job_title": getattr(emp, "job_title", ""),
+                    }),
                     "profile_text": emp.profile_text,
                     "bench_status": emp.bench_status.value if hasattr(emp.bench_status, "value") else str(emp.bench_status),
                     "seniority": sen,
@@ -312,6 +535,9 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     llm = LLMFactory.get_chat_model()
     decisions: List[Dict[str, Any]] = []
     allocated_employee_ids: set = set()
+    # Cache profile-text embeddings across demands so the on-the-fly semantic
+    # scoring only embeds each employee's CV once per run.
+    emp_emb_cache: Dict[str, List[float]] = {}
 
     for demand in demands:
         role_title = demand.get("role", "Unknown Role")
@@ -332,6 +558,15 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
         bench_employees = state.get("bench_employees", [])
         bench_ids = [str(emp["id"]) for emp in bench_employees if emp.get("id")]
         emp_by_id = {str(emp["id"]): emp for emp in bench_employees}
+
+        # Required skills drive both scoring and the training decision. If the
+        # demand has none, derive them from the role text against the bench
+        # skill vocabulary so scores are still varied and explainable.
+        required_skills = _normalize_skill_list(demand.get("required_skills"))
+        if not required_skills:
+            required_skills = _derive_required_skills(
+                role_title, role_description, bench_employees
+            )
 
         # Exclude employees that have already been allocated to earlier demands in this run
         unallocated_bench_ids = [b for b in bench_ids if b not in allocated_employee_ids]
@@ -382,7 +617,23 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 f"RAG query returned no unallocated bench candidates for '{role_title}'. "
                 f"Evaluating unallocated bench employees directly."
             )
-            for b_id in unallocated_bench_ids[:5]:
+            fallback_ids = unallocated_bench_ids
+            profile_texts = [
+                (emp_by_id[b].get("profile_text")
+                 or emp_by_id[b].get("job_title")
+                 or f"{emp_by_id[b].get('name', '')}")
+                for b in fallback_ids
+            ]
+            # Embed the role + each CV on the fly so scores are semantic and
+            # varied even when the vector index is stale/unavailable, then keep
+            # the best-matching bench employees for LLM evaluation.
+            sims = rag.semantic_similarity(
+                role_description, profile_texts, cache=emp_emb_cache
+            )
+            ranked = sorted(
+                zip(fallback_ids, sims), key=lambda pair: pair[1], reverse=True
+            )[:8]
+            for b_id, sim in ranked:
                 emp = emp_by_id[b_id]
                 cost = float(emp.get("hourly_cost") or emp.get("hourly_cost_rate") or 0.0)
                 sen = emp.get("seniority") or emp.get("experience_level") or "Mid"
@@ -390,16 +641,17 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                     sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
                     cost = sen_map.get(str(sen).lower(), 65.0)
                 margin = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2) if target_bill_rate > 0 else 0.0
+                emp_skills = _employee_skill_profile(emp)
                 candidates.append({
                     "employee_id": b_id,
                     "full_name": emp.get("name") or emp.get("full_name") or f"Employee {b_id[:8]}",
-                    "primary_role": emp.get("job_title") or (emp.get("skills")[0] if emp.get("skills") else "Engineer"),
+                    "primary_role": emp.get("job_title") or (emp_skills[0] if emp_skills else "Engineer"),
                     "seniority": sen,
                     "hourly_cost_rate": cost,
                     "bench_start_date": emp.get("available_from") or "",
-                    "similarity_score": 0.60,
+                    "similarity_score": float(sim) if sim else None,
                     "projected_margin_pct": margin,
-                    "document_excerpt": emp.get("profile_text") or f"Skills: {', '.join(emp.get('skills', []))}",
+                    "document_excerpt": emp.get("profile_text") or f"Skills: {', '.join(emp_skills)}",
                     "chunk_index": 0,
                 })
 
@@ -432,6 +684,34 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 if target_bill_rate > 0:
                     cand["projected_margin_pct"] = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2)
 
+            # --- Deterministic, explainable skill-based scoring ---
+            # Blend explicit skill coverage (primary signal) with any RAG
+            # semantic similarity so candidates receive distinct, defensible
+            # match scores instead of a single hard-coded fallback value.
+            emp_meta = emp_by_id.get(cand_id)
+            emp_skills = (
+                _employee_skill_profile(emp_meta)
+                if emp_meta
+                else _normalize_skill_list(cand.get("skills"))
+            )
+            matched, missing, coverage = _match_skills(emp_skills, required_skills)
+            cand["employee_skills"] = emp_skills
+
+            rag_sim = cand.get("similarity_score")
+            rag_sim = float(rag_sim) if rag_sim is not None else None
+
+            if coverage is not None:
+                score = (0.7 * coverage + 0.3 * rag_sim) if (rag_sim and rag_sim > 0) else coverage
+            elif rag_sim is not None and rag_sim > 0:
+                score = rag_sim
+            else:
+                score = 0.6
+
+            cand["similarity_score"] = round(min(1.0, max(0.0, score)), 4)
+            cand["matched_skills"] = matched
+            cand["missing_skills"] = missing
+            cand["skill_coverage"] = round(coverage, 4) if coverage is not None else None
+
         if not candidates:
             decisions.append({
                 "action_type": "hire",
@@ -459,7 +739,40 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
         response = llm.invoke([sys_msg, human_msg])
         raw_json = LLMFactory.parse_json_response(response.content)
 
-        decision = AllocationDecision(**raw_json)
+        try:
+            decision = AllocationDecision(**raw_json)
+        except Exception as validation_err:
+            # Smaller local models sometimes omit required fields (e.g. the
+            # upskilling_path for a 'train' decision). Coerce into a safe,
+            # schema-valid decision instead of failing the whole run.
+            logger.warning(
+                f"allocation_decider: LLM output failed validation for '{role_title}' "
+                f"({validation_err}). Coercing to a safe decision."
+            )
+            fallback_emp = (
+                str(candidates[0].get("employee_id") or candidates[0].get("id"))
+                if candidates else None
+            )
+            action = raw_json.get("action_type")
+            if action not in ("allocate", "train", "hire"):
+                action = "allocate"
+            justification = str(raw_json.get("justification") or "").strip()
+            if len(justification) < 20:
+                justification = (
+                    f"Candidate evaluated against the {role_title} role based on "
+                    f"skills, seniority and projected margin."
+                )
+            upskilling = raw_json.get("upskilling_path")
+            if action == "train" and not upskilling:
+                upskilling = f"Structured upskilling recommended for the {role_title} role."
+            decision = AllocationDecision(
+                action_type=action,
+                employee_id=None if action == "hire" else fallback_emp,
+                projected_margin=float(raw_json.get("projected_margin") or 0.0),
+                justification=justification,
+                upskilling_path=upskilling,
+                match_score=raw_json.get("match_score"),
+            )
 
         chosen_emp_id = str(decision.employee_id) if decision.employee_id else None
         chosen_cand = next(
@@ -485,12 +798,89 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 else:
                     decision.action_type = "hire"
                     decision.employee_id = None
+                    chosen_cand = None
+                    chosen_emp_id = None
                     decision.justification += " (Remaining candidates already allocated to other roles. Hiring recommended)."
             else:
                 allocated_employee_ids.add(chosen_emp_id)
 
         if chosen_cand and (decision.projected_margin == 0.0 or decision.projected_margin is None):
             decision.projected_margin = chosen_cand.get("projected_margin_pct", 0.0)
+
+        # Resolve the chosen employee's metadata with DB/extractor fallbacks so
+        # the HITL UI always has cost rate, seniority and name available.
+        chosen_emp_meta = emp_by_id.get(str(chosen_emp_id)) if chosen_emp_id else None
+        resolved_full_name = (
+            (chosen_cand.get("full_name") if chosen_cand else None)
+            or (chosen_emp_meta.get("full_name") if chosen_emp_meta else None)
+            or (chosen_emp_meta.get("name") if chosen_emp_meta else None)
+        )
+        resolved_seniority = (
+            (chosen_cand.get("seniority") if chosen_cand else None)
+            or (chosen_emp_meta.get("seniority") if chosen_emp_meta else None)
+            or "Mid"
+        )
+        resolved_cost_rate = (
+            (chosen_cand.get("hourly_cost_rate") if chosen_cand else None)
+            or (chosen_emp_meta.get("hourly_cost_rate") if chosen_emp_meta else None)
+            or (chosen_emp_meta.get("hourly_cost") if chosen_emp_meta else None)
+        )
+
+        # Decide allocate vs. train from ACTUAL missing skills (not a bare score
+        # threshold), and generate a training recommendation that names them.
+        coverage = chosen_cand.get("skill_coverage") if chosen_cand else None
+        if chosen_cand and decision.action_type in ("allocate", "train") and coverage is not None:
+            missing_skills = chosen_cand.get("missing_skills") or []
+            if missing_skills:
+                decision.action_type = "train"
+                generated = _build_upskilling_path(missing_skills, role_title)
+                llm_path = (decision.upskilling_path or "").strip()
+                if llm_path and llm_path.lower() not in generated.lower():
+                    generated = f"{generated} {llm_path}"
+                decision.upskilling_path = generated
+            else:
+                decision.action_type = "allocate"
+                decision.upskilling_path = None
+
+        # Replace/augment the LLM justification with an explicit, skill-level
+        # explanation of why this candidate fits (or needs training for) the role.
+        if chosen_cand and decision.action_type in ("allocate", "train"):
+            decision.justification = _build_match_justification(
+                resolved_full_name,
+                role_title,
+                chosen_cand.get("matched_skills") or [],
+                chosen_cand.get("missing_skills") or [],
+                decision.justification,
+                action=decision.action_type,
+                candidate_skills=chosen_cand.get("employee_skills") or [],
+            )
+
+        # Match score: prefer the deterministic skill-based score computed for
+        # the chosen candidate, then the LLM value, then skill_matches.
+        resolved_match_score = chosen_cand.get("similarity_score") if chosen_cand else None
+        if resolved_match_score is None or float(resolved_match_score) == 0.0:
+            resolved_match_score = decision.match_score
+
+        if (resolved_match_score is None or float(resolved_match_score) == 0.0) and chosen_emp_id:
+            skill_matches = state.get("skill_matches") or []
+            relevant = [
+                m for m in skill_matches
+                if str(m.get("employee_id")) == str(chosen_emp_id)
+                and str(m.get("demand_id")) == str(demand.get("id", ""))
+            ]
+            if not relevant:
+                relevant = [
+                    m for m in skill_matches
+                    if str(m.get("employee_id")) == str(chosen_emp_id)
+                ]
+            if relevant:
+                resolved_match_score = max(
+                    float(m.get("match_score") or 0.0) for m in relevant
+                )
+
+        if resolved_match_score is None:
+            resolved_match_score = 0.0
+        decision.match_score = round(float(resolved_match_score), 4)
 
         decision_dict = decision.model_dump()
         decision_dict.update(
@@ -501,9 +891,13 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 "target_bill_rate": target_bill_rate,
                 "target_margin": target_margin,
                 "candidate_count": len(candidates),
-                "seniority": chosen_cand.get("seniority") if chosen_cand else None,
-                "full_name": chosen_cand.get("full_name") if chosen_cand else None,
-                "hourly_cost_rate": chosen_cand.get("hourly_cost_rate") if chosen_cand else None,
+                "match_score": decision.match_score,
+                "similarity_score": decision.match_score,
+                "seniority": resolved_seniority,
+                "full_name": resolved_full_name,
+                "hourly_cost_rate": resolved_cost_rate,
+                "matched_skills": chosen_cand.get("matched_skills") if chosen_cand else [],
+                "missing_skills": chosen_cand.get("missing_skills") if chosen_cand else [],
             }
         )
         decisions.append(decision_dict)

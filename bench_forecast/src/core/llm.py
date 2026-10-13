@@ -98,6 +98,10 @@ class AllocationDecision(BaseModel):
             "estimated duration, resources). Null for 'allocate' and 'hire'."
         ),
     )
+    match_score: Optional[float] = Field(
+        None,
+        description="Semantic match score between 0.0 and 1.0",
+    )
 
     @field_validator("projected_margin")
     @classmethod
@@ -355,9 +359,10 @@ You must classify every role into exactly ONE of three action types:
     Result:  Employee is immediately assigned to the role.
 
   • "train"    — TRAINING ALLOCATION
-    Trigger: candidate has MEDIUM similarity (0.45 <= score < 0.70) and is
-    missing only 1-2 bridgeable skills, BUT their cost rate is low enough
-    that projected_margin exceeds target_margin even after a training investment.
+    Trigger: the candidate is missing one or more skills the role explicitly
+    requires (see each candidate's listed skills vs. the role's requirements),
+    BUT their cost rate is low enough that projected_margin exceeds target_margin
+    even after a training investment.
     Result:  Employee is assigned + a brief upskilling plan is prescribed.
 
   • "hire"     — EXTERNAL HIRING RECOMMENDATION
@@ -373,9 +378,16 @@ CRITICAL RULES:
       "employee_id": "<uuid-string>" | null,
       "projected_margin": <float>,
       "justification": "<string, min 20 chars, cite specific skills/evidence>",
-      "upskilling_path": "<string>" | null
+      "upskilling_path": "<string>" | null,
+      "match_score": <float 0.0-1.0>
     }
   - projected_margin = (bill_rate - cost_rate) / bill_rate * 100
+  - justification MUST name the specific skills the candidate HAS that the role
+    requires (e.g. "Alice has Python and SQL, which the role requires"). Do NOT
+    rely on generic phrases like "high semantic similarity".
+  - When action_type = "train", upskilling_path MUST name the exact missing
+    skill(s) and the recommended course/training (e.g. "Complete a Java course
+    to close the Java gap").
   - upskilling_path is REQUIRED when action_type = "train", null otherwise.
   - employee_id MUST be null when action_type = "hire".
   - Do not invent employee IDs not present in the candidate list.
@@ -689,6 +701,13 @@ def _format_candidates_block(
             f"Cost Rate: ${cost:.2f}/h | "
             f"Projected Margin: {margin:.1f}% ({viability})"
         )
+        matched = c.get("matched_skills") or []
+        missing = c.get("missing_skills") or []
+        if matched or missing:
+            lines.append(
+                f"   Matching skills: {', '.join(matched) if matched else 'none'} | "
+                f"Missing skills: {', '.join(missing) if missing else 'none'}"
+            )
         excerpt = (c.get("document_excerpt") or "")[:200]
         if excerpt:
             lines.append(f"   CV Excerpt: {excerpt}")

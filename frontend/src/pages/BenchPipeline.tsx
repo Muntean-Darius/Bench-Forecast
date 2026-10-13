@@ -356,23 +356,50 @@ function CVModal({
   employee: Employee | null
   onClose: () => void
 }) {
+  // Guard before rendering the stateful content so hook order stays stable.
   if (!employee) return null
+  return <CVModalContent employee={employee} onClose={onClose} />
+}
 
+function CVModalContent({
+  employee,
+  onClose,
+}: {
+  employee: Employee
+  onClose: () => void
+}) {
   const [activeTab, setActiveTab] = useState<'pdf' | 'text'>('pdf')
   const [profileText, setProfileText] = useState<string>(employee.profile_text || '')
+  // Cache-busting token derived from the latest CV document version. A new
+  // upload changes the token, so the PDF viewer never serves a stale file.
+  const [cvToken, setCvToken] = useState<string | null>(null)
 
   useEffect(() => {
-    if (employee?.id) {
-      setProfileText(employee.profile_text || '')
-      // Fetch latest profile text in case a new CV was recently uploaded
-      api.getEmployeePortal(employee.id)
-        .then((res: any) => {
-          if (res?.employee?.profile_text) {
-            setProfileText(res.employee.profile_text)
-          }
-        })
-        .catch(() => {})
-    }
+    if (!employee?.id) return
+    setProfileText(employee.profile_text || '')
+    setCvToken(null)
+
+    // Fetch latest profile text in case a new CV was recently uploaded
+    api.getEmployeePortal(employee.id)
+      .then((res: any) => {
+        if (res?.employee?.profile_text) {
+          setProfileText(res.employee.profile_text)
+        }
+      })
+      .catch(() => {})
+
+    // Fetch the latest document metadata and use it to bust the browser cache
+    api.getEmployeeDocuments(employee.id)
+      .then((docs: any[]) => {
+        const latest = Array.isArray(docs) && docs.length > 0 ? docs[0] : null
+        if (latest) {
+          const uploaded = latest.uploaded_at ? new Date(latest.uploaded_at).getTime() : Date.now()
+          setCvToken(`v${latest.version ?? 0}-${uploaded}`)
+        } else {
+          setCvToken(`t${Date.now()}`)
+        }
+      })
+      .catch(() => setCvToken(`t${Date.now()}`))
   }, [employee?.id])
 
   const skillsArr = Array.isArray(employee.skills)
@@ -381,7 +408,10 @@ function CVModal({
     ? employee.skills.split(',').map((s) => s.trim()).filter(Boolean)
     : []
 
-  const downloadUrl = `/api/v1/documents/employee/${employee.id}/download`
+  const baseDownloadUrl = `/api/v1/documents/employee/${employee.id}/download`
+  const downloadUrl = cvToken
+    ? `${baseDownloadUrl}?cv=${encodeURIComponent(cvToken)}`
+    : baseDownloadUrl
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
@@ -457,11 +487,18 @@ function CVModal({
         <div className="flex-1 overflow-hidden flex flex-col bg-gray-50">
           {activeTab === 'pdf' ? (
             <div className="flex-1 w-full h-full relative">
-              <iframe
-                src={downloadUrl}
-                className="w-full h-full border-0"
-                title={`${employee.full_name || 'employee'} CV`}
-              />
+              {cvToken ? (
+                <iframe
+                  key={downloadUrl}
+                  src={downloadUrl}
+                  className="w-full h-full border-0"
+                  title={`${employee.full_name || 'employee'} CV`}
+                />
+              ) : (
+                <div className="absolute inset-0 flex items-center justify-center text-sm text-gray-400">
+                  Loading CV…
+                </div>
+              )}
             </div>
           ) : (
             <div className="p-6 overflow-y-auto flex-1 font-sans text-sm text-gray-800 leading-relaxed">

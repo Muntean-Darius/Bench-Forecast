@@ -4,7 +4,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Dict
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.database.database import AsyncSessionLocal
 from src.database.models import ForecastRun, Allocation, AllocationStatusEnum
@@ -91,6 +91,26 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
                 if run_rec:
                     run_rec.status = "paused_for_review"
 
+                # A new forecast run supersedes any proposals still awaiting
+                # review from previous runs. Cancel them first so the manager
+                # queue never shows the same employee twice (e.g. as a direct
+                # allocation from an old run AND a training allocation from
+                # this run). Cancelled rows are retained for audit history.
+                superseded = await db.execute(
+                    update(Allocation)
+                    .where(
+                        Allocation.status.in_([
+                            AllocationStatusEnum.pending_manager_approval,
+                            AllocationStatusEnum.proposed_by_ai,
+                        ])
+                    )
+                    .values(status=AllocationStatusEnum.cancelled)
+                )
+                logger.info(
+                    f"Superseded {superseded.rowcount if superseded.rowcount is not None else 'existing'} "
+                    f"stale pending allocation(s) for new forecast run {forecast_run_id}."
+                )
+
                 bench_ids_set = {str(b["id"]) for b in bench_employees if b.get("id")}
 
                 for demand in open_demands:
@@ -122,7 +142,11 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
 
                     emp_uuid = uuid.UUID(emp_id_str)
                     margin_val = float(dec.get("projected_margin", 0.0))
-                    match_score_val = float(dec.get("match_score", 0.0))
+                    match_score_val = float(dec.get("match_score") or 0.0)
+                    if match_score_val <= 0:
+                        # Fall back to the similarity score attached by the
+                        # allocation_decider_node when the LLM omitted match_score.
+                        match_score_val = float(dec.get("similarity_score") or 0.0)
                     justification_val = (
                         dec.get("justification")
                         or f"Proposed allocation for {demand.get('role', 'Role')}."

@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional, List
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from src.database.models import AllocationStatusEnum
 
@@ -12,8 +12,26 @@ class DemandResponse(BaseModel):
     description: Optional[str] = None
     headcount_needed: int
     target_bill_rate: Optional[Decimal] = None
-    
+    required_skills: Optional[List[str]] = None
+
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("required_skills", mode="before")
+    @classmethod
+    def _normalize_required_skills(cls, v):
+        """ProjectDemand.required_skills is JSONB — accept dict/list/str/None."""
+        if not v:
+            return []
+        if isinstance(v, dict):
+            inner = v.get("skills")
+            if isinstance(inner, (list, tuple, set)):
+                return [str(s) for s in inner]
+            return [str(k) for k in v.keys()]
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(s) for s in v]
+        return [str(v)]
 
 class EmployeeBriefResponse(BaseModel):
     id: UUID
@@ -23,6 +41,9 @@ class EmployeeBriefResponse(BaseModel):
     experience_level: Optional[str] = None
     skills: Optional[str] = None
     profile_text: Optional[str] = None
+    hourly_cost_rate: Optional[Decimal] = None
+    cost_rate: Optional[Decimal] = None
+    experience_years: Optional[Decimal] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -36,6 +57,7 @@ class AllocationPendingResponse(BaseModel):
     ai_justification: Optional[str] = None
     ai_match_score: Optional[Decimal] = None
     ai_projected_margin: Optional[Decimal] = None
+    ai_upskilling_path: Optional[str] = None
     project_demand: Optional[DemandResponse] = None
     employee: Optional[EmployeeBriefResponse] = None
     

@@ -73,6 +73,7 @@ export interface AllocationProposal {
   reasoning: string
   missing_skills: string[]
   training_recommendation?: string | null
+  ai_upskilling_path?: string | null
   rag_passages: string[]
   created_at: string
   revision_count?: number
@@ -102,6 +103,7 @@ export interface PendingAllocation {
   ai_justification?: string | null
   ai_match_score?: number | null
   ai_projected_margin?: number | null
+  ai_upskilling_path?: string | null
   project_demand?: {
     id: string
     role: string
