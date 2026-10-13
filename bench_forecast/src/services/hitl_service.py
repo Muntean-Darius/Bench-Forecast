@@ -89,8 +89,17 @@ class HITLService:
         """Fetch all allocations awaiting manager review."""
         stmt = (
             select(Allocation)
-            .options(joinedload(Allocation.project_demand))
-            .where(Allocation.status == AllocationStatusEnum.pending_manager_approval)
+            .options(
+                joinedload(Allocation.project_demand),
+                joinedload(Allocation.employee),
+            )
+            .where(
+                Allocation.status.in_([
+                    AllocationStatusEnum.pending_manager_approval,
+                    AllocationStatusEnum.proposed_by_ai,
+                ])
+            )
+            .order_by(Allocation.created_at.desc())
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())

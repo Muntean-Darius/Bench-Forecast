@@ -306,9 +306,28 @@ async def upload_cv(
                 "The file may be image-only or password-protected."
             )
 
-        # Persist extracted text for audit / re-ingestion without re-upload
+        # Update employee's profile_text and cv_document_uri in database
+        from datetime import datetime
+        await db.execute(
+            update(Employee)
+            .where(Employee.id == emp_uuid)
+            .values(
+                profile_text=full_text,
+                cv_document_uri=file_path,
+                updated_at=datetime.utcnow()
+            )
+        )
         await set_text_content(db, doc_id, full_text)
         await db.commit()
+
+        # Save copies to local storage/cv paths for immediate inline display & download
+        for s_dir in ["storage/cv", "bench_forecast/storage/cv"]:
+            try:
+                os.makedirs(s_dir, exist_ok=True)
+                with open(os.path.join(s_dir, f"{emp_uuid}.pdf"), "wb") as f_out:
+                    f_out.write(pdf_bytes)
+            except Exception as e_save:
+                logger.warning(f"Failed to write fallback CV to {s_dir}: {e_save}")
 
         # ------------------------------------------------------------------
         # 6. Chunk the text
@@ -339,6 +358,8 @@ async def upload_cv(
         # ------------------------------------------------------------------
         logger.info("Upserting to ChromaDB: document_id=%s", doc_id)
         chroma_store = _get_chroma_store()
+        # Clean up any existing chunks for this employee to update embeddings cleanly
+        chroma_store.delete_employee_chunks(str(emp_uuid))
         chroma_doc_id = chroma_store.upsert_document_chunks(
             document_id=str(doc_id),
             employee_id=str(emp_uuid),
@@ -495,4 +516,90 @@ async def list_employee_documents(
         )
         for d in docs
     ]
+
+
+@router.get(
+    "/employee/{employee_id}/download",
+    summary="Download CV document for an employee",
+)
+async def download_employee_cv(
+    employee_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns the CV PDF file for an employee, or generates one if only profile text is available."""
+    from fastapi.responses import FileResponse, Response
+    try:
+        emp_uuid = uuid.UUID(employee_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"'{employee_id}' is not a valid UUID.",
+        )
+
+    emp_res = await db.execute(select(Employee).where(Employee.id == emp_uuid))
+    employee = emp_res.scalar_one_or_none()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # 1. Check for documents row
+    doc_res = await db.execute(
+        select(Document)
+        .where(Document.employee_id == emp_uuid)
+        .order_by(Document.uploaded_at.desc())
+    )
+    doc = doc_res.scalars().first()
+
+    candidate_paths = []
+    if doc and doc.file_path:
+        candidate_paths.append(doc.file_path)
+        candidate_paths.append(os.path.join("bench_forecast", doc.file_path))
+    if employee.cv_document_uri:
+        candidate_paths.append(employee.cv_document_uri)
+        candidate_paths.append(os.path.join("bench_forecast", employee.cv_document_uri))
+    candidate_paths.append(f"./storage/cv/{emp_uuid}.pdf")
+    candidate_paths.append(f"storage/cv/{emp_uuid}.pdf")
+    candidate_paths.append(f"./bench_forecast/storage/cv/{emp_uuid}.pdf")
+    candidate_paths.append(f"bench_forecast/storage/cv/{emp_uuid}.pdf")
+
+    for path in candidate_paths:
+        if path and not path.startswith("s3://") and os.path.exists(path):
+            filename = f"{employee.first_name}_{employee.last_name}_CV.pdf"
+            return FileResponse(
+                path,
+                media_type="application/pdf",
+                filename=filename,
+                content_disposition_type="inline",
+            )
+
+    # If no file exists but profile_text exists, generate PDF dynamically
+    if employee.profile_text:
+        try:
+            from fpdf import FPDF
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, f"{employee.first_name} {employee.last_name} - CV Profile", ln=True)
+            pdf.set_font("Arial", size=10)
+            safe_text = employee.profile_text.encode('latin-1', 'replace').decode('latin-1')
+            pdf.multi_cell(0, 5, txt=safe_text)
+            
+            gen_path = f"./bench_forecast/storage/cv/{emp_uuid}.pdf"
+            os.makedirs(os.path.dirname(gen_path), exist_ok=True)
+            pdf.output(gen_path)
+            return FileResponse(
+                gen_path,
+                media_type="application/pdf",
+                filename=f"{employee.first_name}_{employee.last_name}_CV.pdf",
+                content_disposition_type="inline",
+            )
+        except Exception as e:
+            logger.warning(f"Could not generate PDF on the fly: {e}")
+            return Response(
+                content=employee.profile_text,
+                media_type="text/plain",
+                headers={"Content-Disposition": f"inline; filename={employee.first_name}_{employee.last_name}_CV.txt"}
+            )
+
+    raise HTTPException(status_code=404, detail="No CV document found for this employee")
+
 

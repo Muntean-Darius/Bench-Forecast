@@ -85,10 +85,10 @@ async def review_forecast(
             detail=f"Failed to execute review decision: {str(e)}"
         )
 
-# We can keep the existing allocations endpoints under a different prefix
+# Standard /api/v1/allocations endpoints
 allocations_router = APIRouter(
-    prefix="/api/allocations",
-    tags=["Legacy HITL Allocations"],
+    prefix="/allocations",
+    tags=["HITL Allocations"],
 )
 
 @allocations_router.get("/pending", response_model=List[AllocationPendingResponse])
@@ -129,4 +129,14 @@ async def reject_allocation(allocation_id: uuid.UUID, payload: RejectRequest, db
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
+# Include both /allocations and /api/allocations for complete backward compatibility
 router.include_router(allocations_router)
+
+legacy_allocations_router = APIRouter(
+    prefix="/api/allocations",
+    tags=["Legacy HITL Allocations"],
+)
+legacy_allocations_router.add_api_route("/pending", get_pending_allocations, methods=["GET"], response_model=List[AllocationPendingResponse])
+legacy_allocations_router.add_api_route("/{allocation_id}/approve", approve_allocation, methods=["POST"], response_model=AllocationPendingResponse)
+legacy_allocations_router.add_api_route("/{allocation_id}/reject", reject_allocation, methods=["POST"], response_model=AllocationPendingResponse)
+router.include_router(legacy_allocations_router)

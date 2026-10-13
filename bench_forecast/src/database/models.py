@@ -858,6 +858,12 @@ class Allocation(TimestampMixin, Base):
     employee: Mapped["Employee"] = relationship("Employee", foreign_keys=[employee_id], back_populates="allocations")
     project_demand: Mapped[Optional["ProjectDemand"]] = relationship("ProjectDemand", foreign_keys=[demand_id])
 
+    @property
+    def project_id(self) -> Optional[uuid.UUID]:
+        if self.project_demand and self.project_demand.project_id:
+            return self.project_demand.project_id
+        return None
+
 # ---------------------------------------------------------------------------
 # Utility kept for backward compat (used in postgres_db.py)
 # ---------------------------------------------------------------------------

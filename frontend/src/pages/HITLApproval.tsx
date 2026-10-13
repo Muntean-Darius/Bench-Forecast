@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import clsx from 'clsx'
-import { MOCK_PROPOSALS } from '../data/mockData'
 import { categoryBadge, marginColor } from '../types'
 import { format } from 'date-fns'
+import { api } from '../api/client'
+import { useAuth } from '../contexts/AuthContext'
 
 // ─── Margin delta block ───────────────────────────────────────────────────────
 
@@ -29,15 +30,21 @@ function MarginBlock({
       <div className="grid grid-cols-3 gap-4 mb-5">
         <div className="text-center">
           <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Bill Rate</p>
-          <p className="text-xl font-semibold tabnum text-green-700">€{billRate}/h</p>
+          <p className="text-xl font-semibold tabnum text-green-700">
+            {billRate > 0 ? `€${billRate}/h` : '—'}
+          </p>
         </div>
         <div className="text-center">
           <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Cost Rate</p>
-          <p className="text-xl font-semibold tabnum text-red-600">€{costRate}/h</p>
+          <p className="text-xl font-semibold tabnum text-red-600">
+            {costRate > 0 ? `€${costRate}/h` : '—'}
+          </p>
         </div>
         <div className="text-center">
           <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Margin / hr</p>
-          <p className="text-xl font-semibold tabnum text-gray-900">€{(billRate - costRate).toFixed(2)}/h</p>
+          <p className="text-xl font-semibold tabnum text-gray-900">
+            {billRate > 0 && costRate > 0 ? `€${(billRate - costRate).toFixed(2)}/h` : '—'}
+          </p>
         </div>
       </div>
 
@@ -49,16 +56,18 @@ function MarginBlock({
         <div>
           <p className="text-xs font-mono text-gray-500">Projected Margin</p>
           <p className={clsx('text-3xl font-bold tabnum mt-0.5', marginColor(margin))}>
-            {margin.toFixed(2)}%
+            {margin > 0 ? `${margin.toFixed(2)}%` : '—'}
           </p>
         </div>
         <div className="text-right">
           <p className="text-xs font-mono text-gray-500">vs Target ({targetMargin}%)</p>
-          <p className={clsx('text-2xl font-bold tabnum mt-0.5', isHealthy ? 'text-green-700' : 'text-red-600')}>
-            {isHealthy ? '+' : ''}{delta.toFixed(2)}%
-          </p>
+          {margin > 0 && (
+            <p className={clsx('text-2xl font-bold tabnum mt-0.5', isHealthy ? 'text-green-700' : 'text-red-600')}>
+              {isHealthy ? '+' : ''}{delta.toFixed(2)}%
+            </p>
+          )}
           <p className={clsx('text-xs font-mono mt-1', isHealthy ? 'text-green-600' : 'text-red-500')}>
-            {isHealthy ? '✓ Above target' : '✗ Below target margin'}
+            {margin > 0 ? (isHealthy ? '✓ Above target' : '✗ Below target margin') : 'N/A — no bill rate data'}
           </p>
         </div>
       </div>
@@ -68,26 +77,41 @@ function MarginBlock({
 
 // ─── HITL Approval page ───────────────────────────────────────────────────────
 
-import { useLocation } from 'react-router-dom'
-import { api } from '../api/client'
-
 export default function HITLApproval() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const { state } = useLocation()
-  
+  const { user } = useAuth()
+
   const [decision, setDecision] = useState<'idle' | 'approved' | 'training' | 'rejected'>('idle')
   const [feedback, setFeedback] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [decisionStartTime] = useState<number>(Date.now())
 
-  // Use the proposal from router state if available, else mock data fallback
-  const proposal = state?.proposal || MOCK_PROPOSALS.find((p) => p.id === id)
-  const recId = state?.recId || 'mock-rec-id'
+  // Use proposal from router state (passed from ActionQueue) or fallback to sessionStorage
+  const [proposal] = useState<any>(() => {
+    if (state?.proposal) return state.proposal
+    try {
+      const raw = sessionStorage.getItem('bf_cached_proposals')
+      if (raw) {
+        const list = JSON.parse(raw)
+        return list.find((p: any) => String(p.id) === String(id)) ?? null
+      }
+    } catch (e) {
+      console.error('Failed to parse cached proposals:', e)
+    }
+    return null
+  })
+  const forecastRunId: string = state?.forecastRunId || sessionStorage.getItem('bf_cached_forecast_run_id') || ''
+  const allocationId: string = state?.allocationId ?? id ?? ''
 
   if (!proposal) {
     return (
       <div className="p-6">
-        <p className="text-sm text-red-600">Proposal not found: {id}</p>
+        <p className="text-sm text-red-600">
+          Proposal not found (id: {id}). Please navigate back to the queue.
+        </p>
         <button onClick={() => navigate('/queue')} className="btn-ghost mt-4">← Back to Queue</button>
       </div>
     )
@@ -98,19 +122,55 @@ export default function HITLApproval() {
   const margin = proposal.projected_margin
 
   async function handleAction(action: 'approved' | 'training' | 'rejected') {
+    if (action === 'rejected' && !feedback.trim()) return
+
     setSubmitting(true)
+    setActionError(null)
+    const timeToDecision = (Date.now() - decisionStartTime) / 1000
+
     try {
-      await api.executeForecast({
-        recommendation_id: recId,
-        thread_id: "ui-thread",
-        approved: action === 'approved',
-        approver_name: "Darius Muntean",
-        rejection_feedback: feedback || "No feedback provided"
-      })
+      // 1. Submit forecast review if we have a run_id (LangGraph HITL)
+      if (forecastRunId) {
+        await api.reviewForecast(
+          forecastRunId,
+          action === 'approved' || action === 'training',
+          action === 'rejected' ? feedback : undefined,
+        )
+      }
+
+      // 2. Also call the allocations endpoint if we have an allocation ID (DB record)
+      if (allocationId && user?.id) {
+        if (action === 'approved' || action === 'training') {
+          try {
+            await api.approveAllocation(allocationId, user.id, timeToDecision)
+          } catch {
+            // Non-fatal: allocation may not be in DB yet if coming from forecast decisions
+          }
+        } else if (action === 'rejected') {
+          try {
+            await api.rejectAllocation(allocationId, user.id, feedback, timeToDecision)
+          } catch {
+            // Non-fatal
+          }
+        }
+      }
+
+      // 3. Remove reviewed proposal from sessionStorage so it is cleared from the queue
+      try {
+        const cached = sessionStorage.getItem('bf_cached_proposals')
+        if (cached) {
+          const list = JSON.parse(cached)
+          const updated = list.filter((p: any) => String(p.id) !== String(id) && String(p.id) !== String(allocationId))
+          sessionStorage.setItem('bf_cached_proposals', JSON.stringify(updated))
+        }
+      } catch (cacheErr) {
+        console.error('Failed to update cached proposals in sessionStorage:', cacheErr)
+      }
+
       setDecision(action)
-    } catch (e) {
+    } catch (e: any) {
       console.error(e)
-      alert("Failed to submit decision")
+      setActionError(e.message ?? 'Failed to submit decision')
     } finally {
       setSubmitting(false)
     }
@@ -133,10 +193,15 @@ export default function HITLApproval() {
                                         'Rejected · Re-running AI' }
           </p>
           <p className="text-sm text-gray-500 mt-1">
-            {decision === 'approved'  ? `${emp.full_name} is now allocated to ${project.name}.` :
+            {decision === 'approved'  ? `${emp.full_name} has been allocated to ${project.name}.` :
              decision === 'training'  ? `Training plan created for ${emp.full_name}.` :
                                         'AI will generate a revised allocation proposal.' }
           </p>
+          {decision === 'rejected' && forecastRunId && (
+            <p className="text-xs text-gray-400 font-mono mt-2">
+              LangGraph pipeline resumed · Feedback: "{feedback}"
+            </p>
+          )}
         </div>
         <button onClick={() => navigate('/queue')} className="btn-ghost">
           ← Back to Queue
@@ -144,6 +209,34 @@ export default function HITLApproval() {
       </div>
     )
   }
+
+  const skillsArr: string[] = role.required_skills
+    ? role.required_skills.split(',').map((s: string) => s.trim()).filter(Boolean)
+    : []
+
+  const empSkillsArr: string[] = Array.isArray(emp.skills)
+    ? emp.skills
+    : typeof emp.skills === 'string'
+    ? emp.skills.split(',').map((s: string) => s.trim()).filter(Boolean)
+    : []
+
+  const billRate = role.target_bill_rate ?? 0
+  const costRate = emp.hourly_cost_rate ?? 0
+  const computedMargin = billRate > 0 && costRate > 0
+    ? ((billRate - costRate) / billRate) * 100
+    : margin
+
+  let startDateStr = '—'
+  try { if (role.start_date) startDateStr = format(new Date(role.start_date), 'dd MMM yyyy') } catch {}
+
+  let createdAtStr = '—'
+  try { createdAtStr = format(new Date(proposal.created_at), 'dd MMM yyyy · HH:mm') } catch {}
+
+  let benchDateStr = '—'
+  try {
+    const bd = emp.bench_start_date ?? emp.available_from
+    if (bd) benchDateStr = format(new Date(bd), 'dd MMM yyyy')
+  } catch {}
 
   return (
     <div className="flex flex-col min-h-screen">
@@ -161,13 +254,11 @@ export default function HITLApproval() {
         {proposal.revision_count && proposal.revision_count > 0 && (
           <span className="badge badge-gray">Revision {proposal.revision_count}</span>
         )}
-        <div className="ml-auto text-xs text-gray-400 font-mono">
-          {format(new Date(proposal.created_at), 'dd MMM yyyy · HH:mm')}
-        </div>
+        <div className="ml-auto text-xs text-gray-400 font-mono">{createdAtStr}</div>
       </div>
 
       <div className="flex-1 p-6 grid grid-cols-[1fr_1fr] gap-6">
-        {/* ── LEFT: Demand (Project Role) ──────────────────────────────────── */}
+        {/* ── LEFT: Demand (Project Role) ────────────────────────────────────── */}
         <div className="flex flex-col gap-4">
           <div className="card p-5">
             <p className="text-[10px] font-mono uppercase tracking-wider text-gray-400 mb-3">
@@ -179,15 +270,17 @@ export default function HITLApproval() {
             <div className="mt-4 grid grid-cols-2 gap-y-3 text-sm">
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Start Date</p>
-                <p className="font-mono">{format(new Date(role.start_date), 'dd MMM yyyy')}</p>
+                <p className="font-mono">{startDateStr}</p>
               </div>
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Headcount</p>
-                <p className="font-mono">{role.headcount}</p>
+                <p className="font-mono">{role.headcount ?? 1}</p>
               </div>
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Target Bill Rate</p>
-                <p className="font-mono font-semibold text-green-700">€{role.target_bill_rate}/h</p>
+                <p className="font-mono font-semibold text-green-700">
+                  {billRate > 0 ? `€${billRate}/h` : '—'}
+                </p>
               </div>
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Target Margin</p>
@@ -205,14 +298,23 @@ export default function HITLApproval() {
               </div>
             </div>
 
-            <div className="mt-4">
-              <p className="text-[10px] font-mono text-gray-400 uppercase mb-2">Required Skills</p>
-              <div className="flex flex-wrap gap-1.5">
-                {(role.required_skills ?? '').split(',').map((s: string) => (
-                  <span key={s} className="badge badge-blue">{s.trim()}</span>
-                ))}
+            {skillsArr.length > 0 && (
+              <div className="mt-4">
+                <p className="text-[10px] font-mono text-gray-400 uppercase mb-2">Required Skills</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {skillsArr.map((s: string) => (
+                    <span key={s} className="badge badge-blue">{s.trim()}</span>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
+
+            {role.description && (
+              <div className="mt-4">
+                <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Description</p>
+                <p className="text-xs text-gray-600 leading-relaxed">{role.description}</p>
+              </div>
+            )}
           </div>
         </div>
 
@@ -222,7 +324,7 @@ export default function HITLApproval() {
             <p className="text-[10px] font-mono uppercase tracking-wider text-gray-400 mb-3">
               Supply · Proposed Employee
             </p>
-            <h2 className="text-base font-semibold text-gray-900">{emp.full_name}</h2>
+            <h2 className="text-base font-semibold text-gray-900">{emp.full_name ?? emp.name}</h2>
             <p className="text-sm text-gray-500 mt-0.5">
               {emp.seniority} {emp.primary_role}
             </p>
@@ -230,13 +332,13 @@ export default function HITLApproval() {
             <div className="mt-4 grid grid-cols-2 gap-y-3 text-sm">
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Cost Rate</p>
-                <p className="font-mono font-semibold text-red-700">€{emp.hourly_cost_rate}/h</p>
+                <p className="font-mono font-semibold text-red-700">
+                  {costRate > 0 ? `€${costRate}/h` : '—'}
+                </p>
               </div>
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Bench Since</p>
-                <p className="font-mono">
-                  {emp.bench_start_date ? format(new Date(emp.bench_start_date), 'dd MMM yyyy') : '—'}
-                </p>
+                <p className="font-mono">{benchDateStr}</p>
               </div>
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Experience</p>
@@ -245,16 +347,16 @@ export default function HITLApproval() {
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Match Score</p>
                 <p className={clsx('font-mono font-bold', proposal.match_score >= 0.85 ? 'text-green-700' : 'text-yellow-600')}>
-                  {Math.round(proposal.match_score * 100)}%
+                  {proposal.match_score > 0 ? `${Math.round(proposal.match_score * 100)}%` : '—'}
                 </p>
               </div>
             </div>
 
-            {emp.skills && (
+            {empSkillsArr.length > 0 && (
               <div className="mt-4">
                 <p className="text-[10px] font-mono text-gray-400 uppercase mb-2">Skills</p>
                 <div className="flex flex-wrap gap-1.5">
-                  {emp.skills.split(',').map((s: string) => (
+                  {empSkillsArr.map((s: string) => (
                     <span key={s} className="badge badge-gray">{s.trim()}</span>
                   ))}
                 </div>
@@ -279,7 +381,7 @@ export default function HITLApproval() {
               AI · Semantic RAG Justification
             </p>
             <p className="text-sm text-gray-700 leading-relaxed mb-3">{proposal.reasoning}</p>
-            {proposal.rag_passages.length > 0 && (
+            {proposal.rag_passages && proposal.rag_passages.length > 0 && (
               <div className="border-l-2 border-gray-200 pl-3 space-y-2 mt-3">
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Retrieved CV Passages</p>
                 {proposal.rag_passages.map((p: string, i: number) => (
@@ -301,16 +403,16 @@ export default function HITLApproval() {
       <div className="border-t border-gray-200 bg-white px-6 py-5">
         <div className="max-w-4xl mx-auto">
           <MarginBlock
-            billRate={role.target_bill_rate}
-            costRate={emp.hourly_cost_rate}
-            margin={margin}
+            billRate={billRate}
+            costRate={costRate}
+            margin={computedMargin}
             targetMargin={project.target_margin}
           />
 
           {/* Feedback (for rejection) */}
           <div className="mt-4">
             <label className="text-xs font-mono text-gray-500 block mb-1">
-              Rejection feedback / revision guidance <span className="text-gray-400">(required to trigger re-run)</span>
+              Rejection feedback / revision guidance <span className="text-gray-400">(required to trigger AI re-run)</span>
             </label>
             <textarea
               value={feedback}
@@ -321,6 +423,10 @@ export default function HITLApproval() {
             />
           </div>
 
+          {actionError && (
+            <p className="text-xs text-red-600 font-mono mt-2">{actionError}</p>
+          )}
+
           {/* Action buttons */}
           <div className="mt-4 flex items-center gap-3">
             <button
@@ -328,7 +434,7 @@ export default function HITLApproval() {
               onClick={() => handleAction('approved')}
               className="btn-success flex-1"
             >
-              ✓ Approve Allocation
+              {submitting ? '⏳ Processing…' : '✓ Approve Allocation'}
             </button>
             <button
               disabled={submitting}
@@ -338,7 +444,7 @@ export default function HITLApproval() {
               ⚡ Trigger Upskilling
             </button>
             <button
-              disabled={submitting || (proposal.category !== 'hiring' && !feedback.trim())}
+              disabled={submitting || (!feedback.trim() && proposal.category !== 'hiring')}
               onClick={() => handleAction('rejected')}
               className="btn-danger flex-1"
               title={!feedback.trim() ? 'Add feedback to trigger AI re-run' : ''}
@@ -347,7 +453,7 @@ export default function HITLApproval() {
             </button>
           </div>
           <p className="text-xs text-gray-400 font-mono mt-2 text-center">
-            Approvals are written to PostgreSQL · Rejections with feedback trigger LangGraph revision
+            Approvals written to PostgreSQL · Rejections with feedback resume LangGraph revision pipeline
           </p>
         </div>
       </div>

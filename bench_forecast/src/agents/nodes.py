@@ -78,23 +78,6 @@ def _log_state_exit(node_name: str, updates: Dict[str, Any]) -> None:
     )
 
 
-def _get_db():
-    """Return operational database manager: PostgresManager if configured, else SQLiteManager."""
-    from src.core.config import Config
-    if Config.USE_POSTGRES:
-        try:
-            from src.database.postgres_db import PostgresManager
-            return PostgresManager()
-        except Exception as e:
-            logger.warning(
-                f"PostgreSQL connection failed ({e}), falling back to SQLiteManager"
-            )
-            from src.database.sql_db import SQLiteManager
-            return SQLiteManager()
-    from src.database.sql_db import SQLiteManager
-    return SQLiteManager()
-
-
 from sqlalchemy.orm import selectinload
 
 # ===========================================================================
@@ -123,24 +106,48 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
 
             employees = []
             for emp in employees_db:
+                # Resolve seniority
+                sen = "Mid"
+                if emp.experience_level:
+                    sen = emp.experience_level.value.capitalize()
+                elif getattr(emp, "seniority", None):
+                    sen = str(emp.seniority).capitalize()
+
+                # Cascading hourly cost lookup
+                cost_val = 0.0
+                if emp.employee_costs:
+                    costs = sorted(
+                        emp.employee_costs,
+                        key=lambda c: getattr(c, "effective_date", None) or date.min,
+                        reverse=True
+                    )
+                    cost_val = float(costs[0].internal_hourly_cost)
+                elif getattr(emp, "hourly_cost_rate", None):
+                    cost_val = float(emp.hourly_cost_rate)
+
+                # Never allow 0 cost for an active employee
+                if cost_val <= 0:
+                    sen_map = {
+                        "junior": 40.0,
+                        "mid": 65.0,
+                        "senior": 95.0,
+                        "lead": 125.0,
+                        "principal": 160.0,
+                    }
+                    cost_val = sen_map.get(sen.lower(), 65.0)
+
                 emp_dict = {
                     "id": str(emp.id),
-                    "name": f"{emp.first_name} {emp.last_name}",
+                    "name": f"{emp.first_name} {emp.last_name}".strip(),
+                    "full_name": f"{emp.first_name} {emp.last_name}".strip(),
                     "skills": getattr(emp, "skills") or [], # Legacy fallback or use empty
                     "profile_text": emp.profile_text,
-                    "bench_status": emp.bench_status.value
+                    "bench_status": emp.bench_status.value if hasattr(emp.bench_status, "value") else str(emp.bench_status),
+                    "seniority": sen,
+                    "hourly_cost": cost_val,
+                    "hourly_cost_rate": cost_val,
+                    "daily_cost": cost_val * 8.0,
                 }
-                
-                # Attach financial data
-                if emp.employee_costs:
-                    # Use the most recent cost (assuming order or just take the first)
-                    latest_cost = emp.employee_costs[0]
-                    emp_dict["hourly_cost"] = float(latest_cost.internal_hourly_cost)
-                    emp_dict["daily_cost"] = float(latest_cost.internal_daily_cost)
-                else:
-                    emp_dict["hourly_cost"] = 0.0
-                    emp_dict["daily_cost"] = 0.0
-                
                 employees.append(emp_dict)
 
             # Query open demands with their projects
@@ -184,9 +191,9 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
                 f"data_extractor_node: fetched {len(employees)} employees "
                 f"(horizon={horizon_days}d), {len(demands)} demands (p>={min_win_prob:.0%})"
             )
-    except Exception:
+    except Exception as exc:
         logger.exception("data_extractor_node: database query failed")
-        employees, demands = [], []
+        raise
 
     updates = {
         "bench_employees": employees,
@@ -219,21 +226,17 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
     vector_mgr = VectorStoreManager()
     all_matches: List[Dict[str, Any]] = []
 
+    bench_ids = [str(emp["id"]) for emp in employees if emp.get("id")]
+    where_filter = {"employee_id": {"$in": bench_ids}} if bench_ids else None
+
     for demand in demands:
         rag_query = f"{demand.get('role', '')} {demand.get('description') or ''}"
-        rag_results: List[Dict[str, Any]] = []
-
-        try:
-            rag_results = vector_mgr.similarity_search(rag_query, k=3)
-            if rag_results:
-                logger.debug(
-                    f"skill_matcher: '{demand.get('role')}' RAG top match: "
-                    f"{rag_results[0].get('name')} "
-                    f"(score={rag_results[0].get('similarity_score', 0):.2f})"
-                )
-        except Exception:
-            logger.exception(
-                f"skill_matcher_node: ChromaDB query failed for '{demand.get('role')}'"
+        rag_results = vector_mgr.similarity_search(rag_query, k=3, where=where_filter)
+        if rag_results:
+            logger.debug(
+                f"skill_matcher: '{demand.get('role')}' RAG top match: "
+                f"{rag_results[0].get('name')} "
+                f"(score={rag_results[0].get('similarity_score', 0):.2f})"
             )
 
         rag_passages_by_emp: Dict[str, List[str]] = {}
@@ -247,52 +250,42 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
                 rag_passages_by_emp.setdefault(emp_id, []).append(excerpt)
 
         candidates = [emp for emp in employees if emp.get("id") in candidate_ids]
-        if not candidates:
-            candidates = employees[:3]
 
         for employee in candidates:
-            try:
-                emp_rag = rag_passages_by_emp.get(employee.get("id"), [])
-                if employee.get("profile_text") and employee.get("profile_text") not in emp_rag:
-                    emp_rag = [employee.get("profile_text")] + emp_rag
+            emp_rag = rag_passages_by_emp.get(employee.get("id"), [])
+            if employee.get("profile_text") and employee.get("profile_text") not in emp_rag:
+                emp_rag = [employee.get("profile_text")] + emp_rag
 
-                sys_msg, human_msg = MatchPromptBuilder.build_matching_prompt(
-                    employee_profile=(
-                        employee.get("profile_text")
-                        or f"{employee.get('name')}: {', '.join(employee.get('skills') or [])}"
-                    ),
-                    job_description=(
-                        demand.get("description")
-                        or f"{demand.get('role')} requiring: {', '.join(demand.get('required_skills') or [])}"
-                    ),
-                    required_skills=demand.get("required_skills") or [],
-                    employee_skills=employee.get("skills") or [],
-                    rag_passages=emp_rag[:3],
-                )
+            sys_msg, human_msg = MatchPromptBuilder.build_matching_prompt(
+                employee_profile=(
+                    employee.get("profile_text")
+                    or f"{employee.get('name')}: {', '.join(employee.get('skills') or [])}"
+                ),
+                job_description=(
+                    demand.get("description")
+                    or f"{demand.get('role')} requiring: {', '.join(demand.get('required_skills') or [])}"
+                ),
+                required_skills=demand.get("required_skills") or [],
+                employee_skills=employee.get("skills") or [],
+                rag_passages=emp_rag[:3],
+            )
 
-                response = llm.invoke([sys_msg, human_msg])
-                match_json = LLMFactory.parse_json_response(response.content)
+            response = llm.invoke([sys_msg, human_msg])
+            match_json = LLMFactory.parse_json_response(response.content)
 
-                match = MatchJustification(
-                    employee_id=str(employee.get("id")),
-                    demand_id=str(demand.get("id")),
-                    match_score=float(match_json.get("match_score", 0.0)),
-                    reasoning=match_json.get("reasoning") or "No reasoning provided",
-                    missing_skills=match_json.get("missing_skills", []),
-                    training_recommendation=match_json.get("training_recommendation"),
-                    rag_passages=emp_rag,
-                )
+            match = MatchJustification(
+                employee_id=str(employee.get("id")),
+                demand_id=str(demand.get("id")),
+                match_score=float(match_json.get("match_score", 0.0)),
+                reasoning=match_json.get("reasoning") or "No reasoning provided",
+                missing_skills=match_json.get("missing_skills", []),
+                training_recommendation=match_json.get("training_recommendation"),
+                rag_passages=emp_rag,
+            )
 
-                match_dict = match.model_dump()
-                match_dict["target_project_id"] = demand.get("project_id")
-                all_matches.append(match_dict)
-
-            except Exception:
-                logger.exception(
-                    f"skill_matcher_node: error matching "
-                    f"employee={employee.get('name', '?')} "
-                    f"demand={demand.get('role')}"
-                )
+            match_dict = match.model_dump()
+            match_dict["target_project_id"] = demand.get("project_id")
+            all_matches.append(match_dict)
 
     all_matches.sort(key=lambda x: x["match_score"], reverse=True)
     updates = {"skill_matches": all_matches}
@@ -318,6 +311,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     rag = RAGPipeline()
     llm = LLMFactory.get_chat_model()
     decisions: List[Dict[str, Any]] = []
+    allocated_employee_ids: set = set()
 
     for demand in demands:
         role_title = demand.get("role", "Unknown Role")
@@ -335,72 +329,191 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
             f"bill_rate=${target_bill_rate:.2f}/h target_margin={target_margin:.1f}%"
         )
 
-        try:
-            candidates = rag.retrieve_candidates(
-                role_description=role_description,
-                target_bill_rate=target_bill_rate,
-                k=5,
-            )
+        bench_employees = state.get("bench_employees", [])
+        bench_ids = [str(emp["id"]) for emp in bench_employees if emp.get("id")]
+        emp_by_id = {str(emp["id"]): emp for emp in bench_employees}
+
+        # Exclude employees that have already been allocated to earlier demands in this run
+        unallocated_bench_ids = [b for b in bench_ids if b not in allocated_employee_ids]
+
+        if not unallocated_bench_ids and bench_ids:
             logger.info(
-                f"  RAG candidates (cost < ${target_bill_rate:.2f}/h): "
-                f"{len(candidates)} returned"
+                f"allocation_decider: all bench employees already allocated — recommending hire for '{role_title}'"
             )
+            decisions.append({
+                "action_type": "hire",
+                "employee_id": None,
+                "projected_margin": 0.0,
+                "justification": f"All qualified bench personnel are already allocated to priority projects. External hiring recommended for '{role_title}'.",
+                "upskilling_path": None,
+                "role_id": demand.get("id", ""),
+                "role_title": role_title,
+                "target_project_id": demand.get("project_id", ""),
+                "target_bill_rate": target_bill_rate,
+                "target_margin": target_margin,
+                "candidate_count": 0,
+            })
+            continue
 
-            sys_msg, human_msg = FinancialMatchPrompts.build_role_evaluation_prompt(
-                role_title=role_title,
-                role_description=role_description,
-                target_bill_rate=target_bill_rate,
-                target_margin=target_margin,
-                candidates=candidates,
-            )
+        additional_where = {"employee_id": {"$in": unallocated_bench_ids}} if unallocated_bench_ids else None
+        candidates = rag.retrieve_candidates(
+            role_description=role_description,
+            target_bill_rate=target_bill_rate,
+            k=5,
+            additional_where=additional_where,
+        )
 
-            response = llm.invoke([sys_msg, human_msg])
-            raw_json = LLMFactory.parse_json_response(response.content)
+        # Filter candidates strictly to available bench employees not yet allocated
+        if emp_by_id:
+            candidates = [
+                c for c in candidates
+                if str(c.get("employee_id") or c.get("id")) in emp_by_id
+                and str(c.get("employee_id") or c.get("id")) not in allocated_employee_ids
+            ]
+        else:
+            candidates = [
+                c for c in candidates
+                if str(c.get("employee_id") or c.get("id")) not in allocated_employee_ids
+            ]
 
-            decision = AllocationDecision(**raw_json)
-
-            decision_dict = decision.model_dump()
-            decision_dict.update(
-                {
-                    "role_id": demand.get("id", ""),
-                    "role_title": role_title,
-                    "target_project_id": demand.get("project_id", ""),
-                    "target_bill_rate": target_bill_rate,
-                    "target_margin": target_margin,
-                    "candidate_count": len(candidates),
-                }
-            )
-            decisions.append(decision_dict)
-
+        # If ChromaDB returned 0 bench candidates, fallback to evaluating unallocated bench employees directly
+        if not candidates and unallocated_bench_ids:
             logger.info(
-                f"  Decision for '{role_title}': "
-                f"action={decision.action_type} "
-                f"employee={decision.employee_id} "
-                f"margin={decision.projected_margin:.1f}%"
+                f"RAG query returned no unallocated bench candidates for '{role_title}'. "
+                f"Evaluating unallocated bench employees directly."
             )
+            for b_id in unallocated_bench_ids[:5]:
+                emp = emp_by_id[b_id]
+                cost = float(emp.get("hourly_cost") or emp.get("hourly_cost_rate") or 0.0)
+                sen = emp.get("seniority") or emp.get("experience_level") or "Mid"
+                if cost <= 0:
+                    sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
+                    cost = sen_map.get(str(sen).lower(), 65.0)
+                margin = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2) if target_bill_rate > 0 else 0.0
+                candidates.append({
+                    "employee_id": b_id,
+                    "full_name": emp.get("name") or emp.get("full_name") or f"Employee {b_id[:8]}",
+                    "primary_role": emp.get("job_title") or (emp.get("skills")[0] if emp.get("skills") else "Engineer"),
+                    "seniority": sen,
+                    "hourly_cost_rate": cost,
+                    "bench_start_date": emp.get("available_from") or "",
+                    "similarity_score": 0.60,
+                    "projected_margin_pct": margin,
+                    "document_excerpt": emp.get("profile_text") or f"Skills: {', '.join(emp.get('skills', []))}",
+                    "chunk_index": 0,
+                })
 
-        except Exception:
-            logger.exception(
-                f"allocation_decider_node: failed to evaluate role '{role_title}'"
-            )
-            decisions.append(
-                {
-                    "action_type": "hire",
-                    "employee_id": None,
-                    "projected_margin": 0.0,
-                    "justification": (
-                        f"Evaluation failed for role '{role_title}'. "
-                        "External hiring recommended as safe fallback."
-                    ),
-                    "upskilling_path": None,
-                    "role_id": demand.get("id", ""),
-                    "role_title": role_title,
-                    "target_project_id": demand.get("project_id", ""),
-                    "target_bill_rate": target_bill_rate,
-                    "target_margin": target_margin,
-                    "candidate_count": 0,
-                }
-            )
+        logger.info(
+            f"  Viable bench candidates for '{role_title}': {len(candidates)} candidate(s)"
+        )
+
+        # ENRICH CANDIDATES WITH ACCURATE COST AND SENIORITY FROM DB / EXTRACTOR
+        for cand in candidates:
+            cand_id = str(cand.get("employee_id") or cand.get("id"))
+            if cand_id in emp_by_id:
+                emp = emp_by_id[cand_id]
+                cand["full_name"] = emp.get("name") or emp.get("full_name") or cand.get("full_name", "")
+                cand["seniority"] = emp.get("seniority") or cand.get("seniority") or "Senior"
+                if not cand.get("primary_role") and emp.get("skills"):
+                    cand["primary_role"] = emp["skills"][0]
+
+                cost = float(emp.get("hourly_cost") or emp.get("hourly_cost_rate") or cand.get("hourly_cost_rate") or 0.0)
+                if cost <= 0:
+                    sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
+                    cost = sen_map.get(str(cand["seniority"]).lower(), 65.0)
+                cand["hourly_cost_rate"] = cost
+                if target_bill_rate > 0:
+                    cand["projected_margin_pct"] = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2)
+            else:
+                cost = float(cand.get("hourly_cost_rate") or cand.get("cost") or 0.0)
+                if cost <= 0:
+                    cost = 65.0
+                cand["hourly_cost_rate"] = cost
+                if target_bill_rate > 0:
+                    cand["projected_margin_pct"] = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2)
+
+        if not candidates:
+            decisions.append({
+                "action_type": "hire",
+                "employee_id": None,
+                "projected_margin": 0.0,
+                "justification": f"No available bench candidate meets both technical and financial criteria for '{role_title}'. External hire recommended.",
+                "upskilling_path": None,
+                "role_id": demand.get("id", ""),
+                "role_title": role_title,
+                "target_project_id": demand.get("project_id", ""),
+                "target_bill_rate": target_bill_rate,
+                "target_margin": target_margin,
+                "candidate_count": 0,
+            })
+            continue
+
+        sys_msg, human_msg = FinancialMatchPrompts.build_role_evaluation_prompt(
+            role_title=role_title,
+            role_description=role_description,
+            target_bill_rate=target_bill_rate,
+            target_margin=target_margin,
+            candidates=candidates,
+        )
+
+        response = llm.invoke([sys_msg, human_msg])
+        raw_json = LLMFactory.parse_json_response(response.content)
+
+        decision = AllocationDecision(**raw_json)
+
+        chosen_emp_id = str(decision.employee_id) if decision.employee_id else None
+        chosen_cand = next(
+            (c for c in candidates if str(c.get("employee_id") or c.get("id")) == chosen_emp_id),
+            None
+        )
+
+        # Ensure no duplicate employee allocations across demands
+        if decision.action_type in ("allocate", "train") and chosen_emp_id:
+            if chosen_emp_id in allocated_employee_ids:
+                logger.warning(
+                    f"allocation_decider: Employee {chosen_emp_id} was already allocated! Picking next available candidate."
+                )
+                alt = next(
+                    (c for c in candidates if str(c.get("employee_id") or c.get("id")) not in allocated_employee_ids),
+                    None
+                )
+                if alt:
+                    chosen_emp_id = str(alt.get("employee_id") or alt.get("id"))
+                    decision.employee_id = chosen_emp_id
+                    chosen_cand = alt
+                    allocated_employee_ids.add(chosen_emp_id)
+                else:
+                    decision.action_type = "hire"
+                    decision.employee_id = None
+                    decision.justification += " (Remaining candidates already allocated to other roles. Hiring recommended)."
+            else:
+                allocated_employee_ids.add(chosen_emp_id)
+
+        if chosen_cand and (decision.projected_margin == 0.0 or decision.projected_margin is None):
+            decision.projected_margin = chosen_cand.get("projected_margin_pct", 0.0)
+
+        decision_dict = decision.model_dump()
+        decision_dict.update(
+            {
+                "role_id": demand.get("id", ""),
+                "role_title": role_title,
+                "target_project_id": demand.get("project_id", ""),
+                "target_bill_rate": target_bill_rate,
+                "target_margin": target_margin,
+                "candidate_count": len(candidates),
+                "seniority": chosen_cand.get("seniority") if chosen_cand else None,
+                "full_name": chosen_cand.get("full_name") if chosen_cand else None,
+                "hourly_cost_rate": chosen_cand.get("hourly_cost_rate") if chosen_cand else None,
+            }
+        )
+        decisions.append(decision_dict)
+
+        logger.info(
+            f"  Decision for '{role_title}': "
+            f"action={decision.action_type} "
+            f"employee={decision.employee_id} "
+            f"margin={decision.projected_margin:.1f}%"
+        )
 
     updates = {"decisions": decisions}
     _log_state_exit("allocation_decider_node", updates)
@@ -411,10 +524,72 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
 # Node 4 — Forecast Planner (LLM Aggregate)
 # ===========================================================================
 
-def forecast_planner_node(state: State) -> Dict[str, Any]:
-    """Reasoning engine generating structured allocation, training, and hiring plan.
+def _build_plan_from_decisions(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Deterministically compile a workforce plan directly from per-role decisions."""
+    reallocations = []
+    trainings = []
+    hirings = []
 
-    Consumes skill_matches to produce a consolidated plan with
+    for d in decisions:
+        act = d.get("action_type") or "allocate"
+        if act == "allocate" and d.get("employee_id"):
+            reallocations.append({
+                "employee_id": str(d.get("employee_id")),
+                "target_project_id": str(d.get("target_project_id") or ""),
+                "role": d.get("role_title") or "Engineer",
+                "match_score": float(d.get("match_score") or 0.85),
+                "projected_margin": float(d.get("projected_margin") or 25.0),
+                "action_type": "allocate",
+                "justification": d.get("justification") or f"Direct allocation for {d.get('role_title', 'role')}.",
+            })
+        elif act in ("train", "training"):
+            trainings.append({
+                "employee_id": str(d.get("employee_id") or ""),
+                "target_skills": d.get("missing_skills") or ["Required Skills"],
+                "duration_weeks": 4,
+                "projected_margin": float(d.get("projected_margin") or 20.0),
+                "upskilling_path": d.get("upskilling_path") or "Structured training curriculum",
+            })
+        elif act in ("hire", "hiring"):
+            hirings.append({
+                "role": d.get("role_title") or "Engineer",
+                "required_skills": d.get("missing_skills") or [],
+                "headcount": 1,
+                "justification": d.get("justification") or f"External hire recommended for {d.get('role_title', 'role')}.",
+            })
+
+    total = len(reallocations) + len(trainings) + len(hirings)
+    confidence = (
+        round(
+            (len(reallocations) * 0.9 + len(trainings) * 0.75 + len(hirings) * 0.6)
+            / max(total, 1),
+            2,
+        )
+        if total > 0
+        else 0.5
+    )
+
+    return {
+        "recommendation_id": uuid.uuid4().hex,
+        "reallocations": reallocations,
+        "trainings": trainings,
+        "hirings": hirings,
+        "confidence_score": confidence,
+        "reasoning": (
+            f"Workforce optimization plan formulated across {len(decisions)} demands: "
+            f"{len(reallocations)} direct allocation(s), {len(trainings)} upskilling program(s), "
+            f"and {len(hirings)} external hire(s) based on margin requirements and skill match."
+        ),
+        "revision_note": None,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+
+def forecast_planner_node(state: State) -> Dict[str, Any]:
+    """Aggregate multi-role planning: synthesises reallocations, trainings, and hirings.
+
+    Combines skill_matches with aggregate bench constraints to generate a
+    holistic workforce plan. Uses LLM with FinancialMatchPrompts for
     financially-aware reasoning across all open roles.
 
     Args:
@@ -428,9 +603,10 @@ def forecast_planner_node(state: State) -> Dict[str, Any]:
     matches = state.get("skill_matches", [])
     employees = state.get("bench_employees", [])
     demands = state.get("open_demands", [])
+    decisions = state.get("decisions", [])
 
-    if not matches:
-        logger.warning("forecast_planner_node: no skill matches — returning empty plan")
+    if not matches and not decisions:
+        logger.warning("forecast_planner_node: no skill matches or decisions — returning empty plan")
         empty_plan = {
             "recommendation_id": uuid.uuid4().hex,
             "reallocations": [],
@@ -447,44 +623,58 @@ def forecast_planner_node(state: State) -> Dict[str, Any]:
 
     llm = LLMFactory.get_chat_model()
 
-    try:
-        sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
-            matches=matches,
-            employees_count=len(employees),
-            open_roles_count=len(demands),
-        )
+    sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
+        matches=matches,
+        employees_count=len(employees),
+        open_roles_count=len(demands),
+    )
 
+    plan_json = {}
+    try:
         response = llm.invoke([sys_msg, human_msg])
         plan_json = LLMFactory.parse_json_response(response.content)
-
-        plan_json.setdefault("recommendation_id", uuid.uuid4().hex)
-        plan_json.setdefault("revision_note", None)
-        plan_json.setdefault("created_at", datetime.utcnow().isoformat())
-
-        logger.info(
-            f"forecast_planner_node: plan generated — "
-            f"{len(plan_json.get('reallocations', []))} reallocations, "
-            f"{len(plan_json.get('trainings', []))} trainings, "
-            f"{len(plan_json.get('hirings', []))} hirings "
-            f"(confidence={plan_json.get('confidence_score', 0):.2f})"
+    except Exception as exc:
+        logger.warning(
+            f"forecast_planner_node: LLM planning call failed or produced unparseable JSON ({exc}). "
+            f"Synthesizing plan directly from allocation decisions."
         )
 
-        updates = {"recommendations": plan_json}
+    # Fallback to deterministic synthesis if LLM returned non-dict or empty plan
+    if not isinstance(plan_json, dict) or (
+        not plan_json.get("reallocations")
+        and not plan_json.get("trainings")
+        and not plan_json.get("hirings")
+    ):
+        logger.info(
+            f"forecast_planner_node: synthesizing plan from {len(decisions)} state decisions"
+        )
+        plan_json = _build_plan_from_decisions(decisions)
 
-    except Exception:
-        logger.exception("forecast_planner_node: planning LLM call failed")
-        updates = {
-            "recommendations": {
-                "recommendation_id": uuid.uuid4().hex,
-                "reallocations": [],
-                "trainings": [],
-                "hirings": [],
-                "confidence_score": 0.0,
-                "reasoning": "Planning failed due to LLM error.",
-                "revision_note": None,
-                "created_at": datetime.utcnow().isoformat(),
-            }
-        }
+    plan_json.setdefault("recommendation_id", uuid.uuid4().hex)
+    plan_json.setdefault("revision_note", None)
+    plan_json.setdefault("created_at", datetime.utcnow().isoformat())
+
+    # Deduplicate reallocations so no employee is assigned twice
+    seen_realloc_emps = set()
+    deduped_reallocs = []
+    for r in plan_json.get("reallocations", []):
+        r_emp = r.get("employee_id") or r.get("id")
+        if r_emp and r_emp in seen_realloc_emps:
+            continue
+        if r_emp:
+            seen_realloc_emps.add(r_emp)
+        deduped_reallocs.append(r)
+    plan_json["reallocations"] = deduped_reallocs
+
+    logger.info(
+        f"forecast_planner_node: plan generated — "
+        f"{len(plan_json.get('reallocations', []))} reallocations, "
+        f"{len(plan_json.get('trainings', []))} trainings, "
+        f"{len(plan_json.get('hirings', []))} hirings "
+        f"(confidence={plan_json.get('confidence_score', 0):.2f})"
+    )
+
+    updates = {"recommendations": plan_json}
 
     _log_state_exit("forecast_planner_node", updates)
     return updates
@@ -599,46 +789,47 @@ def revision_planner_node(state: State) -> Dict[str, Any]:
 
     llm = LLMFactory.get_chat_model()
 
-    try:
-        sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
-            matches=matches,
-            employees_count=len(employees),
-            open_roles_count=len(demands),
-            rejection_feedback=str(feedback),
-            previous_plan=previous_plan,
-        )
+    sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
+        matches=matches,
+        employees_count=len(employees),
+        open_roles_count=len(demands),
+        rejection_feedback=str(feedback),
+        previous_plan=previous_plan,
+    )
 
+    plan_json = {}
+    try:
         response = llm.invoke([sys_msg, human_msg])
         plan_json = LLMFactory.parse_json_response(response.content)
-
-        plan_json["recommendation_id"] = uuid.uuid4().hex
-        plan_json["revision_note"] = str(feedback)
-        plan_json["created_at"] = datetime.utcnow().isoformat()
-
-        logger.info(
-            f"revision_planner_node: revised plan ready — "
-            f"{len(plan_json.get('reallocations', []))} reallocations "
-            f"(confidence={plan_json.get('confidence_score', 0):.2f})"
+    except Exception as exc:
+        logger.warning(
+            f"revision_planner_node: LLM planning call failed or produced unparseable JSON ({exc}). "
+            f"Synthesizing plan from decisions."
         )
 
-        updates = {
-            "recommendations": plan_json,
-            "human_approved": False,
-            "rejection_feedback": None,  # Clear so next cycle starts fresh
-        }
+    if not isinstance(plan_json, dict) or (
+        not plan_json.get("reallocations")
+        and not plan_json.get("trainings")
+        and not plan_json.get("hirings")
+    ):
+        decisions = state.get("decisions", [])
+        plan_json = _build_plan_from_decisions(decisions)
 
-    except Exception:
-        logger.exception("revision_planner_node: revision LLM call failed")
-        updates = {
-            "recommendations": {
-                **previous_plan,
-                "recommendation_id": uuid.uuid4().hex,
-                "revision_note": "Revision failed. Original plan retained.",
-                "created_at": datetime.utcnow().isoformat(),
-            },
-            "human_approved": False,
-            "rejection_feedback": None,
-        }
+    plan_json["recommendation_id"] = uuid.uuid4().hex
+    plan_json["revision_note"] = str(feedback)
+    plan_json["created_at"] = datetime.utcnow().isoformat()
+
+    logger.info(
+        f"revision_planner_node: revised plan ready — "
+        f"{len(plan_json.get('reallocations', []))} reallocations "
+        f"(confidence={plan_json.get('confidence_score', 0):.2f})"
+    )
+
+    updates = {
+        "recommendations": plan_json,
+        "human_approved": False,
+        "rejection_feedback": None,  # Clear so next cycle starts fresh
+    }
 
     _log_state_exit("revision_planner_node", updates)
     return updates
@@ -753,11 +944,9 @@ async def execution_engine_node(state: State) -> Dict[str, Any]:
                     run_rec.status = "completed"
 
             await db.commit()
-    except Exception:
+    except Exception as exc:
         logger.exception("execution_engine_node: failed reallocation batch")
-        updates = {"execution_status": "failed"}
-        _log_state_exit("execution_engine_node", updates)
-        return updates
+        raise
 
     status_msg = f"executed_{executed_count}_of_{len(reallocations)}"
     logger.info(f"execution_engine_node: {status_msg}")

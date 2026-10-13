@@ -52,7 +52,7 @@ class Config:
     # -----------------------------------------------------------------------
     # Vector Store Configuration
     # -----------------------------------------------------------------------
-    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_store")
+    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
 
     # -----------------------------------------------------------------------
     # LangSmith Tracing Configuration

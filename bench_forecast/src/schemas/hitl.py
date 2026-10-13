@@ -15,10 +15,21 @@ class DemandResponse(BaseModel):
     
     model_config = ConfigDict(from_attributes=True)
 
+class EmployeeBriefResponse(BaseModel):
+    id: UUID
+    first_name: str
+    last_name: str
+    job_title: Optional[str] = None
+    experience_level: Optional[str] = None
+    skills: Optional[str] = None
+    profile_text: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
 class AllocationPendingResponse(BaseModel):
     id: UUID
     employee_id: UUID
-    project_id: UUID
+    project_id: Optional[UUID] = None
     role_on_project: str
     allocation_pct: Decimal
     status: AllocationStatusEnum
@@ -26,6 +37,7 @@ class AllocationPendingResponse(BaseModel):
     ai_match_score: Optional[Decimal] = None
     ai_projected_margin: Optional[Decimal] = None
     project_demand: Optional[DemandResponse] = None
+    employee: Optional[EmployeeBriefResponse] = None
     
     model_config = ConfigDict(from_attributes=True)
 

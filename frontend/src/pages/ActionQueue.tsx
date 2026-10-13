@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -12,64 +12,213 @@ const CATEGORY_FILTERS: { value: ProposalCategory | 'all'; label: string }[] = [
   { value: 'hiring',   label: '🔴 Hiring Recommendation' },
 ]
 
+// ─── Transform a PendingAllocation into a UI proposal shape ──────────────────
+
+// ─── Transform a PendingAllocation into a UI proposal shape ──────────────────
+
+function allocationToProposal(a: any) {
+  const matchScore = a.ai_match_score ? Number(a.ai_match_score) : 0
+  const margin = a.ai_projected_margin ? Number(a.ai_projected_margin) : 0
+
+  let cat: ProposalCategory = 'direct'
+  if (a.ai_upskilling_path || (matchScore < 0.75 && matchScore > 0)) {
+    cat = 'training'
+  } else if (matchScore === 0) {
+    cat = 'hiring'
+  }
+
+  const empName = a.employee
+    ? `${a.employee.first_name || ''} ${a.employee.last_name || ''}`.trim()
+    : `Employee ${String(a.employee_id).substring(0, 8)}…`
+
+  const seniority = a.employee?.experience_level
+    ? a.employee.experience_level.charAt(0).toUpperCase() + a.employee.experience_level.slice(1).toLowerCase()
+    : ''
+  const primaryRole = a.employee?.job_title || ''
+
+  return {
+    id: String(a.id),
+    category: cat,
+    employee: {
+      full_name: empName,
+      seniority: seniority,
+      primary_role: primaryRole,
+      id: String(a.employee_id),
+    },
+    role: {
+      title: a.role_on_project || a.project_demand?.role || 'Engineer',
+      id: String(a.demand_id || a.id),
+      start_date: new Date().toISOString(),
+      headcount: a.project_demand?.headcount_needed ?? 1,
+      target_bill_rate: a.project_demand?.target_bill_rate ? Number(a.project_demand.target_bill_rate) : 100,
+      required_skills: null,
+      project_id: String(a.project_id || ''),
+      status: 'Open' as const,
+    },
+    project: {
+      id: String(a.project_id || ''),
+      name: a.project_id ? `Project ${String(a.project_id).substring(0, 8)}` : 'Client Project',
+      status: 'Pipeline' as const,
+      probability: 80,
+      target_margin: 30,
+      total_budget: 0,
+    },
+    match_score: matchScore,
+    projected_margin: margin,
+    missing_skills: [] as string[],
+    reasoning: a.ai_justification ?? 'AI-generated allocation recommendation.',
+    rag_passages: [] as string[],
+    created_at: a.created_at || new Date().toISOString(),
+    revision_count: 0,
+    // pass through the original allocation for HITL actions
+    _allocation: a,
+  }
+}
+
 export default function ActionQueue() {
   const navigate = useNavigate()
   const [catFilter, setCatFilter] = useState<ProposalCategory | 'all'>('all')
-  const [proposals, setProposals] = useState<any[]>([])
+  const [proposals, setProposals] = useState<ReturnType<typeof allocationToProposal>[]>(() => {
+    try {
+      const cached = sessionStorage.getItem('bf_cached_proposals')
+      if (cached) {
+        return JSON.parse(cached)
+      }
+    } catch (e) {
+      console.error('Failed to parse cached proposals:', e)
+    }
+    return []
+  })
+  const [forecastRunId, setForecastRunId] = useState<string>(() => {
+    return sessionStorage.getItem('bf_cached_forecast_run_id') || ''
+  })
   const [loading, setLoading] = useState(false)
-  const [recId, setRecId] = useState<string>('')
+  const [fetchingPending, setFetchingPending] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  // Load pending allocations on mount and merge with any active forecast proposals
+  useEffect(() => {
+    async function loadPending() {
+      try {
+        const data = await api.getPendingAllocations()
+        if (data && data.length > 0) {
+          const dbProposals = data.map(allocationToProposal)
+          setProposals((prev) => {
+            if (!prev || prev.length === 0) {
+              sessionStorage.setItem('bf_cached_proposals', JSON.stringify(dbProposals))
+              return dbProposals
+            }
+
+            // Merge: preserve proposals from forecast decisions (e.g. hiring recommendations)
+            // and update existing matching DB items
+            const dbMap = new Map(dbProposals.map((p) => [p.id, p]))
+            const merged: ReturnType<typeof allocationToProposal>[] = []
+
+            for (const p of prev) {
+              if (dbMap.has(p.id)) {
+                merged.push(dbMap.get(p.id)!)
+                dbMap.delete(p.id)
+              } else if (p.id.startsWith('decision-') || p.category === 'hiring') {
+                merged.push(p)
+              }
+            }
+
+            for (const remaining of dbMap.values()) {
+              merged.push(remaining)
+            }
+
+            sessionStorage.setItem('bf_cached_proposals', JSON.stringify(merged))
+            return merged
+          })
+        }
+      } catch (e) {
+        console.error('Failed to load pending allocations:', e)
+      } finally {
+        setFetchingPending(false)
+      }
+    }
+    loadPending()
+  }, [])
 
   async function handleRunForecast() {
     setLoading(true)
+    setError(null)
     try {
-      const res = await api.generateForecast({
-        department_id: "ALL",
-        thread_id: "ui-thread",
-        horizon_days: 90,
-        min_win_probability: 0.75,
+      const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
+      const res = await api.runForecast(horizonDays)
+
+      setForecastRunId(res.forecast_run_id)
+      sessionStorage.setItem('bf_cached_forecast_run_id', res.forecast_run_id)
+
+      // Fetch pending allocations from DB
+      const pendingData = await api.getPendingAllocations()
+      const dbProposals = (pendingData && pendingData.length > 0)
+        ? pendingData.map(allocationToProposal)
+        : []
+
+      // Also get decisions from state_metadata (which includes hiring recommendations)
+      const decisions = res.state_metadata?.decisions ?? []
+      const decisionProposals = decisions.map((d: any, i: number) => {
+        const actType = d.action_type || d.category || 'allocate'
+        const cat: ProposalCategory =
+          actType === 'train' || actType === 'training'
+            ? 'training'
+            : actType === 'hire' || actType === 'hiring'
+            ? 'hiring'
+            : 'direct'
+
+        return {
+          id: `decision-${i}`,
+          category: cat,
+          employee: {
+            full_name: d.employee_id ? `Employee ${String(d.employee_id).substring(0, 8)}` : 'External Hire',
+            seniority: d.seniority || 'Mid',
+            primary_role: d.role_title || 'Engineer',
+            id: String(d.employee_id ?? ''),
+          },
+          role: {
+            title: String(d.role_title ?? d.role ?? 'Engineer'),
+            id: String(d.role_id ?? `r-${i}`),
+            start_date: new Date().toISOString(),
+            headcount: 1,
+            target_bill_rate: d.target_bill_rate ?? 100,
+            required_skills: null,
+            project_id: String(d.target_project_id ?? ''),
+            status: 'Open' as const,
+          },
+          project: {
+            id: String(d.target_project_id ?? ''),
+            name: `Project ${String(d.target_project_id ?? '').substring(0, 8)}`,
+            status: 'Pipeline' as const,
+            probability: 80,
+            target_margin: d.target_margin ?? 30,
+            total_budget: 0,
+          },
+          match_score: d.match_score ?? 0.85,
+          projected_margin: d.projected_margin ?? 28.5,
+          missing_skills: (d.missing_skills || []) as string[],
+          reasoning: d.justification ?? 'AI recommendation from allocation optimization engine.',
+          rag_passages: [] as string[],
+          created_at: new Date().toISOString(),
+          revision_count: res.state_metadata?.revision_count ?? 0,
+          _allocation: null as any,
+        }
       })
-      
-      const recs = res.recommendations
-      if (recs) {
-        setRecId(res.recommendation_id)
-        
-        // Transform backend response to frontend Proposal format
-        const uiProposals = []
-        for (const alloc of (recs.reallocations || [])) {
-          uiProposals.push({
-            id: alloc.employee_id + alloc.target_project_id,
-            category: 'direct',
-            employee: { full_name: `Employee ${alloc.employee_id.substring(0,8)}`, seniority: '', primary_role: '' },
-            role: { title: alloc.role },
-            project: { name: `Project ${alloc.target_project_id.substring(0,8)}` },
-            match_score: alloc.match_score,
-            projected_margin: 50.0,
-            missing_skills: [],
-            reasoning: recs.reasoning,
-            created_at: new Date().toISOString(),
-            revision_count: 0
-          })
-        }
-        for (const tr of (recs.trainings || [])) {
-          uiProposals.push({
-            id: tr.employee_id,
-            category: 'training',
-            employee: { full_name: `Employee ${tr.employee_id.substring(0,8)}`, seniority: '', primary_role: '' },
-            role: { title: 'Needs Training' },
-            project: { name: 'N/A' },
-            match_score: 0.6,
-            projected_margin: 0,
-            missing_skills: tr.target_skills,
-            reasoning: recs.reasoning,
-            created_at: new Date().toISOString(),
-            revision_count: 0
-          })
-        }
-        setProposals(uiProposals)
+
+      // Combine DB proposals with hiring recommendations from decisions
+      let combinedProposals: ReturnType<typeof allocationToProposal>[] = []
+      if (dbProposals.length > 0) {
+        const hiringDecisions = decisionProposals.filter((p: any) => p.category === 'hiring')
+        combinedProposals = [...dbProposals, ...hiringDecisions]
+      } else {
+        combinedProposals = decisionProposals
       }
-    } catch (e) {
+
+      setProposals(combinedProposals)
+      sessionStorage.setItem('bf_cached_proposals', JSON.stringify(combinedProposals))
+    } catch (e: any) {
       console.error(e)
-      alert("Failed to run forecast")
+      setError(e.message ?? 'Failed to run forecast')
     } finally {
       setLoading(false)
     }
@@ -95,13 +244,16 @@ export default function ActionQueue() {
             Prioritized allocation proposals pending human review
           </p>
         </div>
-        <button 
-          onClick={handleRunForecast} 
-          disabled={loading}
-          className="btn-primary"
-        >
-          {loading ? 'Running LLM...' : 'Run Forecast'}
-        </button>
+        <div className="flex items-center gap-3">
+          {error && <span className="text-xs text-red-600 font-mono">{error}</span>}
+          <button
+            onClick={handleRunForecast}
+            disabled={loading}
+            className="btn-primary"
+          >
+            {loading ? '⏳ Running LangGraph agent…' : '▶ Run Forecast'}
+          </button>
+        </div>
       </div>
 
       {/* Summary buckets */}
@@ -157,8 +309,13 @@ export default function ActionQueue() {
 
       {/* Proposals list */}
       <div className="card divide-y divide-gray-100">
-        {filtered.length === 0 ? (
-          <p className="px-4 py-8 text-sm text-center text-gray-400">No proposals in this category.</p>
+        {fetchingPending && proposals.length === 0 ? (
+          <p className="px-4 py-8 text-sm text-center text-gray-400">Loading pending allocations…</p>
+        ) : filtered.length === 0 ? (
+          <div className="px-4 py-8 text-center">
+            <p className="text-sm text-gray-400">No proposals in this category.</p>
+            <p className="text-xs text-gray-400 mt-1 font-mono">Click "Run Forecast" to trigger the AI allocation engine.</p>
+          </div>
         ) : (
           filtered.map((proposal) => {
             const { cls, dot, label } = categoryBadge(proposal.category)
@@ -225,7 +382,9 @@ export default function ActionQueue() {
                 {/* Action */}
                 <div className="shrink-0">
                   <button
-                    onClick={() => navigate(`/queue/${proposal.id}`, { state: { proposal, recId } })}
+                    onClick={() => navigate(`/queue/${proposal.id}`, {
+                      state: { proposal, forecastRunId, allocationId: proposal.id },
+                    })}
                     className="btn-primary text-xs px-3 py-1.5"
                   >
                     Review Proposal →

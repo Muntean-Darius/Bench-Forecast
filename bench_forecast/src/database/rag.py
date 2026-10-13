@@ -352,18 +352,22 @@ class RAGPipeline:
             )
             # Fallback if seed script omitted metadata and returned 0 results
             if not results or not results.get("ids") or len(results["ids"][0]) == 0:
+                fallback_where = additional_where if additional_where else None
                 results = self.collection.query(
                     query_embeddings=query_embeddings,
                     n_results=n_results,
+                    where=fallback_where,
                     include=["documents", "metadatas", "distances", "embeddings"],
                 )
         except Exception as exc:
-            # ChromaDB raises an exception when the where filter yields 0 documents
-            logger.warning(f"Financial filter excluded all candidates or failed ({exc}). Falling back to unfiltered query.")
+            # ChromaDB raises an exception when the where filter references missing metadata keys
+            logger.warning(f"Financial filter failed ({exc}). Retrying query preserving bench employee filter.")
             try:
+                fallback_where = additional_where if additional_where else None
                 results = self.collection.query(
                     query_embeddings=query_embeddings,
                     n_results=n_results,
+                    where=fallback_where,
                     include=["documents", "metadatas", "distances", "embeddings"],
                 )
             except Exception as inner_exc:
@@ -414,7 +418,12 @@ class RAGPipeline:
                 distance = distances[i] if i < len(distances) else 1.0
                 similarity = 1.0 / (1.0 + distance)
 
-            cost_rate = float(meta.get("hourly_cost_rate", 0.0))
+            cost_rate = float(meta.get("hourly_cost_rate") or meta.get("internal_hourly_cost") or 0.0)
+            seniority = meta.get("seniority") or meta.get("experience_level") or "Mid"
+            if cost_rate <= 0:
+                sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
+                cost_rate = sen_map.get(str(seniority).lower(), 65.0)
+
             projected_margin = (
                 (float(target_bill_rate) - cost_rate) / float(target_bill_rate) * 100
                 if float(target_bill_rate) > 0
@@ -424,9 +433,9 @@ class RAGPipeline:
             candidates.append(
                 {
                     "employee_id": emp_id,
-                    "full_name": meta.get("full_name", ""),
+                    "full_name": meta.get("full_name") or meta.get("employee_name", ""),
                     "primary_role": meta.get("primary_role", ""),
-                    "seniority": meta.get("seniority", ""),
+                    "seniority": seniority,
                     "hourly_cost_rate": cost_rate,
                     "bench_start_date": meta.get("bench_start_date", ""),
                     "similarity_score": float(round(similarity, 4)),

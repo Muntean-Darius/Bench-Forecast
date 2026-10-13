@@ -71,7 +71,12 @@ class VectorStoreManager:
         self.collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
         return len(ids)
 
-    def similarity_search(self, query: str, k: int = 3) -> List[Dict[str, Any]]:
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 3,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """Receives a narrative job requirement and returns the most relevant employee profiles."""
         if self.collection.count() == 0:
             return []
@@ -83,11 +88,15 @@ class VectorStoreManager:
         # Compute embedding manually using Ollama to bypass ChromaDB's internal default
         query_embeddings = self.embedding_fn([query])
 
-        results = self.collection.query(
-            query_embeddings=query_embeddings,
-            n_results=n_results,
-            include=["documents", "metadatas", "distances", "embeddings"],
-        )
+        query_kwargs: Dict[str, Any] = {
+            "query_embeddings": query_embeddings,
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances", "embeddings"],
+        }
+        if where:
+            query_kwargs["where"] = where
+
+        results = self.collection.query(**query_kwargs)
 
         matches: List[Dict[str, Any]] = []
         if not results or not results["ids"] or not results["ids"][0]:
@@ -117,13 +126,17 @@ class VectorStoreManager:
                 distance = distances[i] if i < len(distances) else 1.0
                 similarity = max(0.0, min(1.0, 1.0 - distance))
 
+            meta = metas[i] if i < len(metas) and metas[i] else {}
+            emp_id = meta.get("employee_id") or meta.get("id") or ids[i]
+
             matches.append({
-                "id": ids[i],
-                "name": metas[i].get("name") if i < len(metas) else "",
-                "skills": metas[i].get("skills", "").split(", ") if i < len(metas) and metas[i].get("skills") else [],
-                "experience_years": metas[i].get("experience_years", 0.0) if i < len(metas) else 0.0,
-                "current_project": metas[i].get("current_project", "") if i < len(metas) else "",
-                "available_from": metas[i].get("available_from", "") if i < len(metas) else "",
+                "id": str(emp_id),
+                "employee_id": str(emp_id),
+                "name": meta.get("name") or meta.get("employee_name") or "",
+                "skills": meta.get("skills", "").split(", ") if meta.get("skills") else [],
+                "experience_years": meta.get("experience_years", 0.0),
+                "current_project": meta.get("current_project", ""),
+                "available_from": meta.get("available_from", ""),
                 "similarity_score": float(round(similarity, 4)),
                 "document_excerpt": docs[i] if i < len(docs) else "",
             })

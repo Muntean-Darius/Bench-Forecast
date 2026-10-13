@@ -1,13 +1,13 @@
-"""Service layer wrapper for executing the LangGraph forecast pipeline."""
-
 import logging
 import uuid
+from datetime import date
+from decimal import Decimal
 from typing import Any, Dict
 
 from sqlalchemy import select
 
 from src.database.database import AsyncSessionLocal
-from src.database.models import ForecastRun
+from src.database.models import ForecastRun, Allocation, AllocationStatusEnum
 from src.agents.graph import build_forecast_graph
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,83 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
         # Because we have interrupt_before=["human_review"], it will execute
         # the extraction, matching, and planning nodes, and then return the state.
         result_state = await graph.ainvoke(initial_state, config=config)
-        
         logger.info(f"Forecast pipeline paused for run {forecast_run_id}. Waiting for HITL.")
+
+        # Persist proposed allocations and update run status
+        try:
+            open_demands = result_state.get("open_demands", [])
+            decisions = result_state.get("decisions", [])
+            skill_matches = result_state.get("skill_matches", [])
+            bench_employees = result_state.get("bench_employees", [])
+
+            async with AsyncSessionLocal() as db:
+                run_stmt = select(ForecastRun).where(ForecastRun.id == forecast_run_id)
+                run_res = await db.execute(run_stmt)
+                run_rec = run_res.scalars().first()
+                if run_rec:
+                    run_rec.status = "paused_for_review"
+
+                bench_ids_set = {str(b["id"]) for b in bench_employees if b.get("id")}
+
+                for demand in open_demands:
+                    demand_id_str = demand.get("id")
+                    if not demand_id_str:
+                        continue
+                    demand_uuid = uuid.UUID(demand_id_str)
+
+                    # Look for decision matching this demand where action_type is allocate or train
+                    dec = next(
+                        (
+                            d for d in decisions
+                            if str(d.get("role_id")) == demand_id_str
+                            and d.get("action_type") in ("allocate", "train")
+                            and d.get("employee_id")
+                        ),
+                        None,
+                    )
+
+                    if not dec or not dec.get("employee_id"):
+                        continue
+
+                    emp_id_str = str(dec["employee_id"])
+                    if emp_id_str not in bench_ids_set:
+                        logger.warning(
+                            f"Employee {emp_id_str} in decision for demand {demand_id_str} is not in bench_employees"
+                        )
+                        continue
+
+                    emp_uuid = uuid.UUID(emp_id_str)
+                    margin_val = float(dec.get("projected_margin", 0.0))
+                    match_score_val = float(dec.get("match_score", 0.0))
+                    justification_val = (
+                        dec.get("justification")
+                        or f"Proposed allocation for {demand.get('role', 'Role')}."
+                    )
+                    upskill_val = dec.get("upskilling_path")
+
+                    alloc = Allocation(
+                        id=uuid.uuid4(),
+                        employee_id=emp_uuid,
+                        demand_id=demand_uuid,
+                        role_on_project=demand.get("role", "Engineer"),
+                        allocation_pct=Decimal("100.00"),
+                        status=AllocationStatusEnum.pending_manager_approval,
+                        ai_justification=justification_val,
+                        ai_match_score=Decimal(str(round(match_score_val, 4))),
+                        ai_projected_margin=Decimal(str(round(margin_val, 2))),
+                        ai_upskilling_path=upskill_val,
+                        forecast_run_id=forecast_run_id,
+                        created_by=user_id,
+                        start_date=date.today(),
+                    )
+                    db.add(alloc)
+
+                await db.commit()
+                logger.info(f"Successfully persisted pending allocations for forecast run {forecast_run_id}.")
+        except Exception as persist_err:
+            logger.exception(f"Failed to persist pending allocations to database: {persist_err}")
+            raise
+
         return result_state
         
     except Exception as e:
