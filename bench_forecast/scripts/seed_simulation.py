@@ -1,5 +1,11 @@
 import asyncio
 import os
+import sys
+from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import random
 import uuid
 from datetime import datetime, timedelta, date
@@ -20,39 +26,10 @@ from sqlalchemy.orm import declarative_base, Mapped, mapped_column
 from src.database.models import (
     Base, Employee, Department, Skill, EmployeeSkill, Document,
     Project, ProjectDemand, Allocation, ForecastRun, HitlReviewEvent, User,
+    EmployeeCost, BenchHistory, BenchCost,
     ExperienceLevelEnum, BenchStatusEnum, DocumentTypeEnum, IngestionStatusEnum,
     DemandStatusEnum, AllocationStatusEnum, HitlDecisionEnum, EmploymentTypeEnum
 )
-
-# Missing Models
-class EmployeeCost(Base):
-    __tablename__ = "employee_costs"
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    employee_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("employees.id"))
-    effective_date: Mapped[date] = mapped_column(Date, default=date.today)
-    annual_salary: Mapped[Decimal] = mapped_column(Numeric(12, 2))
-    internal_daily_cost: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-    internal_hourly_cost: Mapped[Decimal] = mapped_column(Numeric(8, 2))
-    currency: Mapped[str] = mapped_column(String(3), default="USD")
-    overhead_multiplier: Mapped[Decimal] = mapped_column(Numeric(4, 2), default=Decimal("1.35"))
-
-class BenchHistory(Base):
-    __tablename__ = "bench_history"
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    employee_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("employees.id"))
-    bench_start: Mapped[date] = mapped_column(Date)
-    bench_end: Mapped[date] = mapped_column(Date, nullable=True)
-    duration_days: Mapped[int] = mapped_column(Integer)
-
-class BenchCost(Base):
-    __tablename__ = "bench_costs"
-    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    employee_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("employees.id"))
-    period_start: Mapped[date] = mapped_column(Date)
-    period_end: Mapped[date] = mapped_column(Date)
-    bench_days: Mapped[int] = mapped_column(Integer)
-    daily_cost: Mapped[Decimal] = mapped_column(Numeric(10, 2))
-    total_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2))
 
 # Configuration
 DB_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/bench_forecast")
@@ -100,11 +77,17 @@ async def stage1_hr_and_finance(session: AsyncSession):
     
     # IT Consulting Departments
     dept_names = ["Software Engineering", "Data & AI", "Cloud & DevOps", "Cyber Security", "QA & Testing"]
+    existing_depts_res = await session.execute(select(Department).where(Department.name.in_(dept_names)))
+    depts_by_name = {d.name: d for d in existing_depts_res.scalars().all()}
+    
     depts = []
     for d in dept_names:
-        dept = Department(name=d, head_count_budget=50)
-        session.add(dept)
-        depts.append(dept)
+        if d in depts_by_name:
+            depts.append(depts_by_name[d])
+        else:
+            dept = Department(name=d, head_count_budget=50)
+            session.add(dept)
+            depts.append(dept)
     await session.flush()
     
     employees = []
@@ -144,14 +127,46 @@ async def stage1_hr_and_finance(session: AsyncSession):
         
     await session.flush()
     
-    # employee_costs
+    # employee_costs: varying pay by seniority level and role
+    ROLE_MULTIPLIERS = {
+        "data-science": Decimal("1.20"),
+        "blockchain": Decimal("1.25"),
+        "devops-engineer": Decimal("1.15"),
+        "network-security-engineer": Decimal("1.15"),
+        "python-developer": Decimal("1.10"),
+        "java-developer": Decimal("1.05"),
+        "dotnet-developer": Decimal("1.05"),
+    }
+
+    SENIORITY_BASE_HOURLY = {
+        ExperienceLevelEnum.junior: (Decimal("35.00"), Decimal("45.00")),
+        ExperienceLevelEnum.mid: (Decimal("55.00"), Decimal("70.00")),
+        ExperienceLevelEnum.senior: (Decimal("85.00"), Decimal("110.00")),
+        ExperienceLevelEnum.lead: (Decimal("115.00"), Decimal("140.00")),
+        ExperienceLevelEnum.principal: (Decimal("150.00"), Decimal("185.00")),
+    }
+
     for emp in employees:
-        daily = Decimal("300.00") if emp.experience_level == ExperienceLevelEnum.junior else Decimal("800.00")
+        base_min, base_max = SENIORITY_BASE_HOURLY.get(
+            emp.experience_level, (Decimal("55.00"), Decimal("70.00"))
+        )
+        base_hourly = Decimal(str(round(random.uniform(float(base_min), float(base_max)), 2)))
+        multiplier = ROLE_MULTIPLIERS.get(str(emp.job_title).lower().strip(), Decimal("1.00"))
+        
+        hourly = (base_hourly * multiplier).quantize(Decimal("0.01"))
+        daily = (hourly * Decimal("8.00")).quantize(Decimal("0.01"))
+        salary = (daily * Decimal("220")).quantize(Decimal("0.01"))
+
+        # Also store on employee legacy column for endpoints that read directly
+        emp.hourly_cost_rate = hourly
+
         cost = EmployeeCost(
             employee_id=emp.id,
-            annual_salary=daily * Decimal("220"),
+            annual_salary=salary,
             internal_daily_cost=daily,
-            internal_hourly_cost=daily / Decimal("8")
+            internal_hourly_cost=hourly,
+            currency="EUR",
+            overhead_multiplier=Decimal("1.35")
         )
         session.add(cost)
     
@@ -163,6 +178,10 @@ async def stage1_hr_and_finance(session: AsyncSession):
 # ---------------------------------------------------------------------------
 async def stage2_document_pipeline(session: AsyncSession, employees: list):
     print("Stage 2: Document Ingestion Pipeline (Generating PDFs & Embeddings)")
+    try:
+        chroma_client.delete_collection("employee_profiles")
+    except Exception:
+        pass
     collection = chroma_client.get_or_create_collection("employee_profiles")
     os.makedirs("./storage/cv", exist_ok=True)
     

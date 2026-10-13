@@ -219,6 +219,31 @@ class ChromaIngestionStore:
                 document_id,
             )
 
+    def delete_employee_chunks(self, employee_id: str) -> None:
+        """Remove all existing chunks belonging to employee_id from ChromaDB.
+
+        Used when re-ingesting an updated CV to ensure only the latest embeddings exist.
+        """
+        try:
+            results = self._collection.get(
+                where={"employee_id": str(employee_id)},
+                include=[],
+            )
+            ids_to_delete: list[str] = results.get("ids", [])
+            if ids_to_delete:
+                self._collection.delete(ids=ids_to_delete)
+                logger.info(
+                    "ChromaDB: deleted %d previous chunks for employee_id=%s",
+                    len(ids_to_delete),
+                    employee_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "ChromaDB: could not delete old chunks for employee_id=%s: %s",
+                employee_id,
+                exc,
+            )
+
     def collection_count(self) -> int:
         """Return the total number of chunk vectors currently in the collection."""
         return self._collection.count()

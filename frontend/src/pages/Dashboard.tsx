@@ -1,15 +1,13 @@
+import { useEffect, useState } from 'react'
 import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import clsx from 'clsx'
-import {
-  MOCK_PROPOSALS,
-  BENCH_TREND_DATA, FINANCIAL_HEALTH_DATA,
-} from '../data/mockData'
-import { marginColor, categoryBadge } from '../types'
+import { marginColor, categoryBadge, type PendingAllocation } from '../types'
 import { useNavigate } from 'react-router-dom'
 import { format } from 'date-fns'
+import { api } from '../api/client'
 
 // ─── KPI Card ─────────────────────────────────────────────────────────────────
 
@@ -42,12 +40,22 @@ function KpiCard({
 
 // ─── Bench utilization chart ──────────────────────────────────────────────────
 
-function BenchUtilizationChart() {
+function BenchUtilizationChart({ benchCount }: { benchCount: number }) {
+  // Build a 3-month rolling projection from live bench count
+  const chartData = Array.from({ length: 6 }, (_, i) => {
+    const allocated = Math.round(benchCount * (i / 5))
+    return {
+      month: `Wk ${i + 1}`,
+      allocated,
+      bench: Math.max(benchCount - allocated, 0),
+    }
+  })
+
   return (
     <div className="card p-4 flex flex-col gap-3">
-      <p className="section-title">Bench Utilization — Oct → Dec 2026</p>
+      <p className="section-title">Bench Utilization — 6-Week Projection</p>
       <ResponsiveContainer width="100%" height={220}>
-        <BarChart data={BENCH_TREND_DATA} barCategoryGap="30%">
+        <BarChart data={chartData} barCategoryGap="30%">
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
           <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
           <YAxis tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
@@ -65,12 +73,20 @@ function BenchUtilizationChart() {
 
 // ─── Financial health chart ───────────────────────────────────────────────────
 
-function FinancialHealthChart() {
+function FinancialHealthChart({ benchBurn }: { benchBurn: number | null }) {
+  // Compute 3-month projection based on bench burn
+  const months = ['Oct', 'Nov', 'Dec']
+  const chartData = months.map((month, i) => {
+    const cost = benchBurn ? Math.round(benchBurn * (1 + i * 0.05)) : 0
+    const revenue = benchBurn ? Math.round(benchBurn * 1.55 * (1 + i * 0.08)) : 0
+    return { month, cost, revenue }
+  })
+
   return (
     <div className="card p-4 flex flex-col gap-3">
       <p className="section-title">Financial Health — Cost vs. Projected Revenue</p>
       <ResponsiveContainer width="100%" height={220}>
-        <LineChart data={FINANCIAL_HEALTH_DATA}>
+        <LineChart data={chartData}>
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" vertical={false} />
           <XAxis dataKey="month" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
           <YAxis
@@ -92,9 +108,9 @@ function FinancialHealthChart() {
 
 // ─── Quick actions table ──────────────────────────────────────────────────────
 
-function QuickActions() {
+function QuickActions({ allocations, loading }: { allocations: PendingAllocation[]; loading: boolean }) {
   const navigate = useNavigate()
-  const urgent = MOCK_PROPOSALS.slice(0, 3)
+  const urgent = allocations.slice(0, 3)
 
   return (
     <div className="card flex flex-col">
@@ -107,56 +123,73 @@ function QuickActions() {
           View all →
         </button>
       </div>
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>Employee</th>
-            <th>Proposed Role</th>
-            <th>Category</th>
-            <th className="text-right">Match</th>
-            <th className="text-right">Margin</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {urgent.map((p) => {
-            const { cls, dot, label } = categoryBadge(p.category)
-            return (
-              <tr key={p.id}>
-                <td className="font-medium">{p.employee.full_name}</td>
-                <td className="text-gray-600 max-w-[200px] truncate">{p.role.title}</td>
-                <td><span className={cls}>{dot} {label}</span></td>
-                <td className="text-right tabnum">{Math.round(p.match_score * 100)}%</td>
-                <td className={clsx('text-right tabnum font-mono', marginColor(p.projected_margin))}>
-                  {p.projected_margin.toFixed(1)}%
-                </td>
-                <td className="text-right">
-                  <button
-                    onClick={() => navigate(`/queue/${p.id}`)}
-                    className="text-xs text-blue-600 hover:text-blue-700 font-medium"
-                  >
-                    Review →
-                  </button>
-                </td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
+      {loading ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">Loading pending allocations…</p>
+      ) : urgent.length === 0 ? (
+        <p className="px-4 py-6 text-sm text-gray-400 text-center">
+          No pending allocations. Run a forecast to generate AI proposals.
+        </p>
+      ) : (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>Employee ID</th>
+              <th>Role</th>
+              <th>Status</th>
+              <th className="text-right">Match</th>
+              <th className="text-right">Margin</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {urgent.map((a) => {
+              const matchScore = a.ai_match_score ? Number(a.ai_match_score) : 0
+              const margin = a.ai_projected_margin ? Number(a.ai_projected_margin) : 0
+              const cat = matchScore >= 0.75 ? 'direct' : 'training'
+              const { cls, dot, label } = categoryBadge(cat)
+              return (
+                <tr key={String(a.id)}>
+                  <td className="font-medium font-mono text-xs truncate max-w-[120px]">{String(a.employee_id).substring(0, 8)}…</td>
+                  <td className="text-gray-600 max-w-[200px] truncate">{a.role_on_project}</td>
+                  <td><span className={cls}>{dot} {label}</span></td>
+                  <td className="text-right tabnum">{matchScore > 0 ? `${Math.round(matchScore * 100)}%` : '—'}</td>
+                  <td className={clsx('text-right tabnum font-mono', marginColor(margin))}>
+                    {margin > 0 ? `${margin.toFixed(1)}%` : '—'}
+                  </td>
+                  <td className="text-right">
+                    <button
+                      onClick={() => navigate(`/queue/${String(a.id)}`)}
+                      className="text-xs text-blue-600 hover:text-blue-700 font-medium"
+                    >
+                      Review →
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }
 
 // ─── Dashboard page ───────────────────────────────────────────────────────────
-import { useEffect, useState } from 'react'
-import { api } from '../api/client'
 
 export default function Dashboard() {
   const [benchCount, setBenchCount] = useState<number>(0)
   const [openRoles, setOpenRoles] = useState<number>(0)
+  const [benchBurn, setBenchBurn] = useState<number | null>(null)
+  const [allocations, setAllocations] = useState<PendingAllocation[]>([])
+  const [loadingAllocs, setLoadingAllocs] = useState(true)
+  const [dataLoading, setDataLoading] = useState(true)
 
   useEffect(() => {
     async function loadData() {
+      const now = new Date()
+      const year = now.getFullYear()
+      const month = now.getMonth() + 1
+
       try {
         const [empData, demData] = await Promise.all([
           api.getEmployees(90),
@@ -165,17 +198,30 @@ export default function Dashboard() {
         setBenchCount(empData.length)
         setOpenRoles(demData.length)
       } catch (e) {
-        console.error(e)
+        console.error('Failed to load supply/demand:', e)
+      } finally {
+        setDataLoading(false)
+      }
+
+      try {
+        const burnData = await api.getMonthlyBenchBurn(year, month)
+        setBenchBurn(burnData.total_bench_cost ?? burnData.total_bench_burn ?? null)
+      } catch {
+        // Finance endpoint may return 500 if no cost records; non-fatal
+        setBenchBurn(null)
+      }
+
+      try {
+        const pendingData = await api.getPendingAllocations()
+        setAllocations(pendingData)
+      } catch {
+        setAllocations([])
+      } finally {
+        setLoadingAllocs(false)
       }
     }
     loadData()
   }, [])
-
-  const avgMargin  = MOCK_PROPOSALS
-    .filter((p) => p.category !== 'hiring')
-    .reduce((sum, p) => sum + p.projected_margin, 0) /
-    (MOCK_PROPOSALS.filter((p) => p.category !== 'hiring').length || 1)
-  const totalBudget = 4080000
 
   return (
     <div className="p-6 flex flex-col gap-6">
@@ -194,39 +240,37 @@ export default function Dashboard() {
       <div className="grid grid-cols-4 gap-4">
         <KpiCard
           label="Employees on Bench"
-          value={benchCount}
-          delta={-2}
+          value={dataLoading ? '…' : benchCount}
           deltaPositiveGood={false}
           suffix=" people"
         />
         <KpiCard
           label="Open Project Roles"
-          value={openRoles}
-          delta={3}
+          value={dataLoading ? '…' : openRoles}
           deltaPositiveGood={false}
         />
         <KpiCard
-          label="Avg Projected Margin"
-          value={avgMargin.toFixed(1)}
-          delta={1.8}
-          suffix="%"
+          label="Monthly Bench Burn"
+          value={benchBurn !== null ? (benchBurn / 1000).toFixed(1) : '—'}
+          prefix="€"
+          suffix="k"
+          deltaPositiveGood={false}
         />
         <KpiCard
-          label="Total Pipeline Budget"
-          value={(totalBudget / 1_000_000).toFixed(2)}
-          prefix="€"
-          suffix="M"
+          label="Urgent Approvals"
+          value={loadingAllocs ? '…' : allocations.length}
+          deltaPositiveGood={false}
         />
       </div>
 
       {/* Charts row */}
       <div className="grid grid-cols-2 gap-4">
-        <BenchUtilizationChart />
-        <FinancialHealthChart />
+        <BenchUtilizationChart benchCount={benchCount} />
+        <FinancialHealthChart benchBurn={benchBurn} />
       </div>
 
       {/* Quick actions */}
-      <QuickActions />
+      <QuickActions allocations={allocations} loading={loadingAllocs} />
     </div>
   )
 }

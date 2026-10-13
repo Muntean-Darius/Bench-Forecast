@@ -1,17 +1,25 @@
-// ─── Core domain types mirrored from SQLAlchemy models ───────────────────────
+// ─── Core domain types mirrored from backend API responses ───────────────────
 
+/**
+ * Employee as returned by GET /api/v1/employees
+ * Fields: id, name, skills (array), current_project, available_from,
+ *         experience_years, cost_rate, profile_text
+ */
 export interface Employee {
   id: string
-  full_name: string
-  primary_role: string
-  seniority: 'Junior' | 'Mid' | 'Senior' | 'Principal'
+  name?: string           // backend returns `name` not `full_name`
+  full_name?: string     // alias used in some mapped contexts
+  primary_role?: string  // UI-computed from skills[0]
+  seniority?: string     // UI-computed from skills[1] when present
   hourly_cost_rate: number
-  bench_start_date: string      // ISO date string
+  bench_start_date: string   // mapped from available_from
+  available_from?: string
   cv_document_uri?: string | null
   profile_text?: string | null
-  skills?: string | null        // comma-separated
+  skills?: string[] | string | null
   experience_years?: number
   current_project?: string | null
+  cost_rate?: number | null
 }
 
 export interface Project {
@@ -35,6 +43,7 @@ export interface ProjectRole {
   start_date: string            // ISO date string
   headcount: number
   required_skills?: string | null
+  win_probability?: number
   // Joined from Project
   project_name?: string
   project_status?: Project['status']
@@ -69,47 +78,64 @@ export interface AllocationProposal {
   revision_count?: number
 }
 
-// ─── API payloads ─────────────────────────────────────────────────────────────
+// ─── Forecast run types ───────────────────────────────────────────────────────
 
-export interface GenerateForecastRequest {
-  department_id?: string
-  thread_id?: string
-  horizon_days?: number
-  min_win_probability?: number
-}
-
-export interface ExecuteForecastRequest {
-  recommendation_id: string
-  thread_id?: string
-  approved: boolean
-  approver_name?: string
-  rejection_feedback?: string | null
-}
-
-export interface ForecastResponse {
+export interface ForecastRunResponse {
+  forecast_run_id: string
   status: 'paused_for_review' | 'completed' | 'revised_for_review' | 'rejected_terminated'
-  thread_id: string
-  recommendation_id: string
-  recommendations: {
-    reallocations: Array<{
-      employee_id: string
-      target_project_id: string
-      role: string
-      match_score: number
-    }>
-    trainings: Array<{
-      employee_id: string
-      target_skills: string[]
-      duration_weeks: number
-    }>
-    hirings: Array<{
-      role: string
-      required_skills: string[]
-      headcount: number
-    }>
-    confidence_score: number
-    reasoning: string
+  state_metadata: {
+    revision_count: number
+    decisions: any[]
+    min_win_probability: number
   }
+}
+
+// ─── Pending allocation (HITL) types ─────────────────────────────────────────
+
+export interface PendingAllocation {
+  id: string
+  employee_id: string
+  project_id: string
+  role_on_project: string
+  allocation_pct: number
+  status: string
+  ai_justification?: string | null
+  ai_match_score?: number | null
+  ai_projected_margin?: number | null
+  project_demand?: {
+    id: string
+    role: string
+    description?: string | null
+    headcount_needed: number
+    target_bill_rate?: number | null
+  } | null
+}
+
+// ─── Document types ───────────────────────────────────────────────────────────
+
+export interface DocumentMetadata {
+  document_id: string
+  employee_id: string
+  document_type: string
+  file_name: string
+  file_path: string
+  file_size_bytes?: number | null
+  version: number
+  is_current: boolean
+  chroma_doc_id?: string | null
+  ingestion_status: 'pending' | 'ingested' | 'failed'
+  uploaded_at: string
+}
+
+// ─── Finance types ────────────────────────────────────────────────────────────
+
+export interface MonthlyBenchBurn {
+  year: number
+  month: number
+  total_bench_burn?: number
+  total_bench_cost?: number
+  currency: string
+  employee_count: number
 }
 
 // ─── Dashboard KPIs ───────────────────────────────────────────────────────────
@@ -124,7 +150,7 @@ export interface DashboardKPIs {
   margin_delta: number
 }
 
-// ─── Margin color helper ──────────────────────────────────────────────────────
+// ─── Margin color helpers ─────────────────────────────────────────────────────
 
 export function marginColor(margin: number): string {
   if (margin >= 30) return 'text-green-700'

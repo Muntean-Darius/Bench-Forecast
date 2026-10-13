@@ -9,7 +9,8 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from src.agents.nodes import (
     data_extractor_node,
     allocation_decider_node,
-    execution_engine_node
+    execution_engine_node,
+    forecast_planner_node,
 )
 from src.database.models import Employee, ProjectDemand, BenchStatusEnum, DemandStatusEnum, ForecastRun
 
@@ -214,4 +215,132 @@ async def test_execution_engine_node_rejected(mock_async_session):
     updates = await execution_engine_node(state)
     assert updates["execution_status"] == "skipped_no_approval"
     assert not mock_async_session.commit.called
+
+
+@pytest.mark.asyncio
+async def test_data_extractor_cost_fallback(mock_async_session):
+    """Test data_extractor_node provides non-zero cost fallback for employees with missing cost rows."""
+    from src.database.models import ExperienceLevelEnum
+    mock_emp = Employee(
+        id=uuid.uuid4(),
+        first_name="Alice",
+        last_name="Smith",
+        bench_status=BenchStatusEnum.bench,
+        experience_level=ExperienceLevelEnum.senior,
+        is_active=True,
+    )
+    mock_emp.employee_costs = []
+    mock_emp.hourly_cost_rate = None
+
+    emp_res = MagicMock()
+    emp_res.scalars.return_value.all.return_value = [mock_emp]
+    dem_res = MagicMock()
+    dem_res.scalars.return_value.all.return_value = []
+    mock_async_session.execute.side_effect = [emp_res, dem_res]
+
+    updates = await data_extractor_node({"horizon_days": 90, "min_win_probability": 0.75})
+    emp = updates["bench_employees"][0]
+    assert emp["seniority"] == "Senior"
+    assert emp["hourly_cost"] > 0
+    assert emp["hourly_cost"] == 95.0
+
+
+def test_allocation_decider_prevents_duplicate_allocations(mock_rag_pipeline, mock_llm_factory):
+    """Test that two open demands do not allocate the exact same bench candidate."""
+    emp_id = str(uuid.uuid4())
+    state = {
+        "bench_employees": [
+            {"id": emp_id, "name": "Solo Senior", "seniority": "Senior", "hourly_cost": 95.0}
+        ],
+        "open_demands": [
+            {
+                "id": str(uuid.uuid4()),
+                "project_id": str(uuid.uuid4()),
+                "role": "Role 1",
+                "target_bill_rate": 150.0,
+                "target_margin": 25.0
+            },
+            {
+                "id": str(uuid.uuid4()),
+                "project_id": str(uuid.uuid4()),
+                "role": "Role 2",
+                "target_bill_rate": 150.0,
+                "target_margin": 25.0
+            }
+        ]
+    }
+
+    mock_rag_pipeline.retrieve_candidates.return_value = [
+        {"employee_id": emp_id, "full_name": "Solo Senior", "hourly_cost_rate": 95.0, "projected_margin_pct": 36.67}
+    ]
+
+    mock_llm_response = MagicMock()
+    mock_llm_response.content = f'{{"action_type": "allocate", "employee_id": "{emp_id}", "projected_margin": 36.67, "justification": "Best available fit for this demand."}}'
+    mock_llm_factory.get_chat_model.return_value.invoke.return_value = mock_llm_response
+    mock_llm_factory.parse_json_response.return_value = {
+        "action_type": "allocate",
+        "employee_id": emp_id,
+        "projected_margin": 36.67,
+        "justification": "Best available fit for this demand."
+    }
+
+    updates = allocation_decider_node(state)
+    decisions = updates["decisions"]
+    assert len(decisions) == 2
+
+    # Demand 1 gets the employee
+    assert decisions[0]["action_type"] == "allocate"
+    assert decisions[0]["employee_id"] == emp_id
+    assert decisions[0]["hourly_cost_rate"] == 95.0
+
+    # Demand 2 CANNOT get the same employee; must fallback to hire since no more candidates
+    assert decisions[1]["action_type"] == "hire"
+    assert decisions[1]["employee_id"] is None
+
+
+def test_forecast_planner_node_fallback_on_unparseable_json(mock_llm_factory):
+    """Test forecast_planner_node synthesizes a plan from decisions when LLM JSON is malformed."""
+    emp_id = str(uuid.uuid4())
+    state = {
+        "skill_matches": [{"employee_id": emp_id, "demand_id": "d1", "match_score": 0.85}],
+        "bench_employees": [{"id": emp_id, "name": "Jane Doe"}],
+        "open_demands": [{"id": "d1", "role": "Data Engineer"}],
+        "decisions": [
+            {
+                "action_type": "allocate",
+                "employee_id": emp_id,
+                "role_title": "Data Engineer",
+                "target_project_id": "p1",
+                "match_score": 0.85,
+                "projected_margin": 32.0,
+                "justification": "Optimal assignment",
+            },
+            {
+                "action_type": "hire",
+                "employee_id": None,
+                "role_title": "Frontend Lead",
+                "target_project_id": "p2",
+                "match_score": 0.0,
+                "projected_margin": 0.0,
+                "justification": "No viable candidates",
+            }
+        ]
+    }
+
+    # Simulate LLM returning malformed/unparseable content
+    mock_llm_response = MagicMock()
+    mock_llm_response.content = '{"bench_employees": 15, "open_positions": 5, "broken...'
+    mock_llm_factory.get_chat_model.return_value.invoke.return_value = mock_llm_response
+    mock_llm_factory.parse_json_response.side_effect = ValueError("Could not extract valid JSON")
+
+    updates = forecast_planner_node(state)
+    assert "recommendations" in updates
+    plan = updates["recommendations"]
+    assert len(plan["reallocations"]) == 1
+    assert plan["reallocations"][0]["employee_id"] == emp_id
+    assert len(plan["hirings"]) == 1
+    assert plan["hirings"][0]["role"] == "Frontend Lead"
+    assert plan["confidence_score"] > 0
+
+
 

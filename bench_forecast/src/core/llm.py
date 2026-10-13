@@ -288,9 +288,31 @@ class LLMFactory:
         obj_match = re.search(r"\{.*\}", text, re.DOTALL)
         if obj_match:
             try:
-                return json.loads(obj_match.group(0))
+                res = json.loads(obj_match.group(0))
+                if isinstance(res, dict):
+                    return res
             except json.JSONDecodeError:
                 pass
+
+        # 4. Repair truncated or unclosed JSON (common with smaller local models like llama3.2)
+        start = text.find("{")
+        if start != -1:
+            snippet = text[start:]
+            for trim_len in range(len(snippet), max(0, len(snippet) - 3000), -1):
+                cand = snippet[:trim_len].strip()
+                cand = re.sub(r"[,:\s]+$", "", cand)
+                num_quotes = len(re.findall(r'(?<!\\)"', cand))
+                if num_quotes % 2 != 0:
+                    cand += '"'
+                open_brackets = cand.count("[") - cand.count("]")
+                open_braces = cand.count("{") - cand.count("}")
+                repaired = cand + ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+                try:
+                    parsed = json.loads(repaired)
+                    if isinstance(parsed, dict) and parsed:
+                        return parsed
+                except Exception:
+                    pass
 
         raise ValueError(
             f"Could not extract valid JSON from LLM response. "
@@ -491,7 +513,17 @@ Financial Guidelines:
 - confidence_score: 0.0-1.0 reflecting recommendation certainty
 """
 
-        matches_json = json.dumps(matches[:5], indent=2)
+        compact_matches = [
+            {
+                "employee_id": m.get("employee_id"),
+                "demand_id": m.get("demand_id"),
+                "match_score": m.get("match_score"),
+                "missing_skills": m.get("missing_skills", []),
+                "reasoning": (m.get("reasoning") or "")[:120],
+            }
+            for m in matches[:5]
+        ]
+        matches_json = json.dumps(compact_matches, indent=2)
 
         revision_block = ""
         if rejection_feedback and previous_plan:

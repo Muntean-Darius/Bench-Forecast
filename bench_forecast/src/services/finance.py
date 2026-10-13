@@ -222,8 +222,6 @@ def calculate_and_persist_bench_costs(
         bench_days=bench_days,
         daily_cost=cost_record.internal_daily_cost,
         total_cost=total_cost,
-        currency=cost_record.currency,
-        calculated_at=datetime.utcnow(),
     )
     db.add(bench_cost)
     db.flush()  # populate id without committing
@@ -291,7 +289,6 @@ def get_monthly_bench_burn(
                 "total_cost"
             ),
             func.count(func.distinct(BenchCost.employee_id)).label("employee_count"),
-            BenchCost.currency,
         )
         .where(
             and_(
@@ -299,15 +296,13 @@ def get_monthly_bench_burn(
                 BenchCost.period_end >= first_day,
             )
         )
-        .group_by(BenchCost.currency)
     )
 
-    rows = db.execute(stmt).all()
+    row = db.execute(stmt).first()
 
-    # Aggregate (simple: sum across currencies — front-end should handle FX)
-    total = sum(r.total_cost for r in rows) if rows else Decimal("0.00")
-    emp_count = max((r.employee_count for r in rows), default=0)
-    currency = rows[0].currency if rows else "EUR"
+    total = row.total_cost if row and row.total_cost else Decimal("0.00")
+    emp_count = row.employee_count if row and row.employee_count else 0
+    currency = "EUR"
 
     return {
         "year": year,
@@ -386,8 +381,12 @@ def get_employee_bench_costs(
             "bench_days": r.bench_days,
             "daily_cost": float(r.daily_cost),
             "total_cost": float(r.total_cost),
-            "currency": r.currency,
-            "calculated_at": r.calculated_at.isoformat(),
+            "currency": "EUR",
+            "calculated_at": (
+                r.created_at.isoformat()
+                if hasattr(r, "created_at") and r.created_at
+                else datetime.utcnow().isoformat()
+            ),
         }
         for r in rows
     ]
@@ -418,7 +417,6 @@ def get_org_bench_summary(
             BenchCost.employee_id,
             func.sum(BenchCost.total_cost).label("total_cost"),
             func.sum(BenchCost.bench_days).label("total_bench_days"),
-            BenchCost.currency,
         )
         .where(
             and_(
@@ -426,13 +424,13 @@ def get_org_bench_summary(
                 BenchCost.period_end >= period_start,
             )
         )
-        .group_by(BenchCost.employee_id, BenchCost.currency)
+        .group_by(BenchCost.employee_id)
         .order_by(func.sum(BenchCost.total_cost).desc())
     )
     rows = db.execute(per_emp_stmt).all()
 
-    grand_total = sum(r.total_cost for r in rows)
-    currency = rows[0].currency if rows else "EUR"
+    grand_total = sum(r.total_cost for r in rows) if rows else Decimal("0.00")
+    currency = "EUR"
 
     return {
         "period_start": str(period_start),
@@ -445,7 +443,7 @@ def get_org_bench_summary(
                 "employee_id": str(r.employee_id),
                 "total_cost": float(r.total_cost),
                 "total_bench_days": int(r.total_bench_days),
-                "currency": r.currency,
+                "currency": currency,
             }
             for r in rows
         ],
