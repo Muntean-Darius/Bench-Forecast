@@ -1,8 +1,17 @@
 import { useState, useMemo, useEffect } from 'react'
+import { useNavigate } from 'react-router-dom'
 import clsx from 'clsx'
 import { type Employee, type ProjectRole } from '../types'
 import { format } from 'date-fns'
 import { api } from '../api/client'
+import {
+  DocumentIcon,
+  DownloadIcon,
+  CloseIcon,
+  BriefcaseIcon,
+  ClipboardIcon,
+  BenchEmotion,
+} from '../components/icons/Icons'
 
 // ─── Shared sort hook ─────────────────────────────────────────────────────────
 
@@ -80,6 +89,8 @@ function normalizeEmployee(e: any): Employee {
     skills: skills,
     experience_years: e.experience_years,
     current_project: e.current_project,
+    bench_status: e.bench_status,
+    job_title: e.job_title,
   }
 }
 
@@ -99,10 +110,10 @@ function normalizeDemand(d: any): ProjectRole {
     id: d.id,
     project_id: d.project_id,
     title: d.role,
-    project_name: `Project ${String(d.project_id).substring(0, 8)}`,
+    project_name: d.project_name || `Project ${String(d.project_id).substring(0, 8)}`,
     project_status: 'Active',
     required_skills: skills.join(', '),
-    target_bill_rate: 100, // not provided by API; shown as placeholder
+    target_bill_rate: d.target_bill_rate ?? 100,
     start_date: d.start_date ?? new Date().toISOString().split('T')[0],
     status: 'Open',
     headcount: d.headcount ?? 1,
@@ -111,16 +122,18 @@ function normalizeDemand(d: any): ProjectRole {
   }
 }
 
-// ─── Bench table ──────────────────────────────────────────────────────────────
+// ─── Bench Table (Employees available on bench) ───────────────────────────────
 
 function BenchTable({
   filter,
   employees,
   onOpenCV,
+  onAssign,
 }: {
   filter: string
   employees: Employee[]
   onOpenCV: (emp: Employee) => void
+  onAssign: (emp: Employee) => void
 }) {
   const q = filter.trim().toLowerCase()
   const filtered = employees.filter((e) => {
@@ -143,7 +156,7 @@ function BenchTable({
     <div className="card flex flex-col">
       <div className="section-header">
         <p className="section-title">
-          Bench (Supply)
+          On Bench (Supply)
           <span className="ml-2 badge badge-red">{filtered.length} people</span>
         </p>
       </div>
@@ -157,7 +170,7 @@ function BenchTable({
               <SortTh col="hourly_cost_rate" active={col as keyof Employee} dir={dir} onClick={() => toggle('hourly_cost_rate')}>Cost Rate / hr</SortTh>
               <SortTh col="bench_start_date" active={col as keyof Employee} dir={dir} onClick={() => toggle('bench_start_date')}>Bench Since</SortTh>
               <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">Skills</th>
-              <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">CV</th>
+              <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -203,21 +216,30 @@ function BenchTable({
                       )}
                     </div>
                   </td>
-                  <td>
-                    <button
-                      onClick={() => onOpenCV(e)}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors cursor-pointer"
-                      title="View CV & Profile"
-                    >
-                      <span>📄</span> View CV
-                    </button>
+                  <td className="text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => onOpenCV(e)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors cursor-pointer"
+                        title="View CV & Profile"
+                      >
+                        <DocumentIcon className="w-3.5 h-3.5" /> View CV
+                      </button>
+                      <button
+                        onClick={() => onAssign(e)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded transition-colors cursor-pointer shadow-sm"
+                        title="Assign directly to a project"
+                      >
+                        Assign to Project →
+                      </button>
+                    </div>
                   </td>
                 </tr>
               )
             })}
             {sorted.length === 0 && (
               <tr>
-                <td colSpan={7} className="text-center text-gray-400 text-sm py-6">
+                <td colSpan={7} className="text-center text-gray-400 text-sm py-8">
                   No bench employees found.
                 </td>
               </tr>
@@ -229,7 +251,136 @@ function BenchTable({
   )
 }
 
-// ─── Projects table ───────────────────────────────────────────────────────────
+// ─── Assigned Table (Employees already on a project) ──────────────────────────
+
+function AssignedTable({
+  filter,
+  employees,
+  onOpenCV,
+  onRelease,
+}: {
+  filter: string
+  employees: Employee[]
+  onOpenCV: (emp: Employee) => void
+  onRelease: (emp: Employee) => void
+}) {
+  const q = filter.trim().toLowerCase()
+  const filtered = employees.filter((e) => {
+    if (!q) return true
+    const nameMatch = (e.full_name ?? e.name ?? '').toLowerCase().includes(q)
+    const roleMatch = (e.primary_role ?? '').toLowerCase().includes(q)
+    const senMatch = (e.seniority ?? '').toLowerCase().includes(q)
+    const projMatch = (e.current_project ?? '').toLowerCase().includes(q)
+    const skillsList = Array.isArray(e.skills)
+      ? e.skills
+      : typeof e.skills === 'string'
+      ? e.skills.split(',').map((s) => s.trim())
+      : []
+    const skillsMatch = skillsList.some((s) => s.toLowerCase().includes(q))
+    return nameMatch || roleMatch || senMatch || projMatch || skillsMatch
+  })
+
+  const { sorted, col, dir, toggle } = useSort(filtered, 'full_name')
+
+  return (
+    <div className="card flex flex-col">
+      <div className="section-header">
+        <p className="section-title">
+          Already has a project
+          <span className="ml-2 badge badge-green">{filtered.length} people</span>
+        </p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="data-table">
+          <thead>
+            <tr>
+              <SortTh col="full_name"        active={col as keyof Employee} dir={dir} onClick={() => toggle('full_name')}>Name</SortTh>
+              <SortTh col="seniority"        active={col as keyof Employee} dir={dir} onClick={() => toggle('seniority')}>Seniority</SortTh>
+              <SortTh col="primary_role"     active={col as keyof Employee} dir={dir} onClick={() => toggle('primary_role')}>Role</SortTh>
+              <SortTh col="current_project"  active={col as keyof Employee} dir={dir} onClick={() => toggle('current_project')}>Current Project</SortTh>
+              <SortTh col="hourly_cost_rate" active={col as keyof Employee} dir={dir} onClick={() => toggle('hourly_cost_rate')}>Cost Rate / hr</SortTh>
+              <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">Skills</th>
+              <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((e) => {
+              const seniority = e.seniority ?? 'Mid'
+              const senColor = ({
+                Junior: 'badge-gray',
+                Mid: 'badge-blue',
+                Senior: 'badge-green',
+                Principal: 'badge badge-yellow',
+              } as Record<string, string>)[seniority] || 'badge-gray'
+
+              const skillsArr: string[] = Array.isArray(e.skills)
+                ? e.skills
+                : typeof e.skills === 'string'
+                ? e.skills.split(',').map((s: string) => s.trim())
+                : []
+
+              return (
+                <tr key={e.id}>
+                  <td className="font-medium">{e.full_name ?? e.name}</td>
+                  <td>
+                    <span className={clsx('badge', senColor)}>{seniority}</span>
+                  </td>
+                  <td className="text-gray-600">{e.primary_role ?? 'Engineer'}</td>
+                  <td>
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-green-800 bg-green-50 rounded border border-green-200">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                      {e.current_project || 'Active Project'}
+                    </span>
+                  </td>
+                  <td className="tabnum font-mono text-gray-800">
+                    €{Number(e.hourly_cost_rate ?? 0).toFixed(2)}/h
+                  </td>
+                  <td className="max-w-[200px]">
+                    <div className="flex flex-wrap gap-1">
+                      {skillsArr.slice(0, 3).map((s, i) => (
+                        <span key={i} className="badge badge-gray">{s}</span>
+                      ))}
+                      {skillsArr.length > 3 && (
+                        <span className="badge badge-gray">+{skillsArr.length - 3}</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => onOpenCV(e)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors cursor-pointer"
+                        title="View CV & Profile"
+                      >
+                        <DocumentIcon className="w-3.5 h-3.5" /> View CV
+                      </button>
+                      <button
+                        onClick={() => onRelease(e)}
+                        className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-red-600 hover:text-red-700 hover:bg-red-50 rounded border border-red-200 transition-colors cursor-pointer"
+                        title="Release back to bench"
+                      >
+                        Release to Bench
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+            {sorted.length === 0 && (
+              <tr>
+                <td colSpan={7} className="text-center text-gray-400 text-sm py-8">
+                  No employees currently assigned to projects.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// ─── Projects Table (Project demand pipeline) ─────────────────────────────────
 
 const STATUS_BADGE: Record<string, string> = {
   Open: 'badge badge-blue',
@@ -238,6 +389,7 @@ const STATUS_BADGE: Record<string, string> = {
 }
 
 function ProjectsTable({ filter, roles }: { filter: string; roles: ProjectRole[] }) {
+  const navigate = useNavigate()
   const [statusFilter, setStatusFilter] = useState<string>('all')
 
   const filtered = roles.filter((r) => {
@@ -256,7 +408,7 @@ function ProjectsTable({ filter, roles }: { filter: string; roles: ProjectRole[]
     <div className="card flex flex-col">
       <div className="section-header">
         <p className="section-title">
-          Projects (Demand)
+          Projects (Demand Pipeline)
           <span className="ml-2 badge badge-blue">{filtered.length} roles</span>
         </p>
         <div className="flex items-center gap-2">
@@ -283,6 +435,7 @@ function ProjectsTable({ filter, roles }: { filter: string; roles: ProjectRole[]
               <SortTh col="win_probability" active={col as keyof ProjectRole} dir={dir} onClick={() => toggle('win_probability')}>Win Prob.</SortTh>
               <SortTh col="start_date"      active={col as keyof ProjectRole} dir={dir} onClick={() => toggle('start_date')}>Start Date</SortTh>
               <SortTh col="status"          active={col as keyof ProjectRole} dir={dir} onClick={() => toggle('status')}>Status</SortTh>
+              <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200 bg-gray-50">Action</th>
             </tr>
           </thead>
           <tbody>
@@ -328,12 +481,21 @@ function ProjectsTable({ filter, roles }: { filter: string; roles: ProjectRole[]
                   <td>
                     <span className={STATUS_BADGE[r.status] || 'badge badge-gray'}>{r.status}</span>
                   </td>
+                  <td className="text-right">
+                    <button
+                      onClick={() => navigate(`/queue?project_id=${r.project_id}`)}
+                      className="btn-primary text-xs px-2.5 py-1 whitespace-nowrap cursor-pointer"
+                      title="Run AI Forecast for this project"
+                    >
+                      Forecast →
+                    </button>
+                  </td>
                 </tr>
               )
             })}
             {sorted.length === 0 && (
               <tr>
-                <td colSpan={6} className="text-center text-gray-400 text-sm py-6">
+                <td colSpan={7} className="text-center text-gray-400 text-sm py-6">
                   No open project roles found.
                 </td>
               </tr>
@@ -345,7 +507,128 @@ function ProjectsTable({ filter, roles }: { filter: string; roles: ProjectRole[]
   )
 }
 
-// ─── Bench & Pipeline page ────────────────────────────────────────────────────
+// ─── Direct Assignment Modal ──────────────────────────────────────────────────
+
+function AssignModal({
+  employee,
+  demands,
+  onClose,
+  onSuccess,
+}: {
+  employee: Employee | null
+  demands: ProjectRole[]
+  onClose: () => void
+  onSuccess: (empId: string, projectName: string) => void
+}) {
+  if (!employee) return null
+
+  const [selectedDemandId, setSelectedDemandId] = useState<string>(demands[0]?.id || '')
+  const [customProjectName, setCustomProjectName] = useState<string>('')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const selectedDemand = demands.find((d) => d.id === selectedDemandId)
+
+  async function handleConfirm() {
+    if (!employee) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      const projName = customProjectName.trim() || selectedDemand?.project_name || 'Assigned Project'
+      const roleName = selectedDemand?.title || employee?.primary_role || 'Engineer'
+      await api.assignEmployee(employee.id, selectedDemandId || undefined, projName, roleName)
+      onSuccess(employee.id, projName)
+      onClose()
+    } catch (e: any) {
+      console.error(e)
+      setError(e.message || 'Failed to assign employee')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+      <div className="bg-white rounded-lg shadow-2xl w-full max-w-lg flex flex-col overflow-hidden animate-fadeIn">
+        <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between bg-gray-50">
+          <div>
+            <h2 className="text-base font-semibold text-gray-900">
+              Assign {employee.full_name ?? employee.name}
+            </h2>
+            <p className="text-xs text-gray-500 font-mono mt-0.5">
+              {employee.seniority} · {employee.primary_role} · €{Number(employee.hourly_cost_rate ?? 0).toFixed(2)}/h
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 cursor-pointer" title="Close">
+            <CloseIcon className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-6 flex flex-col gap-4">
+          {error && (
+            <div className="text-xs text-red-600 bg-red-50 p-2.5 rounded border border-red-200">
+              {error}
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-medium text-gray-700 uppercase font-mono mb-1">
+              Select Open Project Demand
+            </label>
+            <select
+              value={selectedDemandId}
+              onChange={(e) => setSelectedDemandId(e.target.value)}
+              className="w-full text-sm border border-gray-300 rounded p-2 bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              {demands.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.project_name} — {d.title} (Needed: {d.headcount} | Skills: {d.required_skills || 'Any'})
+                </option>
+              ))}
+              <option value="">Custom / Other Project</option>
+            </select>
+          </div>
+
+          {!selectedDemandId && (
+            <div>
+              <label className="block text-xs font-medium text-gray-700 uppercase font-mono mb-1">
+                Custom Project Name
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. Fintech Mobile App v2"
+                value={customProjectName}
+                onChange={(e) => setCustomProjectName(e.target.value)}
+                className="w-full text-sm border border-gray-300 rounded p-2 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+            </div>
+          )}
+
+          {selectedDemand && (
+            <div className="bg-blue-50/60 p-3 rounded border border-blue-100 text-xs text-gray-700 space-y-1">
+              <p><strong>Role:</strong> {selectedDemand.title}</p>
+              <p><strong>Required Skills:</strong> {selectedDemand.required_skills || 'None specified'}</p>
+              <p><strong>Target Bill Rate:</strong> €{selectedDemand.target_bill_rate}/h</p>
+            </div>
+          )}
+        </div>
+
+        <div className="px-6 py-3 border-t border-gray-200 bg-gray-50 flex items-center justify-end gap-3">
+          <button onClick={onClose} disabled={submitting} className="btn-ghost text-xs px-4 py-2">
+            Cancel
+          </button>
+          <button
+            onClick={handleConfirm}
+            disabled={submitting}
+            className="btn-primary text-xs px-4 py-2 flex items-center gap-1.5 cursor-pointer"
+          >
+            {submitting ? 'Assigning…' : 'Confirm Assignment'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 // ─── CV Viewer Modal ──────────────────────────────────────────────────────────
 
@@ -364,7 +647,6 @@ function CVModal({
   useEffect(() => {
     if (employee?.id) {
       setProfileText(employee.profile_text || '')
-      // Fetch latest profile text in case a new CV was recently uploaded
       api.getEmployeePortal(employee.id)
         .then((res: any) => {
           if (res?.employee?.profile_text) {
@@ -404,13 +686,14 @@ function CVModal({
               download={`${employee.full_name || 'employee'}_CV.pdf`}
               className="btn-primary text-xs px-3 py-1.5 flex items-center gap-1.5"
             >
-              <span>⬇</span> Download PDF
+              <DownloadIcon className="w-3.5 h-3.5" /> Download PDF
             </a>
             <button
               onClick={onClose}
-              className="text-gray-400 hover:text-gray-600 p-1 text-lg font-bold leading-none cursor-pointer"
+              className="text-gray-400 hover:text-gray-600 p-1 cursor-pointer"
+              title="Close"
             >
-              ✕
+              <CloseIcon className="w-5 h-5" />
             </button>
           </div>
         </div>
@@ -421,24 +704,24 @@ function CVModal({
             <button
               onClick={() => setActiveTab('pdf')}
               className={clsx(
-                'px-3 py-1 text-xs font-medium rounded transition-colors',
+                'px-3 py-1 text-xs font-medium rounded transition-colors cursor-pointer flex items-center gap-1.5',
                 activeTab === 'pdf'
                   ? 'bg-white text-gray-900 shadow-sm border border-gray-200'
                   : 'text-gray-600 hover:text-gray-900'
               )}
             >
-              📄 CV Document (PDF)
+              <DocumentIcon className="w-3.5 h-3.5" /> CV Document (PDF)
             </button>
             <button
               onClick={() => setActiveTab('text')}
               className={clsx(
-                'px-3 py-1 text-xs font-medium rounded transition-colors',
+                'px-3 py-1 text-xs font-medium rounded transition-colors cursor-pointer flex items-center gap-1.5',
                 activeTab === 'text'
                   ? 'bg-white text-gray-900 shadow-sm border border-gray-200'
                   : 'text-gray-600 hover:text-gray-900'
               )}
             >
-              📝 Extracted Profile Text
+              <ClipboardIcon className="w-3.5 h-3.5" /> Extracted Profile Text
             </button>
           </div>
 
@@ -481,7 +764,7 @@ function CVModal({
 
         {/* Footer */}
         <div className="px-6 py-2.5 border-t border-gray-200 bg-white flex justify-end shrink-0">
-          <button onClick={onClose} className="btn-ghost text-xs px-4 py-1.5">
+          <button onClick={onClose} className="btn-ghost text-xs px-4 py-1.5 cursor-pointer">
             Close
           </button>
         </div>
@@ -490,38 +773,77 @@ function CVModal({
   )
 }
 
-// ─── Bench & Pipeline page ────────────────────────────────────────────────────
+// ─── Bench & Pipeline Page (Main Manager View) ────────────────────────────────
 
 export default function BenchPipeline() {
+  const [activeTab, setActiveTab] = useState<'bench' | 'assigned' | 'projects'>('bench')
   const [filter, setFilter] = useState('')
   const [employees, setEmployees] = useState<Employee[]>([])
   const [demands, setDemands] = useState<ProjectRole[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [selectedEmpCV, setSelectedEmpCV] = useState<Employee | null>(null)
+  const [assigningEmp, setAssigningEmp] = useState<Employee | null>(null)
+
+  const loadData = async () => {
+    try {
+      const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
+      const minWinProb = Number(localStorage.getItem('bf_min_win_prob') ?? 0.5)
+
+      const [empData, demData] = await Promise.all([
+        api.getEmployees(horizonDays),
+        api.getDemands(minWinProb),
+      ])
+
+      setEmployees((empData as any[]).map(normalizeEmployee))
+      setDemands((demData as any[]).map(normalizeDemand))
+    } catch (e: any) {
+      console.error(e)
+      setError(e.message ?? 'Failed to load data')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
-    async function loadData() {
-      try {
-        const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
-        const minWinProb = Number(localStorage.getItem('bf_min_win_prob') ?? 0.5)
-
-        const [empData, demData] = await Promise.all([
-          api.getEmployees(horizonDays),
-          api.getDemands(minWinProb),
-        ])
-
-        setEmployees((empData as any[]).map(normalizeEmployee))
-        setDemands((demData as any[]).map(normalizeDemand))
-      } catch (e: any) {
-        console.error(e)
-        setError(e.message ?? 'Failed to load data')
-      } finally {
-        setLoading(false)
-      }
-    }
     loadData()
   }, [])
+
+  const benchEmployees = useMemo(() => {
+    return employees.filter((e) => !e.current_project && e.bench_status !== 'on_project')
+  }, [employees])
+
+  const assignedEmployees = useMemo(() => {
+    return employees.filter((e) => Boolean(e.current_project) || e.bench_status === 'on_project')
+  }, [employees])
+
+  async function handleRelease(emp: Employee) {
+    if (!window.confirm(`Release ${emp.full_name ?? emp.name} back to the bench?`)) return
+    try {
+      await api.releaseEmployee(emp.id)
+      setEmployees((prev) =>
+        prev.map((e) =>
+          e.id === emp.id
+            ? { ...e, current_project: null, bench_status: 'bench', bench_start_date: new Date().toISOString() }
+            : e
+        )
+      )
+    } catch (err: any) {
+      alert(`Failed to release employee: ${err.message || err}`)
+    }
+  }
+
+  function handleAssignSuccess(empId: string, projectName: string) {
+    setEmployees((prev) =>
+      prev.map((e) =>
+        e.id === empId
+          ? { ...e, current_project: projectName, bench_status: 'on_project', bench_start_date: '' }
+          : e
+      )
+    )
+    // Reload full demands in background to update headcounts
+    loadData()
+  }
 
   if (loading) {
     return <div className="p-6 text-gray-500">Loading data from database…</div>
@@ -532,13 +854,13 @@ export default function BenchPipeline() {
   }
 
   return (
-    <div className="p-6 flex flex-col gap-6">
-      {/* Header */}
+    <div className="p-6 flex flex-col gap-5">
+      {/* Page Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-gray-900">Bench &amp; Pipeline</h1>
           <p className="text-xs text-gray-500 font-mono mt-0.5">
-            Supply vs. Demand · {employees.length} bench · {demands.filter((r) => r.status === 'Open').length} open roles
+            Workforce Allocation &amp; Demand Management · {benchEmployees.length} on bench · {assignedEmployees.length} assigned · {demands.length} project roles
           </p>
         </div>
         <div className="relative">
@@ -552,10 +874,97 @@ export default function BenchPipeline() {
         </div>
       </div>
 
-      <BenchTable filter={filter} employees={employees} onOpenCV={(emp) => setSelectedEmpCV(emp)} />
-      <ProjectsTable filter={filter} roles={demands} />
+      {/* View Switcher Buttons */}
+      <div className="flex items-center gap-2 border-b border-gray-200 pb-3">
+        <button
+          onClick={() => setActiveTab('bench')}
+          className={clsx(
+            'px-4 py-2 text-sm font-medium rounded-md transition-all flex items-center gap-2 cursor-pointer',
+            activeTab === 'bench'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-200'
+          )}
+        >
+          <BenchEmotion className="w-2.5 h-2.5" />
+          <span>Bench</span>
+          <span className={clsx(
+            'text-xs px-2 py-0.5 rounded-full font-mono',
+            activeTab === 'bench' ? 'bg-blue-700 text-white' : 'bg-gray-100 text-gray-600'
+          )}>
+            {benchEmployees.length}
+          </span>
+        </button>
 
+        <button
+          onClick={() => setActiveTab('assigned')}
+          className={clsx(
+            'px-4 py-2 text-sm font-medium rounded-md transition-all flex items-center gap-2 cursor-pointer',
+            activeTab === 'assigned'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-200'
+          )}
+        >
+          <BriefcaseIcon className="w-4 h-4" />
+          <span>Already has a project</span>
+          <span className={clsx(
+            'text-xs px-2 py-0.5 rounded-full font-mono',
+            activeTab === 'assigned' ? 'bg-blue-700 text-white' : 'bg-gray-100 text-gray-600'
+          )}>
+            {assignedEmployees.length}
+          </span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab('projects')}
+          className={clsx(
+            'px-4 py-2 text-sm font-medium rounded-md transition-all flex items-center gap-2 cursor-pointer',
+            activeTab === 'projects'
+              ? 'bg-blue-600 text-white shadow-sm'
+              : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-200'
+          )}
+        >
+          <ClipboardIcon className="w-4 h-4" />
+          <span>Projects</span>
+          <span className={clsx(
+            'text-xs px-2 py-0.5 rounded-full font-mono',
+            activeTab === 'projects' ? 'bg-blue-700 text-white' : 'bg-gray-100 text-gray-600'
+          )}>
+            {demands.length}
+          </span>
+        </button>
+      </div>
+
+      {/* Active Tab View */}
+      {activeTab === 'bench' && (
+        <BenchTable
+          filter={filter}
+          employees={benchEmployees}
+          onOpenCV={(emp) => setSelectedEmpCV(emp)}
+          onAssign={(emp) => setAssigningEmp(emp)}
+        />
+      )}
+
+      {activeTab === 'assigned' && (
+        <AssignedTable
+          filter={filter}
+          employees={assignedEmployees}
+          onOpenCV={(emp) => setSelectedEmpCV(emp)}
+          onRelease={handleRelease}
+        />
+      )}
+
+      {activeTab === 'projects' && (
+        <ProjectsTable filter={filter} roles={demands} />
+      )}
+
+      {/* Modals */}
       <CVModal employee={selectedEmpCV} onClose={() => setSelectedEmpCV(null)} />
+      <AssignModal
+        employee={assigningEmp}
+        demands={demands.filter((d) => d.status === 'Open')}
+        onClose={() => setAssigningEmp(null)}
+        onSuccess={handleAssignSuccess}
+      />
     </div>
   )
 }

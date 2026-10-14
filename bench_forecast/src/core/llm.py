@@ -59,28 +59,23 @@ class AllocationDecision(BaseModel):
     }
     """
 
-    action_type: Literal["allocate", "train", "hire"] = Field(
+    action_type: Literal["allocate", "train"] = Field(
         ...,
         description=(
             "Decision bucket: "
-            "'allocate' = direct assignment, "
-            "'train' = assign + upskill, "
-            "'hire' = open external recruitment"
+            "'allocate' = direct assignment without prior training, "
+            "'train' = assign employee with prescribed upskilling plan to close skill gaps and raise compatibility"
         ),
     )
-    employee_id: Optional[str] = Field(
-        None,
-        description=(
-            "UUID of the selected employee. "
-            "Must be null when action_type is 'hire'."
-        ),
+    employee_id: str = Field(
+        ...,
+        description="UUID of the selected bench employee (must be an internal employee from the candidates list).",
     )
     projected_margin: float = Field(
         0.0,
         description=(
             "Projected gross margin % for this allocation. "
-            "Formula: (bill_rate - cost_rate) / bill_rate * 100. "
-            "Must be > 0 for 'allocate' and 'train'. Set to 0.0 for 'hire'."
+            "Formula: (bill_rate - cost_rate) / bill_rate * 100."
         ),
     )
     justification: str = Field(
@@ -95,7 +90,7 @@ class AllocationDecision(BaseModel):
         None,
         description=(
             "For action_type='train': a brief upskilling plan (technologies, "
-            "estimated duration, resources). Null for 'allocate' and 'hire'."
+            "estimated duration, resources). Null for 'allocate'."
         ),
     )
 
@@ -108,26 +103,16 @@ class AllocationDecision(BaseModel):
         return round(v, 2)
 
     @model_validator(mode="after")
-    def hire_has_no_employee(self) -> "AllocationDecision":
-        """When action_type is 'hire', employee_id must be null."""
-        if self.action_type == "hire" and self.employee_id is not None:
+    def validate_action_fields(self) -> "AllocationDecision":
+        """Validate employee_id and upskilling_path according to action_type."""
+        if not self.employee_id:
             raise ValueError(
-                "employee_id must be null when action_type is 'hire' "
-                "(no internal candidate is being assigned)"
+                f"employee_id is required for '{self.action_type}'"
             )
-        if self.action_type in ("allocate", "train") and not self.employee_id:
-            raise ValueError(
-                f"employee_id is required when action_type is '{self.action_type}'"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def train_requires_upskilling_path(self) -> "AllocationDecision":
-        """Training allocations must include an upskilling path."""
         if self.action_type == "train" and not self.upskilling_path:
-            raise ValueError(
-                "upskilling_path is required when action_type is 'train'"
-            )
+            self.upskilling_path = "Targeted 2-4 week training curriculum targeting key missing skills to raise compatibility score."
+        elif self.action_type == "allocate":
+            self.upskilling_path = None
         return self
 
 
@@ -347,37 +332,33 @@ Your job is to allocate bench employees to open project roles, balancing:
   1. Technical fit   — semantic skill match between CV and job description.
   2. Financial health — the allocation must respect the project's margin target.
 
-You must classify every role into exactly ONE of three action types:
+IMPORTANT CONTEXT:
+All candidate profiles in the system are internal employees. There are NO external candidates, and hiring recommendations are disabled.
+Every open role must be assigned to an internal candidate from the provided list, classified strictly into ONE of two action types:
 
   • "allocate" — DIRECT ALLOCATION
-    Trigger: candidate has HIGH semantic similarity (score >= 0.70) AND
+    Trigger: A bench candidate already has strong match with role requirements (similarity score >= 0.70) AND
     projected_margin >= target_margin.
-    Result:  Employee is immediately assigned to the role.
+    Result: Direct allocation to the project without required prior training.
 
   • "train"    — TRAINING ALLOCATION
-    Trigger: candidate has MEDIUM similarity (0.45 <= score < 0.70) and is
-    missing only 1-2 bridgeable skills, BUT their cost rate is low enough
-    that projected_margin exceeds target_margin even after a training investment.
-    Result:  Employee is assigned + a brief upskilling plan is prescribed.
-
-  • "hire"     — EXTERNAL HIRING RECOMMENDATION
-    Trigger: No internal candidate has the required skills OR every viable
-    candidate has a cost_rate that would push projected_margin below target_margin.
-    Result:  An external hire is recommended. employee_id must be null.
+    Trigger: A candidate matches the fundamental domain or role, but has an identifiable skill gap where targeted training / upskilling
+    could help him/her get a better compatibility score to fulfill the role, and projected_margin remains viable.
+    Result: Training allocation — the candidate is selected, and a concrete upskilling path is prescribed to close the gap and raise compatibility score.
 
 CRITICAL RULES:
   - Respond ONLY with a valid JSON object. NO markdown, NO explanations outside JSON.
   - The JSON MUST conform to this exact schema:
     {
-      "action_type": "allocate" | "train" | "hire",
-      "employee_id": "<uuid-string>" | null,
+      "action_type": "allocate" | "train",
+      "employee_id": "<uuid-string from the candidates list>",
       "projected_margin": <float>,
       "justification": "<string, min 20 chars, cite specific skills/evidence>",
       "upskilling_path": "<string>" | null
     }
   - projected_margin = (bill_rate - cost_rate) / bill_rate * 100
-  - upskilling_path is REQUIRED when action_type = "train", null otherwise.
-  - employee_id MUST be null when action_type = "hire".
+  - upskilling_path is REQUIRED when action_type = "train", null for "allocate".
+  - Do NOT recommend hiring. Do NOT return employee_id as null.
   - Do not invent employee IDs not present in the candidate list.
 """
 

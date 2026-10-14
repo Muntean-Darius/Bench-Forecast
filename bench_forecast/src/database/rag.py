@@ -134,6 +134,7 @@ class RAGPipeline:
         self.collection = self.client.get_or_create_collection(
             name="employee_profiles",
             metadata={"hnsw:space": "cosine"},
+            embedding_function=self.embedding_fn,
         )
         logger.info(
             f"RAGPipeline initialised: collection='{collection_name}' "

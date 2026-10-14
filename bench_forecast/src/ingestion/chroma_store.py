@@ -93,9 +93,15 @@ class ChromaIngestionStore:
             os.makedirs(Config.CHROMA_PERSIST_DIR, exist_ok=True)
             self._client = chromadb.PersistentClient(path=Config.CHROMA_PERSIST_DIR)
 
+        from chromadb.utils import embedding_functions  # noqa: PLC0415
+        ef = embedding_functions.OllamaEmbeddingFunction(
+            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
+            model_name=Config.EMBEDDING_MODEL,
+        )
         self._collection = self._client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
+            embedding_function=ef,
         )
         logger.info(
             "ChromaIngestionStore: collection '%s' ready (%d existing docs)",

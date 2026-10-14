@@ -38,6 +38,7 @@ class VectorStoreManager:
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
+            embedding_function=self.embedding_fn,
         )
 
     def index_employees(self, employees: List[Dict[str, Any]]) -> int:

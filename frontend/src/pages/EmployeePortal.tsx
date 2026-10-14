@@ -2,6 +2,15 @@ import { useState, useEffect } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { api } from '../api/client'
 import type { DocumentMetadata } from '../types'
+import {
+  CheckIcon,
+  CloseIcon,
+  UploadIcon,
+  SpinnerIcon,
+  DocumentIcon,
+  BenchEmotion,
+  OnProjectEmotion,
+} from '../components/icons/Icons'
 
 interface EmployeePortalData {
   employee: {
@@ -50,7 +59,7 @@ function CVUploadSection({
     try {
       const result = await api.uploadDocument(selectedFile, employeeId, 'cv')
       setUploadMsg(
-        `✓ Ingested ${result.chunks_ingested} chunk(s) into ChromaDB. Status: ${result.ingestion_status}`,
+        `Ingested ${result.chunks_ingested} chunk(s) into ChromaDB. Status: ${result.ingestion_status}`,
       )
       setSelectedFile(null)
       // Refresh document list
@@ -88,12 +97,24 @@ function CVUploadSection({
           <button
             onClick={handleUpload}
             disabled={!selectedFile || uploading}
-            className="btn-primary text-xs px-4 py-1.5"
+            className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5"
           >
-            {uploading ? '⏳ Ingesting…' : '⬆ Upload & Ingest'}
+            {uploading ? (
+              <>
+                <SpinnerIcon className="w-3.5 h-3.5 animate-spin" /> Ingesting…
+              </>
+            ) : (
+              <>
+                <UploadIcon className="w-3.5 h-3.5" /> Upload &amp; Ingest
+              </>
+            )}
           </button>
         </div>
-        {uploadMsg && <p className="text-xs text-green-600 font-mono">{uploadMsg}</p>}
+        {uploadMsg && (
+          <p className="text-xs text-green-600 font-mono flex items-center gap-1.5">
+            <CheckIcon className="w-3.5 h-3.5" /> {uploadMsg}
+          </p>
+        )}
         {uploadError && <p className="text-xs text-red-600 font-mono">{uploadError}</p>}
         <p className="text-[10px] text-gray-400 font-mono">
           PDF is extracted, chunked and embedded into ChromaDB for AI matching.
@@ -156,12 +177,12 @@ function PersonalDetails({
     setPwMsg('')
     try {
       await api.changePassword(oldPw, newPw)
-      setPwMsg('✓ Password changed successfully!')
+      setPwMsg('Password changed successfully!')
       setPwMsgType('success')
       setOldPw('')
       setNewPw('')
     } catch (e: any) {
-      setPwMsg(`✗ ${e.message?.includes('400') ? 'Wrong current password.' : e.message}`)
+      setPwMsg(e.message?.includes('400') ? 'Wrong current password.' : e.message)
       setPwMsgType('error')
     } finally {
       setChangingPw(false)
@@ -189,11 +210,17 @@ function PersonalDetails({
         </div>
         <div className="p-5">
           <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">Status</p>
-          <p className="mt-1">
-            {emp.current_project
-              ? <span className="badge badge-green">● Allocated</span>
-              : <span className="badge badge-yellow">● On Bench</span>}
-          </p>
+          <div className="mt-1">
+            {emp.current_project ? (
+              <span className="badge badge-green flex items-center gap-1.5 w-fit">
+                <OnProjectEmotion className="w-2 h-2" /> Allocated
+              </span>
+            ) : (
+              <span className="badge badge-yellow flex items-center gap-1.5 w-fit">
+                <BenchEmotion className="w-2 h-2" /> On Bench
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -218,9 +245,9 @@ function PersonalDetails({
             href={`/api/v1/documents/employee/${emp.id}/download`}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-xs text-blue-600 hover:text-blue-700 font-mono flex items-center gap-1"
+            className="text-xs text-blue-600 hover:text-blue-700 font-mono flex items-center gap-1.5"
           >
-            <span>📄</span> View Current PDF ↗
+            <DocumentIcon className="w-3.5 h-3.5" /> View Current PDF ↗
           </a>
         </div>
         <div className="p-5">
@@ -263,7 +290,10 @@ function PersonalDetails({
             {changingPw ? 'Changing…' : 'Change Password'}
           </button>
           {pwMsg && (
-            <p className={`text-xs ${pwMsgType === 'success' ? 'text-green-600' : 'text-red-600'}`}>{pwMsg}</p>
+            <p className={`text-xs flex items-center gap-1.5 ${pwMsgType === 'success' ? 'text-green-600' : 'text-red-600'}`}>
+              {pwMsgType === 'success' ? <CheckIcon className="w-3.5 h-3.5" /> : <CloseIcon className="w-3.5 h-3.5" />}
+              {pwMsg}
+            </p>
           )}
         </div>
       </div>
@@ -298,26 +328,51 @@ function ProjectsView({ data }: { data: EmployeePortalData }) {
       <div className="bg-white border border-gray-200">
         <div className="section-header"><h3 className="section-title">Allocation History</h3></div>
         <div className="p-5">
-          {data.allocations?.length > 0 ? (
-            <table className="data-table">
-              <thead><tr>
-                <th>Project</th><th>Role</th><th>Status</th><th>Date</th>
-              </tr></thead>
-              <tbody>{data.allocations.map((a: any, i: number) => (
-                <tr key={i}>
-                  <td>{a.target_project_id ?? a.project_id ?? '—'}</td>
-                  <td>{a.role ?? a.role_on_project ?? '—'}</td>
-                  <td><span className="badge badge-green">{a.status ?? 'approved'}</span></td>
-                  <td className="font-mono text-xs">{(a.created_at ?? a.start_date ?? '').split('T')[0] || '—'}</td>
-                </tr>
-              ))}</tbody>
-            </table>
-          ) : (
-            <div className="text-center py-6">
-              <p className="text-sm text-gray-500">No allocations yet</p>
-              <p className="text-xs text-gray-400 mt-1">Next assignment appears here after AI allocation and manager approval</p>
-            </div>
-          )}
+          {(() => {
+            const confirmedAllocations = (data.allocations || []).filter((a: any) => {
+              const raw = String(a.raw_status || a.status || '').toLowerCase()
+              // Explicitly exclude any pending, proposed or rejected items
+              if (raw.includes('pending') || raw.includes('proposed') || raw.includes('reject')) {
+                return false
+              }
+              return (
+                raw === 'assigned' ||
+                raw === 'done' ||
+                raw === 'approved_by_manager' ||
+                raw === 'approved' ||
+                raw === 'active' ||
+                raw === 'completed'
+              )
+            })
+
+            return confirmedAllocations.length > 0 ? (
+              <table className="data-table">
+                <thead><tr>
+                  <th>Project</th><th>Role</th><th>Status</th><th>Date</th>
+                </tr></thead>
+                <tbody>{confirmedAllocations.map((a: any, i: number) => {
+                  const isDone = a.status === 'Done' || a.raw_status === 'completed'
+                  return (
+                    <tr key={a.id || i}>
+                      <td className="font-medium text-gray-900">{a.project_name || a.target_project_id || a.project_id || a.role_on_project || 'Assigned Project'}</td>
+                      <td>{a.role ?? a.role_on_project ?? '—'}</td>
+                      <td>
+                        <span className={`badge ${isDone ? 'badge-gray' : 'badge-green'}`}>
+                          {isDone ? 'Done' : 'Assigned'}
+                        </span>
+                      </td>
+                      <td className="font-mono text-xs">{(a.created_at ?? a.start_date ?? '').split('T')[0] || '—'}</td>
+                    </tr>
+                  )
+                })}</tbody>
+              </table>
+            ) : (
+              <div className="text-center py-6">
+                <p className="text-sm text-gray-500">No project allocations yet</p>
+                <p className="text-xs text-gray-400 mt-1">Assigned projects will appear here once approved by management</p>
+              </div>
+            )
+          })()}
         </div>
       </div>
 

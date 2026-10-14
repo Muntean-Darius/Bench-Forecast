@@ -864,6 +864,12 @@ class Allocation(TimestampMixin, Base):
             return self.project_demand.project_id
         return None
 
+    @property
+    def project_name(self) -> Optional[str]:
+        if self.project_demand and self.project_demand.project:
+            return self.project_demand.project.name
+        return None
+
 # ---------------------------------------------------------------------------
 # Utility kept for backward compat (used in postgres_db.py)
 # ---------------------------------------------------------------------------
