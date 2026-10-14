@@ -33,11 +33,15 @@ Dependencies
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import uuid
 from typing import Annotated, Optional
+
+from langchain_core.messages import HumanMessage
+from src.core.llm import LLMFactory
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
@@ -160,6 +164,7 @@ class DocumentUploadResponse(BaseModel):
     ingestion_status: str
     chunks_ingested: int
     message: str
+    summary: Optional[str] = None
 
 
 class DocumentMetadataResponse(BaseModel):
@@ -306,17 +311,7 @@ async def upload_cv(
                 "The file may be image-only or password-protected."
             )
 
-        # Update employee's profile_text and cv_document_uri in database
-        from datetime import datetime
-        await db.execute(
-            update(Employee)
-            .where(Employee.id == emp_uuid)
-            .values(
-                profile_text=full_text,
-                cv_document_uri=file_path,
-                updated_at=datetime.utcnow()
-            )
-        )
+        # Save raw extracted text to documents table for audit
         await set_text_content(db, doc_id, full_text)
         await db.commit()
 
@@ -341,6 +336,74 @@ async def upload_cv(
             doc_id,
             len(chunks),
         )
+
+        # ------------------------------------------------------------------
+        # 6b. LLM CV Summarization (Excluding Personal Data)
+        # ------------------------------------------------------------------
+        logger.info("Generating anonymized professional CV summary via LLM: document_id=%s", doc_id)
+        cv_summary: Optional[str] = None
+        try:
+            llm = LLMFactory.get_chat_model()
+            summary_prompt = (
+                "You are an expert HR and workforce allocation analyst.\n"
+                "Analyze the following candidate CV and create a comprehensive professional summary in JSON format.\n\n"
+                "CRITICAL PRIVACY RULE:\n"
+                "Strictly EXCLUDE ALL personal data (candidate name, email address, phone number, physical address, age, gender, personal social links).\n\n"
+                "IMPORTANT INFORMATION TO INCLUDE:\n"
+                "- professional_summary: Detailed professional summary containing core strengths, domains, and career highlights.\n"
+                "- seniority_level: Junior, Mid, Senior, Lead, or Principal.\n"
+                "- years_of_experience: Number of years (float or int).\n"
+                "- core_skills: Array of primary technical skills, frameworks, languages, and tools.\n"
+                "- key_achievements: Array of notable projects or deliverables.\n"
+                "- domain_expertise: Array of business domains (e.g. FinTech, Healthcare, Cloud, etc.).\n\n"
+                "JSON schema:\n"
+                "{\n"
+                '  "professional_summary": "string",\n'
+                '  "seniority_level": "string",\n'
+                '  "years_of_experience": float,\n'
+                '  "core_skills": ["string"],\n'
+                '  "key_achievements": ["string"],\n'
+                '  "domain_expertise": ["string"]\n'
+                "}\n\n"
+                f"Candidate CV text:\n{full_text[:6000]}"
+            )
+            llm_res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=summary_prompt)])
+            parsed_summary = LLMFactory.parse_json_response(llm_res.content)
+
+            prof_sum = parsed_summary.get("professional_summary") or ""
+            skills_list = parsed_summary.get("core_skills", [])
+            domains_list = parsed_summary.get("domain_expertise", [])
+            achieve_list = parsed_summary.get("key_achievements", [])
+
+            summary_parts = []
+            if prof_sum:
+                summary_parts.append(prof_sum)
+            if skills_list:
+                summary_parts.append(f"Core Skills: {', '.join(skills_list)}")
+            if domains_list:
+                summary_parts.append(f"Domains: {', '.join(domains_list)}")
+            if achieve_list:
+                summary_parts.append(f"Key Achievements: {'; '.join(achieve_list)}")
+
+            if summary_parts:
+                cv_summary = "\n\n".join(summary_parts)
+                logger.info("✓ LLM CV summary successfully generated: document_id=%s (%d chars)", doc_id, len(cv_summary))
+        except Exception as e_sum:
+            logger.warning(f"LLM CV summarization failed (falling back to extracted text): {e_sum}")
+
+        # Update employee's profile_text (using anonymized summary) and cv_document_uri in database
+        from datetime import datetime
+        profile_text_to_save = cv_summary if cv_summary else full_text
+        await db.execute(
+            update(Employee)
+            .where(Employee.id == emp_uuid)
+            .values(
+                profile_text=profile_text_to_save,
+                cv_document_uri=file_path,
+                updated_at=datetime.utcnow()
+            )
+        )
+        await db.commit()
 
         # ------------------------------------------------------------------
         # 7. Embed chunks with Ollama nomic-embed-text
@@ -424,6 +487,7 @@ async def upload_cv(
             f"CV successfully ingested. {chunks_ingested} chunk(s) embedded "
             f"into ChromaDB collection 'employee_profiles'."
         ),
+        summary=cv_summary,
     )
 
 

@@ -173,3 +173,33 @@ export function categoryBadge(cat: ProposalCategory) {
     case 'hiring':   return { cls: 'badge badge-red',    dot: '🔴', label: 'Hiring Recommendation' }
   }
 }
+
+// ─── Financial helpers ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the effective hourly bill rate for a proposal.
+ *
+ * `projected_margin` is the canonical figure produced by the backend (it is
+ * what the action queue lists). `ProjectDemand.target_bill_rate` is nullable,
+ * so when it is missing we derive the bill rate from the employee's cost rate
+ * and the canonical margin — bill = cost / (1 - margin/100) — instead of
+ * fabricating a default. This keeps the HITL financial block consistent with
+ * the projected margin shown in the queue.
+ */
+export function resolveBillRate(
+  targetBillRate: number | null | undefined,
+  costRate: number | null | undefined,
+  margin: number | null | undefined,
+): number {
+  const round2 = (n: number) => Math.round(n * 100) / 100
+
+  const bill = Number(targetBillRate)
+  if (Number.isFinite(bill) && bill > 0) return round2(bill)
+
+  const cost = Number(costRate)
+  const m = Number(margin)
+  if (cost > 0 && Number.isFinite(m) && m !== 0 && m < 100) {
+    return round2(cost / (1 - m / 100))
+  }
+  return 0
+}

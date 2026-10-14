@@ -34,6 +34,7 @@ function CVUploadSection({
   const [uploading, setUploading] = useState(false)
   const [uploadMsg, setUploadMsg] = useState('')
   const [uploadError, setUploadError] = useState('')
+  const [uploadSummary, setUploadSummary] = useState<string | null>(null)
 
   useEffect(() => {
     api.getEmployeeDocuments(employeeId)
@@ -47,11 +48,13 @@ function CVUploadSection({
     setUploading(true)
     setUploadMsg('')
     setUploadError('')
+    setUploadSummary(null)
     try {
       const result = await api.uploadDocument(selectedFile, employeeId, 'cv')
       setUploadMsg(
         `✓ Ingested ${result.chunks_ingested} chunk(s) into ChromaDB. Status: ${result.ingestion_status}`,
       )
+      setUploadSummary(result.summary ?? null)
       setSelectedFile(null)
       // Refresh document list
       const docs = await api.getEmployeeDocuments(employeeId)
@@ -95,6 +98,16 @@ function CVUploadSection({
         </div>
         {uploadMsg && <p className="text-xs text-green-600 font-mono">{uploadMsg}</p>}
         {uploadError && <p className="text-xs text-red-600 font-mono">{uploadError}</p>}
+        {uploadSummary && (
+          <div className="border border-blue-200 bg-blue-50 p-3">
+            <p className="text-[10px] font-mono text-blue-500 uppercase tracking-wider mb-1">
+              AI Anonymized CV Summary (personal data removed)
+            </p>
+            <p className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
+              {uploadSummary}
+            </p>
+          </div>
+        )}
         <p className="text-[10px] text-gray-400 font-mono">
           PDF is extracted, chunked and embedded into ChromaDB for AI matching.
         </p>
@@ -207,7 +220,8 @@ function PersonalDetails({
         </div>
       </div>
 
-      {/* Current CV — raw extracted text is intentionally not shown to employees */}
+      {/* Current CV — the raw extracted text is intentionally not shown; the
+          AI-generated anonymized summary (stored as profile_text) is. */}
       <div className="bg-white border border-gray-200">
         <div className="section-header flex items-center justify-between">
           <div>
@@ -223,6 +237,16 @@ function PersonalDetails({
             <span>📄</span> View Current PDF ↗
           </a>
         </div>
+        {emp.profile_text && (
+          <div className="px-5 pb-5">
+            <p className="text-[10px] font-mono text-gray-400 uppercase tracking-wider mb-1.5">
+              AI Anonymized Profile Summary
+            </p>
+            <p className="text-xs text-gray-700 whitespace-pre-wrap leading-relaxed border border-gray-100 bg-gray-50 p-3 max-h-64 overflow-y-auto">
+              {emp.profile_text}
+            </p>
+          </div>
+        )}
       </div>
 
       {/* PDF Upload */}

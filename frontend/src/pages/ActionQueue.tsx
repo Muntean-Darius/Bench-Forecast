@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
-import { categoryBadge, marginColor, type ProposalCategory } from '../types'
+import { categoryBadge, marginColor, resolveBillRate, type ProposalCategory } from '../types'
 import { format } from 'date-fns'
 
 const CATEGORY_FILTERS: { value: ProposalCategory | 'all'; label: string }[] = [
@@ -18,7 +18,12 @@ const CATEGORY_FILTERS: { value: ProposalCategory | 'all'; label: string }[] = [
 
 function allocationToProposal(a: any) {
   const matchScore = a.ai_match_score ? Number(a.ai_match_score) : 0
-  const margin = a.ai_projected_margin ? Number(a.ai_projected_margin) : 0
+  const margin = a.ai_projected_margin != null ? Number(a.ai_projected_margin) : 0
+  const costRate = Number(a.employee?.hourly_cost_rate ?? a.employee?.cost_rate ?? 0)
+  // Prefer the demand's real bill rate; if ProjectDemand.target_bill_rate is
+  // null, derive it from the canonical margin + cost so the HITL financial
+  // block matches the projected margin shown here instead of a fake default.
+  const billRate = resolveBillRate(a.project_demand?.target_bill_rate, costRate, margin)
 
   // Classification rules:
   //   • 'hiring' is reserved strictly for unassigned roles (no employee_id) or
@@ -70,7 +75,7 @@ function allocationToProposal(a: any) {
       seniority: seniority,
       primary_role: primaryRole,
       id: String(a.employee_id),
-      hourly_cost_rate: Number(a.employee?.hourly_cost_rate ?? a.employee?.cost_rate ?? 0),
+      hourly_cost_rate: costRate,
       experience_years: Number(a.employee?.experience_years ?? 0),
       skills: skills,
     },
@@ -79,7 +84,7 @@ function allocationToProposal(a: any) {
       id: String(a.demand_id || a.id),
       start_date: new Date().toISOString(),
       headcount: a.project_demand?.headcount_needed ?? 1,
-      target_bill_rate: a.project_demand?.target_bill_rate ? Number(a.project_demand.target_bill_rate) : 100,
+      target_bill_rate: billRate,
       required_skills: requiredSkills.length > 0 ? requiredSkills.join(', ') : null,
       project_id: String(a.project_id || ''),
       status: 'Open' as const,
@@ -211,6 +216,10 @@ export default function ActionQueue() {
           cat = 'direct'
         }
 
+        const costRate = Number(d.hourly_cost_rate ?? 0)
+        const margin = Number(d.projected_margin ?? 0)
+        const billRate = resolveBillRate(d.target_bill_rate, costRate, margin)
+
         return {
           id: `decision-${i}`,
           category: cat,
@@ -220,7 +229,7 @@ export default function ActionQueue() {
             seniority: d.seniority || 'Mid',
             primary_role: d.role_title || 'Engineer',
             id: String(d.employee_id ?? ''),
-            hourly_cost_rate: d.hourly_cost_rate ?? 0,
+            hourly_cost_rate: costRate,
             experience_years: d.experience_years ?? 3,
             skills: d.skills
               ? (typeof d.skills === 'string' ? d.skills.split(',') : d.skills)
@@ -231,7 +240,7 @@ export default function ActionQueue() {
             id: String(d.role_id ?? `r-${i}`),
             start_date: new Date().toISOString(),
             headcount: 1,
-            target_bill_rate: d.target_bill_rate ?? 100,
+            target_bill_rate: billRate,
             required_skills: null,
             project_id: String(d.target_project_id ?? ''),
             status: 'Open' as const,
@@ -245,7 +254,7 @@ export default function ActionQueue() {
             total_budget: 0,
           },
           match_score: d.match_score ?? d.similarity_score ?? 0.85,
-          projected_margin: d.projected_margin ?? 28.5,
+          projected_margin: margin,
           missing_skills: (d.missing_skills || []) as string[],
           reasoning: d.justification ?? 'AI recommendation from allocation optimization engine.',
           training_recommendation: d.upskilling_path ?? null,
@@ -413,7 +422,7 @@ export default function ActionQueue() {
                     <div>
                       <p className="text-[10px] font-mono text-gray-400 uppercase">Projected Margin</p>
                       <p className={clsx('text-sm font-semibold tabnum', marginColor(proposal.projected_margin))}>
-                        {proposal.projected_margin > 0 ? `${proposal.projected_margin.toFixed(1)}%` : '—'}
+                        {proposal.projected_margin !== 0 ? `${proposal.projected_margin.toFixed(1)}%` : '—'}
                       </p>
                     </div>
                   </div>

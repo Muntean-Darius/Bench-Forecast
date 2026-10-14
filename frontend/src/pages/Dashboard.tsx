@@ -4,7 +4,7 @@ import {
   Tooltip, Legend, ResponsiveContainer,
 } from 'recharts'
 import clsx from 'clsx'
-import { marginColor, categoryBadge, type PendingAllocation } from '../types'
+import { marginColor, categoryBadge, type PendingAllocation, type ProposalCategory } from '../types'
 import { useNavigate } from 'react-router-dom'
 import { format } from 'date-fns'
 import { api } from '../api/client'
@@ -144,8 +144,15 @@ function QuickActions({ allocations, loading }: { allocations: PendingAllocation
           <tbody>
             {urgent.map((a) => {
               const matchScore = a.ai_match_score ? Number(a.ai_match_score) : 0
-              const margin = a.ai_projected_margin ? Number(a.ai_projected_margin) : 0
-              const cat = matchScore >= 0.75 ? 'direct' : 'training'
+              const margin = a.ai_projected_margin != null ? Number(a.ai_projected_margin) : null
+              // Training status is driven by the backend's skill-gap signal
+              // (upskilling path), never by the match score alone — matching
+              // the classification used by the AI Action Queue.
+              const cat: ProposalCategory = !a.employee_id
+                ? 'hiring'
+                : a.ai_upskilling_path
+                  ? 'training'
+                  : 'direct'
               const { cls, dot, label } = categoryBadge(cat)
               return (
                 <tr key={String(a.id)}>
@@ -153,8 +160,8 @@ function QuickActions({ allocations, loading }: { allocations: PendingAllocation
                   <td className="text-gray-600 max-w-[200px] truncate">{a.role_on_project}</td>
                   <td><span className={cls}>{dot} {label}</span></td>
                   <td className="text-right tabnum">{matchScore > 0 ? `${Math.round(matchScore * 100)}%` : '—'}</td>
-                  <td className={clsx('text-right tabnum font-mono', marginColor(margin))}>
-                    {margin > 0 ? `${margin.toFixed(1)}%` : '—'}
+                  <td className={clsx('text-right tabnum font-mono', margin != null ? marginColor(margin) : 'text-gray-400')}>
+                    {margin != null ? `${margin.toFixed(1)}%` : '—'}
                   </td>
                   <td className="text-right">
                     <button

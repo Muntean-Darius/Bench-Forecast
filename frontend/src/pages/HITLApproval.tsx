@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import clsx from 'clsx'
-import { categoryBadge, marginColor } from '../types'
+import { categoryBadge, marginColor, resolveBillRate } from '../types'
 import { format } from 'date-fns'
 import { api } from '../api/client'
 import { useAuth } from '../contexts/AuthContext'
@@ -31,13 +31,13 @@ function MarginBlock({
         <div className="text-center">
           <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Bill Rate</p>
           <p className="text-xl font-semibold tabnum text-green-700">
-            {billRate > 0 ? `€${billRate}/h` : '—'}
+            {billRate > 0 ? `€${billRate.toFixed(2)}/h` : '—'}
           </p>
         </div>
         <div className="text-center">
           <p className="text-[10px] font-mono text-gray-400 uppercase mb-1">Cost Rate</p>
           <p className="text-xl font-semibold tabnum text-red-600">
-            {costRate > 0 ? `€${costRate}/h` : '—'}
+            {costRate > 0 ? `€${costRate.toFixed(2)}/h` : '—'}
           </p>
         </div>
         <div className="text-center">
@@ -56,18 +56,22 @@ function MarginBlock({
         <div>
           <p className="text-xs font-mono text-gray-500">Projected Margin</p>
           <p className={clsx('text-3xl font-bold tabnum mt-0.5', marginColor(margin))}>
-            {margin > 0 ? `${margin.toFixed(2)}%` : '—'}
+            {Number.isFinite(margin) ? `${margin.toFixed(2)}%` : '—'}
           </p>
         </div>
         <div className="text-right">
           <p className="text-xs font-mono text-gray-500">vs Target ({targetMargin}%)</p>
-          {margin > 0 && (
+          {Number.isFinite(margin) && (
             <p className={clsx('text-2xl font-bold tabnum mt-0.5', isHealthy ? 'text-green-700' : 'text-red-600')}>
               {isHealthy ? '+' : ''}{delta.toFixed(2)}%
             </p>
           )}
-          <p className={clsx('text-xs font-mono mt-1', isHealthy ? 'text-green-600' : 'text-red-500')}>
-            {margin > 0 ? (isHealthy ? '✓ Above target' : '✗ Below target margin') : 'N/A — no bill rate data'}
+          <p className={clsx('text-xs font-mono mt-1', billRate <= 0 ? 'text-gray-400' : isHealthy ? 'text-green-600' : 'text-red-500')}>
+            {billRate <= 0
+              ? 'N/A — no bill rate data'
+              : isHealthy
+                ? '✓ Above target'
+                : '✗ Below target margin'}
           </p>
         </div>
       </div>
@@ -220,11 +224,16 @@ export default function HITLApproval() {
     ? emp.skills.split(',').map((s: string) => s.trim()).filter(Boolean)
     : []
 
-  const billRate = role.target_bill_rate ?? 0
   const costRate = emp.hourly_cost_rate ?? 0
-  const computedMargin = billRate > 0 && costRate > 0
-    ? ((billRate - costRate) / billRate) * 100
-    : margin
+  const storedMargin = Number(margin ?? 0)
+  // The backend's projected_margin is canonical — it is what the queue lists.
+  // Only recompute from bill/cost when it is unavailable, and derive a missing
+  // bill rate from the canonical margin so this financial block never
+  // contradicts the margin shown in the action queue.
+  const billRate = resolveBillRate(role.target_bill_rate, costRate, storedMargin)
+  const computedMargin = storedMargin !== 0
+    ? storedMargin
+    : (billRate > 0 && costRate > 0 ? ((billRate - costRate) / billRate) * 100 : 0)
 
   let startDateStr = '—'
   try { if (role.start_date) startDateStr = format(new Date(role.start_date), 'dd MMM yyyy') } catch {}
@@ -279,7 +288,7 @@ export default function HITLApproval() {
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Target Bill Rate</p>
                 <p className="font-mono font-semibold text-green-700">
-                  {billRate > 0 ? `€${billRate}/h` : '—'}
+                  {billRate > 0 ? `€${billRate.toFixed(2)}/h` : '—'}
                 </p>
               </div>
               <div>
@@ -333,7 +342,7 @@ export default function HITLApproval() {
               <div>
                 <p className="text-[10px] font-mono text-gray-400 uppercase">Cost Rate</p>
                 <p className="font-mono font-semibold text-red-700">
-                  {costRate > 0 ? `€${costRate}/h` : '—'}
+                  {costRate > 0 ? `€${costRate.toFixed(2)}/h` : '—'}
                 </p>
               </div>
               <div>
