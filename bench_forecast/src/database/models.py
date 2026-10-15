@@ -131,6 +131,12 @@ class HitlDecisionEnum(str, enum.Enum):
     edited_then_approved = "edited_then_approved"
 
 
+class HiringRecommendationStatusEnum(str, enum.Enum):
+    open = "open"
+    dismissed = "dismissed"
+    fulfilled = "fulfilled"
+
+
 # ---------------------------------------------------------------------------
 # Mixin: auto-managed timestamps
 # ---------------------------------------------------------------------------
@@ -909,6 +915,12 @@ class ForecastRun(Base):
     ragas_answer_relevance: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4), nullable=True)
     ragas_context_recall: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4), nullable=True)
 
+    # Run observability / evaluation metrics
+    decision_metrics: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    latency_seconds: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    llm_provider: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    llm_model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+
 
 class ProjectDemand(TimestampMixin, Base):
     __tablename__ = "project_demands"
@@ -939,6 +951,51 @@ class HitlReviewEvent(Base):
     rejection_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     time_to_decision_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+
+class HiringRecommendation(TimestampMixin, Base):
+    """External-hire recommendation raised when no bench employee fits a role.
+
+    Produced either by the forecast pipeline (when the allocation decider
+    recommends an external hire for a demand) or by the HITL reject flow when
+    the manager's feedback requires a skill no bench candidate possesses
+    (e.g. "I need someone who already knows Go").
+    """
+
+    __tablename__ = "hiring_recommendations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    demand_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("project_demands.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    role: Mapped[str] = mapped_column(String(200), nullable=False)
+    required_skills: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    headcount: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    justification: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[HiringRecommendationStatusEnum] = mapped_column(
+        SQLEnum(HiringRecommendationStatusEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+        default=HiringRecommendationStatusEnum.open,
+        index=True,
+    )
+    forecast_run_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("forecast_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    project: Mapped[Optional["Project"]] = relationship("Project", foreign_keys=[project_id])
+
+    @property
+    def project_name(self) -> Optional[str]:
+        return self.project.name if self.project else None
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<HiringRecommendation id={self.id} role='{self.role}' status='{self.status}'>"
 
 
 class KpiSnapshot(Base):

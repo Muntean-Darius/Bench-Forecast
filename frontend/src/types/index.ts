@@ -117,6 +117,19 @@ export interface PendingAllocation {
 
 // ─── Document types ───────────────────────────────────────────────────────────
 
+export interface HiringRecommendation {
+  id: string
+  project_id?: string | null
+  project_name?: string | null
+  demand_id?: string | null
+  role: string
+  required_skills: string[]
+  headcount: number
+  justification?: string | null
+  status: string
+  created_at?: string | null
+}
+
 export interface DocumentMetadata {
   document_id: string
   employee_id: string

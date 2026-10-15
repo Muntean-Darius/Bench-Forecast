@@ -1,9 +1,9 @@
 """ChromaDB upsert logic for the employee_profiles collection.
 
-This module is the authoritative writer to ChromaDB in Phase 2.
-It connects to ChromaDB in HTTP client mode (pointing at the Docker
-container on CHROMA_HOST:CHROMA_PORT) and upserts pre-computed embeddings
-together with their chunk text and employee metadata.
+Writes go through the single shared embedded client in
+``src/database/chroma_client.py`` so CV-upload ingestion lands in the SAME
+store the agent reads from. It upserts pre-computed embeddings together with
+their chunk text and employee metadata.
 
 Collection schema (matches plan.md §5)::
 
@@ -62,41 +62,12 @@ class ChromaIngestionStore:
     """
 
     def __init__(self, collection_name: str = _COLLECTION_NAME) -> None:
-        import chromadb  # noqa: PLC0415
-
-        from src.core.config import Config  # noqa: PLC0415
+        # Use the single shared client/collection so CV-upload ingestion writes
+        # to the SAME store the agent reads from (see chroma_client.py).
+        from src.database.chroma_client import get_employee_collection
 
         self._collection_name = collection_name
-
-        # Prefer HTTP client (docker-compose service) for consistency across
-        # the API and seed scripts.  Fall back to PersistentClient for local dev.
-        try:
-            self._client = chromadb.HttpClient(
-                host=Config.CHROMA_HOST,
-                port=Config.CHROMA_PORT,
-            )
-            # Smoke-test: will raise if the server isn't running
-            self._client.heartbeat()
-            logger.info(
-                "ChromaIngestionStore: connected via HttpClient to %s:%s",
-                Config.CHROMA_HOST,
-                Config.CHROMA_PORT,
-            )
-        except Exception as exc:
-            logger.warning(
-                "ChromaDB HTTP server not reachable (%s). "
-                "Falling back to PersistentClient at '%s'.",
-                exc,
-                Config.CHROMA_PERSIST_DIR,
-            )
-            import os  # noqa: PLC0415
-            os.makedirs(Config.CHROMA_PERSIST_DIR, exist_ok=True)
-            self._client = chromadb.PersistentClient(path=Config.CHROMA_PERSIST_DIR)
-
-        self._collection = self._client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._collection = get_employee_collection()
         logger.info(
             "ChromaIngestionStore: collection '%s' ready (%d existing docs)",
             collection_name,
@@ -166,12 +137,18 @@ class ChromaIngestionStore:
             metadatas.append(
                 {
                     "employee_id": str(employee_id),
+                    # Canonical keys shared with the seeder / agent retrievers:
+                    "id": str(employee_id),
+                    "name": employee_name,
                     "employee_name": employee_name,
                     "document_id": base_id,
                     "chunk_index": i,
                     "document_type": document_type,
                     "experience_level": experience_level,
+                    # `hourly_cost_rate` is what RAGPipeline's financial pre-filter
+                    # queries on; keep internal_hourly_cost for backward compat.
                     "internal_hourly_cost": float(internal_hourly_cost),
+                    "hourly_cost_rate": float(internal_hourly_cost),
                 }
             )
 

@@ -788,11 +788,11 @@ export default function BenchPipeline() {
   const loadData = async () => {
     try {
       const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
-      const minWinProb = Number(localStorage.getItem('bf_min_win_prob') ?? 0.5)
+      const minWinProb = Number(localStorage.getItem('bf_min_win_prob') ?? 0.75)
 
       const [empData, demData] = await Promise.all([
         api.getEmployees(horizonDays),
-        api.getDemands(minWinProb),
+        api.getDemands(minWinProb, horizonDays),
       ])
 
       setEmployees((empData as any[]).map(normalizeEmployee))

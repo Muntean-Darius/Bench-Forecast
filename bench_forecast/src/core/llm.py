@@ -251,6 +251,28 @@ class LLMFactory:
                 num_predict=8192,
             )
 
+        elif provider in ("openai_compatible", "openai-compatible"):
+            # Any OpenAI-compatible /chat/completions endpoint: OpenCode Go,
+            # Groq, vLLM, LM Studio, Together, etc. Embeddings still come from
+            # Ollama (configured separately) unless changed here.
+            if not (Config.LLM_BASE_URL and Config.LLM_API_KEY):
+                raise ValueError(
+                    "LLM_PROVIDER=openai_compatible requires LLM_BASE_URL and "
+                    "LLM_API_KEY to be set in .env."
+                )
+            from langchain_openai import ChatOpenAI  # noqa: PLC0415
+
+            logger.info(
+                f"Initializing OpenAI-compatible client: model={Config.LLM_MODEL} "
+                f"base_url={Config.LLM_BASE_URL}"
+            )
+            return ChatOpenAI(
+                base_url=Config.LLM_BASE_URL,
+                api_key=Config.LLM_API_KEY,
+                model=model_name or Config.LLM_MODEL,
+                temperature=0.3,
+            )
+
         else:
             raise ValueError(f"Unknown LLM provider: '{provider}'")
 
@@ -658,6 +680,69 @@ Respond with ONLY the JSON object, no additional text."""
         return SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)
 
     @staticmethod
+    def build_batch_matching_prompt(
+        candidates: List[Dict[str, Any]],
+        job_description: str,
+        required_skills: List[str],
+    ) -> tuple:
+        """Score ALL candidates for one role in a single LLM call.
+
+        ``candidates`` is a list of ``{"employee": <emp dict>, "passages": [str]}``.
+        Returns ``(system, human)`` messages asking for a JSON object
+        ``{"matches": [{employee_id, match_score, reasoning, missing_skills,
+        training_recommendation}]}`` — one entry per candidate.
+
+        Batching keeps the same LLM matching work while turning N round-trips
+        (one per candidate) into a single call per role.
+        """
+        system_prompt = """You are an expert talent manager matching candidates to an open role.
+
+CRITICAL: Respond with ONLY valid JSON (no markdown, no prose).
+
+Return a single JSON object of this exact shape:
+{
+  "matches": [
+    {
+      "employee_id": "string",
+      "match_score": 0.0,
+      "reasoning": "string (>= 20 chars, cite specific skills from the candidate)",
+      "missing_skills": ["skill1"],
+      "training_recommendation": "string or null"
+    }
+  ]
+}
+
+Rules:
+- Return ONE entry for EVERY candidate provided, using their exact employee_id.
+- match_score: float 0.0-1.0 from skill overlap + semantic/experience fit.
+- missing_skills: required skills the candidate does not demonstrate.
+- training_recommendation: if match_score >= 0.6 and skills are missing, suggest
+  a 2-4 week plan for the top missing skill; otherwise null.
+"""
+
+        blocks = []
+        for c in candidates:
+            emp = c.get("employee", {})
+            skills = ", ".join(emp.get("skills") or [])
+            passages = "\n".join(c.get("passages") or [])[:1200]
+            blocks.append(
+                f"CANDIDATE employee_id={emp.get('id')}\n"
+                f"Name: {emp.get('name') or emp.get('full_name') or ''}\n"
+                f"Title: {emp.get('job_title') or ''} | Seniority: {emp.get('seniority') or ''}\n"
+                f"Skills: {skills}\n"
+                f"Profile excerpt: {passages}"
+            )
+
+        human_prompt = (
+            f"OPEN ROLE: {job_description}\n"
+            f"Required skills: {', '.join(required_skills or [])}\n\n"
+            f"Score each of the following {len(candidates)} candidate(s):\n\n"
+            + "\n\n---\n\n".join(blocks)
+            + "\n\nRespond with ONLY the JSON object."
+        )
+        return SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)
+
+    @staticmethod
     def build_planning_prompt(
         matches: List[Dict[str, Any]],
         employees_count: int,
@@ -708,7 +793,9 @@ def _format_candidates_block(
                 f"   Matching skills: {', '.join(matched) if matched else 'none'} | "
                 f"Missing skills: {', '.join(missing) if missing else 'none'}"
             )
-        excerpt = (c.get("document_excerpt") or "")[:200]
+        # Ground the LLM in the retrieved CV passage (longer excerpt gives the
+        # model real evidence to reason over, not just the numeric scores).
+        excerpt = (c.get("document_excerpt") or "")[:600]
         if excerpt:
             lines.append(f"   CV Excerpt: {excerpt}")
         lines.append("")

@@ -82,6 +82,41 @@ class AllocationPendingResponse(BaseModel):
     
     model_config = ConfigDict(from_attributes=True)
 
+class HiringRecommendationResponse(BaseModel):
+    id: UUID
+    project_id: Optional[UUID] = None
+    project_name: Optional[str] = None
+    demand_id: Optional[UUID] = None
+    role: str
+    required_skills: List[str] = []
+    headcount: int = 1
+    justification: Optional[str] = None
+    status: str
+    created_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("required_skills", mode="before")
+    @classmethod
+    def _normalize_required_skills(cls, v):
+        if not v:
+            return []
+        if isinstance(v, dict):
+            inner = v.get("skills")
+            if isinstance(inner, (list, tuple, set)):
+                return [str(s) for s in inner]
+            return [str(k) for k in v.keys()]
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(s) for s in v]
+        return [str(v)]
+
+
+class DismissHiringRequest(BaseModel):
+    reviewer_id: Optional[UUID] = None
+
+
 class RejectRequest(BaseModel):
     feedback: str
     reviewer_id: UUID

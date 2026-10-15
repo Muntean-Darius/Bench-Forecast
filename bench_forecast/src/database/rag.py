@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_COLLECTION = "employee_cvs"
+DEFAULT_COLLECTION = "employee_profiles"
 DEFAULT_CHUNK_SIZE = 512    # Characters per text chunk
 DEFAULT_CHUNK_OVERLAP = 64  # Overlapping characters between consecutive chunks
 
@@ -114,29 +114,21 @@ class RAGPipeline:
                               Defaults to <project_root>/data/chroma_store.
             collection_name:  ChromaDB collection name.
         """
-        if persist_dir is None:
-            base_dir = Path(__file__).resolve().parents[2]
-            self.persist_dir = str(base_dir / "chroma_data")
-        else:
-            self.persist_dir = persist_dir
-
-        os.makedirs(self.persist_dir, exist_ok=True)
-
-        self.client = chromadb.PersistentClient(path=self.persist_dir)
-        
-        from chromadb.utils import embedding_functions
+        # Always use the single shared client/collection (see chroma_client.py).
         from src.core.config import Config
-        self.embedding_fn = embedding_functions.OllamaEmbeddingFunction(
-            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
-            model_name=Config.EMBEDDING_MODEL,
+        from src.database.chroma_client import (
+            EMPLOYEE_COLLECTION,
+            get_chroma_client,
+            get_embedding_function,
+            get_employee_collection,
         )
 
-        self.collection = self.client.get_or_create_collection(
-            name="employee_profiles",
-            metadata={"hnsw:space": "cosine"},
-        )
+        self.persist_dir = Config.CHROMA_PERSIST_DIR
+        self.client = get_chroma_client()
+        self.embedding_fn = get_embedding_function()
+        self.collection = get_employee_collection()
         logger.info(
-            f"RAGPipeline initialised: collection='{collection_name}' "
+            f"RAGPipeline initialised: collection='{EMPLOYEE_COLLECTION}' "
             f"docs={self.collection.count()} persist_dir={self.persist_dir}"
         )
 

@@ -44,6 +44,7 @@ function CVUploadSection({
   const [uploadMsg, setUploadMsg] = useState('')
   const [uploadError, setUploadError] = useState('')
   const [uploadSummary, setUploadSummary] = useState<string | null>(null)
+  const [uploadSkills, setUploadSkills] = useState<string[]>([])
 
   useEffect(() => {
     api.getEmployeeDocuments(employeeId)
@@ -58,12 +59,14 @@ function CVUploadSection({
     setUploadMsg('')
     setUploadError('')
     setUploadSummary(null)
+    setUploadSkills([])
     try {
       const result = await api.uploadDocument(selectedFile, employeeId, 'cv')
       setUploadMsg(
         `Ingested ${result.chunks_ingested} chunk(s) into ChromaDB. Status: ${result.ingestion_status}`,
       )
-      setUploadSummary(result.profile_summary ?? null)
+      setUploadSummary(result.summary ?? result.profile_summary ?? null)
+      setUploadSkills(Array.isArray(result.extracted_skills) ? result.extracted_skills : [])
       setSelectedFile(null)
       // Refresh document list
       const docs = await api.getEmployeeDocuments(employeeId)
@@ -119,6 +122,18 @@ function CVUploadSection({
           </p>
         )}
         {uploadError && <p className="text-xs text-red-600 font-mono">{uploadError}</p>}
+        {uploadSkills.length > 0 && (
+          <div className="border border-green-200 bg-green-50 p-3 rounded">
+            <p className="text-[10px] font-mono text-green-700 uppercase tracking-wider mb-1.5">
+              Skills extracted from CV ({uploadSkills.length})
+            </p>
+            <div className="flex flex-wrap gap-1">
+              {uploadSkills.map((skill, i) => (
+                <span key={i} className="badge badge-green text-[11px]">{skill}</span>
+              ))}
+            </div>
+          </div>
+        )}
         {uploadSummary && (
           <div className="border border-blue-200 bg-blue-50 p-3 rounded">
             <p className="text-[10px] font-mono text-blue-500 uppercase tracking-wider mb-1">

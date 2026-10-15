@@ -228,7 +228,6 @@ export default function HITLApproval() {
     }
   }, [id, proposal])
 
-  const forecastRunId: string = state?.forecastRunId || sessionStorage.getItem('bf_cached_forecast_run_id') || ''
   const allocationId: string = state?.allocationId ?? id ?? ''
 
   if (!proposal) {
@@ -314,14 +313,6 @@ export default function HITLApproval() {
     const timeToDecision = (Date.now() - decisionStartTime) / 1000
 
     try {
-      if (forecastRunId) {
-        await api.reviewForecast(
-          forecastRunId,
-          action === 'approved' || action === 'training',
-          action === 'rejected' ? feedback : undefined,
-        )
-      }
-
       if (allocationId && user?.id) {
         if (action === 'approved' || action === 'training') {
           try {
@@ -389,12 +380,12 @@ export default function HITLApproval() {
           <h2 className="text-xl font-bold text-gray-900 tracking-tight">
             {decision === 'approved'  ? 'Direct Allocation Approved' :
              decision === 'training'  ? 'Upskilling & Training Allocation Approved' :
-                                        'Proposal Rejected · AI Graph Re-evaluation Triggered' }
+                                        'Proposal Rejected · AI Re-evaluation Triggered' }
           </h2>
           <p className="text-sm text-gray-600 mt-2 max-w-lg leading-relaxed">
             {decision === 'approved'  ? `${emp.full_name} is now successfully staffed to ${project.name} as ${role.title}.` :
              decision === 'training'  ? `Training pathway initiated for ${emp.full_name}. Staffing will take effect following upskilling milestones.` :
-                                        'Rejection feedback submitted to LangGraph engine for candidate re-selection.' }
+                                        'Rejection feedback recorded. The engine is re-selecting a candidate for this role (or will recommend an external hire if none qualifies).' }
           </p>
           {decision === 'rejected' && feedback && (
             <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded text-xs text-gray-600 font-mono text-left max-w-md mx-auto">
@@ -794,7 +785,7 @@ export default function HITLApproval() {
           </div>
 
           <p className="text-[11px] text-gray-400 font-mono mt-3 text-center">
-            HITL State Machine: Approved proposals transition to approved_by_manager. Rejections trigger LangGraph revision node.
+            HITL State Machine: Approved proposals transition to approved_by_manager; rejections trigger AI candidate re-selection (or an external-hire recommendation).
           </p>
         </div>
 

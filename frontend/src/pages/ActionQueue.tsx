@@ -3,19 +3,23 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
 import { categoryBadge, marginColor, type ProposalCategory } from '../types'
+import type { HiringRecommendation } from '../types'
 import { format } from 'date-fns'
 import {
   PlayIcon,
   SpinnerIcon,
   BoltIcon,
+  BriefcaseIcon,
   DirectEmotion,
   TrainingEmotion,
+  HiringEmotion,
 } from '../components/icons/Icons'
 
 const CATEGORY_FILTERS: { value: ProposalCategory | 'all'; label: string }[] = [
   { value: 'all',      label: 'All Proposals' },
   { value: 'direct',   label: 'Direct Allocation' },
   { value: 'training', label: 'Training Allocation' },
+  { value: 'hiring',   label: 'External Hiring' },
 ]
 
 // ─── Transform a PendingAllocation into a UI proposal shape ──────────────────
@@ -175,7 +179,9 @@ export default function ActionQueue() {
   const [forecastRunId, setForecastRunId] = useState<string>(() => {
     return sessionStorage.getItem('bf_cached_forecast_run_id') || ''
   })
+  const [hiringRecs, setHiringRecs] = useState<HiringRecommendation[]>([])
   const [loading, setLoading] = useState(false)
+  const [runElapsed, setRunElapsed] = useState(0)
   const [fetchingPending, setFetchingPending] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -202,50 +208,76 @@ export default function ActionQueue() {
     fetchProjects()
   }, [])
 
-  // Load pending allocations on mount
-  useEffect(() => {
-    async function loadPending() {
-      try {
-        const data = await api.getPendingAllocations()
-        if (data && data.length > 0) {
-          const dbProposals = data.map(allocationToProposal)
-          setProposals(dbProposals)
-          sessionStorage.setItem('bf_cached_proposals', JSON.stringify(dbProposals))
-        }
-      } catch (e) {
-        console.error('Failed to load pending allocations:', e)
-      } finally {
-        setFetchingPending(false)
-      }
+  // Load pending allocations + external-hire recommendations from the DB.
+  async function refreshQueue() {
+    try {
+      const [pendingData, hiringData] = await Promise.all([
+        api.getPendingAllocations(),
+        api.getPendingHiring().catch(() => []),
+      ])
+      const dbProposals = (pendingData && pendingData.length > 0)
+        ? pendingData.map(allocationToProposal)
+        : []
+      setProposals(dbProposals)
+      sessionStorage.setItem('bf_cached_proposals', JSON.stringify(dbProposals))
+      setHiringRecs(Array.isArray(hiringData) ? hiringData : [])
+    } catch (e) {
+      console.error('Failed to load the action queue:', e)
+    } finally {
+      setFetchingPending(false)
     }
-    loadPending()
+  }
+
+  useEffect(() => {
+    refreshQueue()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  async function handleDismissHiring(id: string) {
+    try {
+      await api.dismissHiring(id)
+      setHiringRecs((prev) => prev.filter((r) => r.id !== id))
+    } catch (e) {
+      console.error('Failed to dismiss hiring recommendation:', e)
+    }
+  }
 
   const selectedProjectObj = useMemo(() => {
     if (selectedProjectId === 'all') return null
     return projects.find((p) => p.id === selectedProjectId) || null
   }, [projects, selectedProjectId])
 
+  // The planner runs as a long background job; poll until it finishes. No
+  // artificial cap — a local model can legitimately take several minutes.
+  async function waitForRun(runId: string) {
+    const start = Date.now()
+    for (;;) {
+      const run = await api.getForecastRun(runId)
+      if (run.status === 'paused_for_review' || run.status === 'completed') return
+      if (run.status === 'failed') throw new Error('Forecast run failed — check the backend logs')
+      setRunElapsed(Math.round((Date.now() - start) / 1000))
+      await new Promise((r) => setTimeout(r, 2500))
+    }
+  }
+
   async function handleRunForecast() {
     setLoading(true)
     setError(null)
+    setRunElapsed(0)
     try {
       const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
+      const minWinProb = Number(localStorage.getItem('bf_min_win_prob') ?? 0.75)
       const targetProjId = selectedProjectId !== 'all' ? selectedProjectId : undefined
 
-      const res = await api.runForecast(horizonDays, targetProjId)
+      const res = await api.runForecast(horizonDays, targetProjId, minWinProb)
 
       setForecastRunId(res.forecast_run_id)
       sessionStorage.setItem('bf_cached_forecast_run_id', res.forecast_run_id)
 
-      // Refresh all pending allocations from database
-      const pendingData = await api.getPendingAllocations()
-      const dbProposals = (pendingData && pendingData.length > 0)
-        ? pendingData.map(allocationToProposal)
-        : []
+      await waitForRun(res.forecast_run_id)
 
-      setProposals(dbProposals)
-      sessionStorage.setItem('bf_cached_proposals', JSON.stringify(dbProposals))
+      // Refresh pending allocations + hiring recommendations from the database
+      await refreshQueue()
     } catch (e: any) {
       console.error(e)
       setError(e.message ?? 'Failed to run forecast')
@@ -269,11 +301,20 @@ export default function ActionQueue() {
     )
   }, [projectProposals, catFilter])
 
+  // Hiring recommendations scoped to the selected project
+  const projectHiring = useMemo(() => {
+    if (selectedProjectId === 'all') return hiringRecs
+    return hiringRecs.filter((h) => String(h.project_id || '') === selectedProjectId)
+  }, [hiringRecs, selectedProjectId])
+
   const counts = {
     direct:   projectProposals.filter((p) => p.category === 'direct').length,
     training: projectProposals.filter((p) => p.category === 'training').length,
-    hiring:   0,
+    hiring:   projectHiring.length,
   }
+
+  const showProposals = catFilter === 'all' || catFilter === 'direct' || catFilter === 'training'
+  const showHiring = catFilter === 'all' || catFilter === 'hiring'
 
   return (
     <div className="p-6 flex flex-col gap-6">
@@ -328,7 +369,7 @@ export default function ActionQueue() {
             {loading ? (
               <>
                 <SpinnerIcon className="w-3.5 h-3.5" />
-                <span>Running Forecast Agent…</span>
+                <span>Running Forecast Agent… {runElapsed > 0 ? `(${runElapsed}s)` : ''}</span>
               </>
             ) : selectedProjectObj ? (
               <>
@@ -359,10 +400,10 @@ export default function ActionQueue() {
           <p className="text-[11px] text-gray-400 mt-0.5">Assigned internal talent · Upskilling path</p>
         </div>
 
-        <div className="card p-4 border-l-4 border-l-gray-300 opacity-60 bg-gray-50/50">
-          <p className="text-xs font-medium text-gray-400 uppercase tracking-wider">Hiring Recommendations</p>
-          <p className="text-2xl font-semibold tabnum mt-1 text-gray-400">0</p>
-          <p className="text-[11px] text-gray-400 mt-0.5">Disabled · 100% internal employee model</p>
+        <div className="card p-4 border-l-4 border-l-red-500">
+          <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">External Hiring</p>
+          <p className="text-2xl font-semibold tabnum mt-1 text-red-600">{counts.hiring}</p>
+          <p className="text-[11px] text-gray-400 mt-0.5">No internal match · recruitment recommended</p>
         </div>
       </div>
 
@@ -382,14 +423,15 @@ export default function ActionQueue() {
             {f.label}
             {f.value !== 'all' && (
               <span className="ml-1.5 badge badge-gray">
-                {counts[f.value as 'direct' | 'training']}
+                {counts[f.value as keyof typeof counts]}
               </span>
             )}
           </button>
         ))}
       </div>
 
-      {/* Proposals list */}
+      {/* Proposals list (allocation proposals only) */}
+      {showProposals && (
       <div className="card divide-y divide-gray-100">
         {fetchingPending && proposals.length === 0 ? (
           <p className="px-4 py-8 text-sm text-center text-gray-400">Loading pending allocations from database…</p>
@@ -492,6 +534,85 @@ export default function ActionQueue() {
           })
         )}
       </div>
+      )}
+
+      {/* External hiring recommendations */}
+      {showHiring && (
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <BriefcaseIcon className="w-3.5 h-3.5 text-red-600" />
+            <h2 className="text-xs font-mono font-bold uppercase tracking-wider text-gray-500">
+              External Hiring Recommendations
+            </h2>
+          </div>
+          <div className="card divide-y divide-gray-100">
+            {projectHiring.length === 0 ? (
+              <div className="px-4 py-8 text-center">
+                <p className="text-sm font-medium text-gray-500">No external hiring recommendations.</p>
+                <p className="text-xs text-gray-400 mt-1 font-mono">
+                  Raised automatically when no bench employee matches a role&apos;s required skills.
+                </p>
+              </div>
+            ) : (
+              projectHiring.map((rec) => (
+                <div key={rec.id} className="px-4 py-4 flex items-start gap-4 hover:bg-gray-50">
+                  <div className="shrink-0 mt-1">
+                    <HiringEmotion />
+                  </div>
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="badge badge-red">External Hiring</span>
+                      <span className="badge badge-blue text-[11px] font-mono">
+                        {rec.project_name || 'Project'}
+                      </span>
+                      {rec.created_at && (
+                        <span className="text-xs text-gray-400 font-mono">
+                          {format(new Date(rec.created_at), 'dd MMM · HH:mm')}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="mt-2.5 flex gap-6 flex-wrap">
+                      <div>
+                        <p className="text-[10px] font-mono text-gray-400 uppercase">Role</p>
+                        <p className="text-sm font-semibold text-gray-900 leading-tight">{rec.role}</p>
+                      </div>
+
+                      <div>
+                        <p className="text-[10px] font-mono text-gray-400 uppercase">Headcount</p>
+                        <p className="text-sm font-semibold tabnum">{rec.headcount}</p>
+                      </div>
+
+                      <div>
+                        <p className="text-[10px] font-mono text-gray-400 uppercase">Required Skills</p>
+                        <div className="flex flex-wrap gap-1 mt-0.5">
+                          {(rec.required_skills || []).map((skill, i) => (
+                            <span key={i} className="badge badge-gray text-[11px]">{skill}</span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+
+                    <p className="mt-2 text-xs text-gray-600 leading-relaxed">
+                      {rec.justification}
+                    </p>
+                  </div>
+
+                  <div className="shrink-0">
+                    <button
+                      onClick={() => handleDismissHiring(rec.id)}
+                      className="btn-ghost text-xs px-3 py-1.5 cursor-pointer"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

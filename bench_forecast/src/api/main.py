@@ -17,6 +17,7 @@ from src.api.routers.documents import router as documents_router
 from src.api.routers.finance import router as finance_router
 from src.api.routers.hitl import router as hitl_router
 from src.api.routers.forecast import router as forecast_router
+from src.api.routers.analytics import router as analytics_router
 
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ app.include_router(documents_router)
 app.include_router(finance_router)
 app.include_router(hitl_router)
 app.include_router(forecast_router)
+app.include_router(analytics_router)
 
 setup_phoenix_tracing()
 
@@ -58,12 +60,22 @@ async def startup():
     logger.info(f"LLM Provider: {Config.LLM_PROVIDER}")
     if Config.LLM_PROVIDER == "groq":
         logger.info(f"Groq Model: {Config.GROQ_MODEL}")
+    elif Config.LLM_PROVIDER == "openai_compatible":
+        logger.info(f"OpenAI-compatible Model: {Config.LLM_MODEL} @ {Config.LLM_BASE_URL}")
     else:
         logger.info(f"Ollama Model: {Config.OLLAMA_MODEL} @ {Config.OLLAMA_BASE_URL}")
     logger.info(f"Database: {Config.SQLITE_DB_PATH}")
     logger.info(f"Phoenix Tracing: {'Enabled' if Config.ENABLE_PHOENIX else 'Disabled'}")
     logger.info("=" * 60)
     Config.validate()
+
+    # Ensure any newly added tables exist (idempotent — only creates missing).
+    try:
+        from src.database.database import init_db_sync
+        init_db_sync()
+        logger.info("✓ Database schema verified/initialised")
+    except Exception as e:
+        logger.warning(f"DB schema init failed (non-fatal): {e}")
 
     from src.auth.auth import init_auth_db
     init_auth_db()
@@ -169,10 +181,10 @@ async def get_employee_portal(employee_id: str):
 
             allocations = []
             for a in alloc_rows:
-                proj_name = None
-                if a.project_name:
-                    proj_name = a.project_name
-                elif a.project_demand and a.project_demand.project:
+                # Allocation has no `project_name` column; resolve the display
+                # name from the linked demand → project, then fall back to the
+                # role label so the portal never raises an AttributeError.
+                if a.project_demand and a.project_demand.project:
                     proj_name = a.project_demand.project.name
                 elif a.role_on_project:
                     proj_name = a.role_on_project
@@ -345,9 +357,12 @@ async def list_models():
     OpenAI-compatible endpoint, returning the active model here avoids the
     spurious ``404 Not Found`` in the server logs.
     """
-    model_id = (
-        Config.GROQ_MODEL if Config.LLM_PROVIDER == "groq" else Config.OLLAMA_MODEL
-    )
+    if Config.LLM_PROVIDER == "groq":
+        model_id = Config.GROQ_MODEL
+    elif Config.LLM_PROVIDER == "openai_compatible":
+        model_id = Config.LLM_MODEL
+    else:
+        model_id = Config.OLLAMA_MODEL
     return {
         "object": "list",
         "data": [
@@ -390,8 +405,8 @@ async def get_employees(horizon_days: int = 90):
                     skills = [s.strip() for s in emp.skills.split(",") if s.strip()]
                 elif emp.job_title:
                     skills = [emp.job_title]
-                if emp.experience_level and emp.experience_level.value not in skills:
-                    skills.append(emp.experience_level.value)
+                # NOTE: seniority is surfaced separately via `experience_level`,
+                # so it is intentionally NOT appended to the skills list.
 
                 cost_rate = float(cost.internal_hourly_cost) if cost and cost.internal_hourly_cost else (
                     float(emp.hourly_cost_rate) if emp.hourly_cost_rate else 0.0
@@ -428,13 +443,14 @@ async def get_employees(horizon_days: int = 90):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/demands", status_code=status.HTTP_200_OK)
-async def get_demands(min_win_probability: float = 0.75):
+async def get_demands(min_win_probability: float = 0.75, horizon_days: int = 365):
     from src.database.database import get_sync_db
     from src.database.models import ProjectDemand, Project, DemandStatusEnum
-    from datetime import date
+    from datetime import date, timedelta
     from sqlalchemy import select
 
     try:
+        cutoff = date.today() + timedelta(days=horizon_days)
         with get_sync_db() as session:
             stmt = (
                 select(ProjectDemand)
@@ -449,6 +465,9 @@ async def get_demands(min_win_probability: float = 0.75):
                     float(d.project.probability) / 100.0 if d.project and d.project.probability else 0.8
                 )
                 if win_prob < min_win_probability:
+                    continue
+                # Only surface roles needed within the forecast horizon.
+                if d.needed_by_date is not None and d.needed_by_date > cutoff:
                     continue
 
                 skills = []

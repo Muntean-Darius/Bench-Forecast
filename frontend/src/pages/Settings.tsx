@@ -49,7 +49,7 @@ export default function Settings() {
 
           <SettingRow
             label="Forecast Horizon"
-            description="Employees finishing projects within this window are included in the next forecast run."
+            description="Look-ahead window. Employees becoming available, and roles needed, within this window are included in the next forecast run."
           >
             <div className="flex items-center gap-2">
               <input

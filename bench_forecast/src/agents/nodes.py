@@ -19,14 +19,22 @@ using logging.info so every transition is fully traceable in production.
 
 import json
 import logging
+import os
 import re
 import uuid
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
+from langchain_core.messages import HumanMessage
 from sqlalchemy import select, or_
+
+# Number of concurrent LLM calls fired within a node. Requires the Ollama
+# server to allow parallelism (OLLAMA_NUM_PARALLEL) to help materially, but it
+# also overlaps embeddings + per-call latency.
+_LLM_PARALLELISM = int(os.getenv("FORECAST_LLM_PARALLELISM", "4"))
 from src.database.database import AsyncSessionLocal
-from src.database.models import Employee, ProjectDemand, BenchStatusEnum, DemandStatusEnum, ForecastRun, Allocation, AllocationStatusEnum
+from src.database.models import Employee, Project, ProjectDemand, BenchStatusEnum, DemandStatusEnum, ForecastRun, Allocation, AllocationStatusEnum
 
 from src.agents.state import MAX_REVISIONS, State
 from src.database.vector_store import VectorStoreManager
@@ -233,6 +241,22 @@ def _derive_required_skills(
     return _extract_skills_from_text(f"{role_title or ''} {role_description or ''}")
 
 
+def _candidate_rank(candidate: Dict[str, Any]) -> tuple:
+    """Rank candidates deterministically.
+
+    Priority order:
+      1. highest fraction of the role's required skills covered,
+      2. strongest blended match score (skill coverage + RAG similarity),
+      3. highest projected margin (financial tie-breaker).
+    """
+    coverage = candidate.get("skill_coverage")
+    return (
+        float(coverage) if coverage is not None else 0.0,
+        float(candidate.get("similarity_score") or 0.0),
+        float(candidate.get("projected_margin_pct") or 0.0),
+    )
+
+
 def _build_upskilling_path(missing_skills: List[str], role_title: str) -> str:
     """Generate a concrete training recommendation naming the missing skills."""
     skills = ", ".join(missing_skills)
@@ -292,7 +316,16 @@ def _build_match_justification(
             g in lower
             for g in ("semantic similarity", "high similarity", "similarity score", "match score")
         )
-        contradicts = action == "allocate" and ("train" in lower or "upskill" in lower)
+        # Drop LLM text that recommends an external hire / says no candidate
+        # fits when we are actually allocating or training someone.
+        hire_language = any(
+            h in lower
+            for h in ("hire", "hiring", "external", "no internal", "no suitable",
+                      "no candidate", "no bench", "not a fit", "cannot be met")
+        )
+        contradicts = action in ("allocate", "train") and hire_language
+        if action == "allocate" and ("train" in lower or "upskill" in lower):
+            contradicts = True
         if not generic and not contradicts:
             parts.append(text)
 
@@ -309,15 +342,19 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
 
     horizon_days: int = state.get("horizon_days", 90)
     min_win_prob: float = state.get("min_win_probability", 0.75)
+    cutoff = date.today() + timedelta(days=horizon_days)
 
     try:
         async with AsyncSessionLocal() as db:
-            # Query active employees on bench or upcoming_bench with their costs
+            # Query active employees on bench or becoming available within the
+            # forecast horizon (upcoming_bench whose availability is inside the
+            # window). bench_start_date is null for immediately-available talent.
             emp_stmt = select(Employee).options(
                 selectinload(Employee.employee_costs)
             ).where(
                 Employee.is_active == True,
-                Employee.bench_status.in_([BenchStatusEnum.bench, BenchStatusEnum.upcoming_bench])
+                Employee.bench_status.in_([BenchStatusEnum.bench, BenchStatusEnum.upcoming_bench]),
+                or_(Employee.bench_start_date.is_(None), Employee.bench_start_date <= cutoff),
             )
             emp_res = await db.execute(emp_stmt)
             employees_db = emp_res.scalars().all()
@@ -379,7 +416,10 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
                 selectinload(ProjectDemand.project)
             ).where(
                 ProjectDemand.status == DemandStatusEnum.open,
-                or_(ProjectDemand.win_probability >= min_win_prob, ProjectDemand.win_probability == None)
+                or_(ProjectDemand.win_probability >= min_win_prob, ProjectDemand.win_probability == None),
+                # Only plan for roles that are actually needed within the
+                # forecast horizon window.
+                or_(ProjectDemand.needed_by_date.is_(None), ProjectDemand.needed_by_date <= cutoff),
             )
             if target_project_id:
                 try:
@@ -457,11 +497,14 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
     all_matches: List[Dict[str, Any]] = []
 
     bench_ids = [str(emp["id"]) for emp in employees if emp.get("id")]
+    bench_by_id = {str(emp["id"]): emp for emp in employees if emp.get("id")}
     where_filter = {"employee_id": {"$in": bench_ids}} if bench_ids else None
 
+    # ---- Phase 1: retrieve candidates + build ONE prompt per demand --------
+    tasks: List[Dict[str, Any]] = []
     for demand in demands:
         rag_query = f"{demand.get('role', '')} {demand.get('description') or ''}"
-        rag_results = vector_mgr.similarity_search(rag_query, k=3, where=where_filter)
+        rag_results = vector_mgr.similarity_search(rag_query, k=5, where=where_filter)
         if rag_results:
             logger.debug(
                 f"skill_matcher: '{demand.get('role')}' RAG top match: "
@@ -469,50 +512,72 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
                 f"(score={rag_results[0].get('similarity_score', 0):.2f})"
             )
 
-        rag_passages_by_emp: Dict[str, List[str]] = {}
-        candidate_ids = set()
+        candidates = []
         for r in rag_results:
             emp_id = r.get("id", "")
-            excerpt = r.get("document_excerpt", "")
-            if emp_id:
-                candidate_ids.add(emp_id)
-            if emp_id and excerpt:
-                rag_passages_by_emp.setdefault(emp_id, []).append(excerpt)
+            emp = bench_by_id.get(emp_id)
+            if not emp:
+                continue
+            passages = [r.get("document_excerpt", "")]
+            if emp.get("profile_text") and emp.get("profile_text") not in passages:
+                passages.append(emp.get("profile_text"))
+            candidates.append({"employee": emp, "passages": passages})
 
-        candidates = [emp for emp in employees if emp.get("id") in candidate_ids]
+        if not candidates:
+            continue
 
-        for employee in candidates:
-            emp_rag = rag_passages_by_emp.get(employee.get("id"), [])
-            if employee.get("profile_text") and employee.get("profile_text") not in emp_rag:
-                emp_rag = [employee.get("profile_text")] + emp_rag
+        sys_msg, human_msg = MatchPromptBuilder.build_batch_matching_prompt(
+            candidates=candidates,
+            job_description=(
+                demand.get("description")
+                or f"{demand.get('role')} requiring: {', '.join(demand.get('required_skills') or [])}"
+            ),
+            required_skills=demand.get("required_skills") or [],
+        )
+        tasks.append({"demand": demand, "sys": sys_msg, "human": human_msg, "candidates": candidates})
 
-            sys_msg, human_msg = MatchPromptBuilder.build_matching_prompt(
-                employee_profile=(
-                    employee.get("profile_text")
-                    or f"{employee.get('name')}: {', '.join(employee.get('skills') or [])}"
-                ),
-                job_description=(
-                    demand.get("description")
-                    or f"{demand.get('role')} requiring: {', '.join(demand.get('required_skills') or [])}"
-                ),
-                required_skills=demand.get("required_skills") or [],
-                employee_skills=employee.get("skills") or [],
-                rag_passages=emp_rag[:3],
-            )
+    # ---- Phase 2: one LLM call per demand, run concurrently ---------------
+    def _invoke(task: Dict[str, Any]) -> str:
+        return llm.invoke([task["sys"], task["human"]]).content
 
-            response = llm.invoke([sys_msg, human_msg])
-            match_json = LLMFactory.parse_json_response(response.content)
+    contents: List[str] = []
+    if tasks:
+        with ThreadPoolExecutor(max_workers=_LLM_PARALLELISM) as executor:
+            contents = list(executor.map(_invoke, tasks))
 
+    logger.info(
+        f"skill_matcher_node: {len(tasks)} role(s) matched "
+        f"({len(tasks)} LLM calls, parallelism={_LLM_PARALLELISM})"
+    )
+
+    # ---- Phase 3: parse each batched response into per-candidate matches ---
+    for task, content in zip(tasks, contents):
+        demand = task["demand"]
+        parsed = LLMFactory.parse_json_response(content)
+        rows = parsed.get("matches") if isinstance(parsed, dict) else parsed
+        if not isinstance(rows, list):
+            rows = []
+
+        passages_by_id = {
+            str(c["employee"].get("id")): c.get("passages") or [] for c in task["candidates"]
+        }
+        valid_ids = set(passages_by_id.keys())
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            emp_id = str(row.get("employee_id") or "")
+            if emp_id not in valid_ids:
+                continue
             match = MatchJustification(
-                employee_id=str(employee.get("id")),
+                employee_id=emp_id,
                 demand_id=str(demand.get("id")),
-                match_score=float(match_json.get("match_score", 0.0)),
-                reasoning=match_json.get("reasoning") or "No reasoning provided",
-                missing_skills=match_json.get("missing_skills", []),
-                training_recommendation=match_json.get("training_recommendation"),
-                rag_passages=emp_rag,
+                match_score=float(row.get("match_score", 0.0) or 0.0),
+                reasoning=row.get("reasoning") or "No reasoning provided",
+                missing_skills=row.get("missing_skills", []) or [],
+                training_recommendation=row.get("training_recommendation"),
+                rag_passages=passages_by_id.get(emp_id, [])[:3],
             )
-
             match_dict = match.model_dump()
             match_dict["target_project_id"] = demand.get("project_id")
             all_matches.append(match_dict)
@@ -528,7 +593,13 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
 # ===========================================================================
 
 def allocation_decider_node(state: State) -> Dict[str, Any]:
-    """Per-role financial optimization using the RAGPipeline financial pre-filter."""
+    """Per-role financial optimization using the RAGPipeline financial pre-filter.
+
+    The LLM evaluates each open role (one call per role, fired CONCURRENTLY) and
+    PROPOSES a candidate. A deterministic post-pass only guards against
+    double-allocating the same person across roles and refines ``allocate`` vs
+    ``train`` from the chosen candidate's actual missing skills.
+    """
     _log_state_entry("allocation_decider_node", state)
 
     demands = state.get("open_demands", [])
@@ -546,6 +617,14 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     # scoring only embeds each employee's CV once per run.
     emp_emb_cache: Dict[str, List[float]] = {}
 
+    bench_employees = state.get("bench_employees", [])
+    bench_ids = [str(emp["id"]) for emp in bench_employees if emp.get("id")]
+    emp_by_id = {str(emp["id"]): emp for emp in bench_employees}
+
+    # ------------------------------------------------------------------
+    # Phase 1 — build the candidate set + prompt per role (no LLM yet).
+    # ------------------------------------------------------------------
+    prepared: List[Dict[str, Any]] = []
     for demand in demands:
         role_title = demand.get("role", "Unknown Role")
         role_description = demand.get("description", "") or role_title
@@ -562,10 +641,6 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
             f"bill_rate=${target_bill_rate:.2f}/h target_margin={target_margin:.1f}%"
         )
 
-        bench_employees = state.get("bench_employees", [])
-        bench_ids = [str(emp["id"]) for emp in bench_employees if emp.get("id")]
-        emp_by_id = {str(emp["id"]): emp for emp in bench_employees}
-
         # Required skills drive both scoring and the training decision. If the
         # demand has none, derive them from the role text against the bench
         # skill vocabulary so scores are still varied and explainable.
@@ -575,14 +650,13 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 role_title, role_description, bench_employees
             )
 
-        # Exclude employees that have already been allocated to earlier demands in this run
         unallocated_bench_ids = [b for b in bench_ids if b not in allocated_employee_ids]
 
         if not unallocated_bench_ids and bench_ids:
             logger.info(
                 f"allocation_decider: all bench employees already allocated — recommending hire for '{role_title}'"
             )
-            decisions.append({
+            prepared.append({"decision": {
                 "action_type": "hire",
                 "employee_id": None,
                 "projected_margin": 0.0,
@@ -594,7 +668,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 "target_bill_rate": target_bill_rate,
                 "target_margin": target_margin,
                 "candidate_count": 0,
-            })
+            }})
             continue
 
         additional_where = {"employee_id": {"$in": unallocated_bench_ids}} if unallocated_bench_ids else None
@@ -618,49 +692,51 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 if str(c.get("employee_id") or c.get("id")) not in allocated_employee_ids
             ]
 
-        # If ChromaDB returned 0 bench candidates, fallback to evaluating unallocated bench employees directly
-        if not candidates and unallocated_bench_ids:
-            logger.info(
-                f"RAG query returned no unallocated bench candidates for '{role_title}'. "
-                f"Evaluating unallocated bench employees directly."
-            )
-            fallback_ids = unallocated_bench_ids
-            profile_texts = [
-                (emp_by_id[b].get("profile_text")
-                 or emp_by_id[b].get("job_title")
-                 or f"{emp_by_id[b].get('name', '')}")
-                for b in fallback_ids
-            ]
-            # Embed the role + each CV on the fly so scores are semantic and
-            # varied even when the vector index is stale/unavailable, then keep
-            # the best-matching bench employees for LLM evaluation.
-            sims = rag.semantic_similarity(
-                role_description, profile_texts, cache=emp_emb_cache
-            )
-            ranked = sorted(
-                zip(fallback_ids, sims), key=lambda pair: pair[1], reverse=True
-            )[:8]
-            for b_id, sim in ranked:
-                emp = emp_by_id[b_id]
-                cost = float(emp.get("hourly_cost") or emp.get("hourly_cost_rate") or 0.0)
-                sen = emp.get("seniority") or emp.get("experience_level") or "Mid"
-                if cost <= 0:
-                    sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
-                    cost = sen_map.get(str(sen).lower(), 65.0)
-                margin = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2) if target_bill_rate > 0 else 0.0
-                emp_skills = _employee_skill_profile(emp)
-                candidates.append({
-                    "employee_id": b_id,
-                    "full_name": emp.get("name") or emp.get("full_name") or f"Employee {b_id[:8]}",
-                    "primary_role": emp.get("job_title") or (emp_skills[0] if emp_skills else "Engineer"),
-                    "seniority": sen,
-                    "hourly_cost_rate": cost,
-                    "bench_start_date": emp.get("available_from") or "",
-                    "similarity_score": float(sim) if sim else None,
-                    "projected_margin_pct": margin,
-                    "document_excerpt": emp.get("profile_text") or f"Skills: {', '.join(emp_skills)}",
-                    "chunk_index": 0,
-                })
+        # ALWAYS evaluate the FULL unallocated bench pool (on top of any RAG
+        # hits) so a strong candidate the vector index ranked poorly is never
+        # missed.
+        if unallocated_bench_ids:
+            existing_ids = {
+                str(c.get("employee_id") or c.get("id")) for c in candidates
+            }
+            fallback_ids = [b for b in unallocated_bench_ids if b not in existing_ids]
+            if fallback_ids:
+                logger.info(
+                    f"Augmenting '{role_title}' candidates with {len(fallback_ids)} "
+                    f"additional unallocated bench employee(s)."
+                )
+                profile_texts = [
+                    (emp_by_id[b].get("profile_text")
+                     or emp_by_id[b].get("job_title")
+                     or f"{emp_by_id[b].get('name', '')}")
+                    for b in fallback_ids
+                ]
+                # Embed the role + each CV on the fly so scores are semantic and
+                # varied even when the vector index is stale/unavailable.
+                sims = rag.semantic_similarity(
+                    role_description, profile_texts, cache=emp_emb_cache
+                )
+                for b_id, sim in zip(fallback_ids, sims):
+                    emp = emp_by_id[b_id]
+                    cost = float(emp.get("hourly_cost") or emp.get("hourly_cost_rate") or 0.0)
+                    sen = emp.get("seniority") or emp.get("experience_level") or "Mid"
+                    if cost <= 0:
+                        sen_map = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
+                        cost = sen_map.get(str(sen).lower(), 65.0)
+                    margin = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2) if target_bill_rate > 0 else 0.0
+                    emp_skills = _employee_skill_profile(emp)
+                    candidates.append({
+                        "employee_id": b_id,
+                        "full_name": emp.get("name") or emp.get("full_name") or f"Employee {b_id[:8]}",
+                        "primary_role": emp.get("job_title") or (emp_skills[0] if emp_skills else "Engineer"),
+                        "seniority": sen,
+                        "hourly_cost_rate": cost,
+                        "bench_start_date": emp.get("available_from") or "",
+                        "similarity_score": float(sim) if sim else None,
+                        "projected_margin_pct": margin,
+                        "document_excerpt": emp.get("profile_text") or f"Skills: {', '.join(emp_skills)}",
+                        "chunk_index": 0,
+                    })
 
         logger.info(
             f"  Viable bench candidates for '{role_title}': {len(candidates)} candidate(s)"
@@ -692,9 +768,6 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                     cand["projected_margin_pct"] = round(((target_bill_rate - cost) / target_bill_rate) * 100, 2)
 
             # --- Deterministic, explainable skill-based scoring ---
-            # Blend explicit skill coverage (primary signal) with any RAG
-            # semantic similarity so candidates receive distinct, defensible
-            # match scores instead of a single hard-coded fallback value.
             emp_meta = emp_by_id.get(cand_id)
             emp_skills = (
                 _employee_skill_profile(emp_meta)
@@ -720,7 +793,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
             cand["skill_coverage"] = round(coverage, 4) if coverage is not None else None
 
         if not candidates:
-            decisions.append({
+            prepared.append({"decision": {
                 "action_type": "hire",
                 "employee_id": None,
                 "projected_margin": 0.0,
@@ -732,19 +805,86 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 "target_bill_rate": target_bill_rate,
                 "target_margin": target_margin,
                 "candidate_count": 0,
-            })
+            }})
             continue
 
-        sys_msg, human_msg = FinancialMatchPrompts.build_role_evaluation_prompt(
-            role_title=role_title,
-            role_description=role_description,
-            target_bill_rate=target_bill_rate,
-            target_margin=target_margin,
-            candidates=candidates,
-        )
+        prepared.append({
+            "demand": demand,
+            "role_title": role_title,
+            "role_description": role_description,
+            "target_bill_rate": target_bill_rate,
+            "target_margin": target_margin,
+            "required_skills": required_skills,
+            "candidates": candidates,
+        })
 
-        response = llm.invoke([sys_msg, human_msg])
-        raw_json = LLMFactory.parse_json_response(response.content)
+    # ------------------------------------------------------------------
+    # Phase 2 — one LLM evaluation per role, fired CONCURRENTLY.
+    # ------------------------------------------------------------------
+    llm_items = [p for p in prepared if "candidates" in p]
+
+    def _evaluate(p: Dict[str, Any]) -> str:
+        sys_msg, human_msg = FinancialMatchPrompts.build_role_evaluation_prompt(
+            role_title=p["role_title"],
+            role_description=p["role_description"],
+            target_bill_rate=p["target_bill_rate"],
+            target_margin=p["target_margin"],
+            candidates=p["candidates"],
+        )
+        # Keep the messages so Phase 3 can retry once on unparseable output.
+        p["_messages"] = (sys_msg, human_msg)
+        return llm.invoke([sys_msg, human_msg]).content
+
+    responses: List[str] = []
+    if llm_items:
+        with ThreadPoolExecutor(max_workers=_LLM_PARALLELISM) as executor:
+            responses = list(executor.map(_evaluate, llm_items))
+    for p, content in zip(llm_items, responses):
+        p["response_content"] = content
+
+    logger.info(
+        f"allocation_decider: completed {len(llm_items)} role evaluation(s) via LLM "
+        f"(parallelism={_LLM_PARALLELISM})"
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 3 — parse each LLM decision + apply deterministic guards.
+    # ------------------------------------------------------------------
+    for item in prepared:
+        if "decision" in item:
+            decisions.append(item["decision"])
+            continue
+
+        demand = item["demand"]
+        role_title = item["role_title"]
+        target_bill_rate = item["target_bill_rate"]
+        target_margin = item["target_margin"]
+        required_skills = item["required_skills"]
+        candidates = item["candidates"]
+
+        def _parse(content: str) -> Dict[str, Any]:
+            try:
+                parsed = LLMFactory.parse_json_response(content or "")
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+
+        raw_json = _parse(item.get("response_content") or "")
+
+        # One retry when the model returned something we could not parse as a
+        # decision object (keeps LLM-driven output, adds resilience).
+        if not raw_json.get("action_type") and item.get("_messages"):
+            logger.warning(
+                f"allocation_decider: unparseable LLM output for '{role_title}'; retrying once."
+            )
+            sys_msg, human_msg = item["_messages"]
+            strict = HumanMessage(content=(
+                human_msg.content
+                + "\n\nReturn ONLY one valid JSON object with keys: "
+                  "action_type ('allocate'|'train'|'hire'), employee_id, "
+                  "projected_margin, justification."
+            ))
+            raw_json = _parse(llm.invoke([sys_msg, strict]).content)
 
         try:
             decision = AllocationDecision(**raw_json)
@@ -781,13 +921,60 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 match_score=raw_json.get("match_score"),
             )
 
+        # Respect the LLM's proposed employee/action — the model drives
+        # selection. The only deterministic guards are the two below.
         chosen_emp_id = str(decision.employee_id) if decision.employee_id else None
         chosen_cand = next(
             (c for c in candidates if str(c.get("employee_id") or c.get("id")) == chosen_emp_id),
-            None
+            None,
         )
 
-        # Ensure no duplicate employee allocations across demands
+        # Skill-coverage extremes over the whole candidate pool.
+        coverages = [
+            c.get("skill_coverage") for c in candidates
+            if c.get("skill_coverage") is not None
+        ]
+        best_cov = max(coverages) if coverages else None
+
+        # Guard 1: never recommend an external hire when a bench candidate
+        # FULLY covers the role's required skills.
+        if decision.action_type == "hire" and required_skills:
+            full_matches = [c for c in candidates if c.get("skill_coverage") == 1.0]
+            if full_matches:
+                best = max(full_matches, key=_candidate_rank)
+                best_id = str(best.get("employee_id") or best.get("id") or "")
+                if best_id:
+                    logger.info(
+                        f"allocation_decider: '{role_title}' — LLM proposed hire but "
+                        f"{best_id} fully covers the required skills; allocating internally."
+                    )
+                    decision.action_type = "allocate"
+                    decision.employee_id = best_id
+                    chosen_emp_id = best_id
+                    chosen_cand = best
+
+        # Guard 2: no meaningful internal match → recommend an external hire.
+        # (Best candidate covers less than half the required skills.)
+        if (
+            required_skills
+            and best_cov is not None
+            and best_cov < 0.5
+            and decision.action_type != "hire"
+        ):
+            logger.info(
+                f"allocation_decider: '{role_title}' — best bench coverage {best_cov:.0%} "
+                f"< 50%; overriding '{decision.action_type}' with an external hire."
+            )
+            decision.action_type = "hire"
+            decision.employee_id = None
+            chosen_emp_id = None
+            chosen_cand = None
+            decision.justification = (
+                f"No bench employee covers enough of the required skills for "
+                f"'{role_title}' (best match {best_cov:.0%}). External hire recommended."
+            )
+
+        # Guard 3: never allocate the same person to two roles in one run.
         if decision.action_type in ("allocate", "train") and chosen_emp_id:
             if chosen_emp_id in allocated_employee_ids:
                 logger.warning(
@@ -795,7 +982,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 )
                 alt = next(
                     (c for c in candidates if str(c.get("employee_id") or c.get("id")) not in allocated_employee_ids),
-                    None
+                    None,
                 )
                 if alt:
                     chosen_emp_id = str(alt.get("employee_id") or alt.get("id"))
@@ -1022,50 +1209,29 @@ def forecast_planner_node(state: State) -> Dict[str, Any]:
         _log_state_exit("forecast_planner_node", updates)
         return updates
 
-    llm = LLMFactory.get_chat_model()
+    # The plan is ALWAYS derived deterministically from the per-role decisions
+    # (the decider already selected the candidates). The LLM is used only to
+    # write the human-readable reasoning — it must never invent allocations,
+    # employees or project ids.
+    plan_json = _build_plan_from_decisions(decisions)
 
-    sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
-        matches=matches,
-        employees_count=len(employees),
-        open_roles_count=len(demands),
-    )
-
-    plan_json = {}
     try:
+        llm = LLMFactory.get_chat_model()
+        sys_msg, human_msg = FinancialMatchPrompts.build_planning_prompt(
+            matches=matches,
+            employees_count=len(employees),
+            open_roles_count=len(demands),
+        )
         response = llm.invoke([sys_msg, human_msg])
-        plan_json = LLMFactory.parse_json_response(response.content)
+        parsed = LLMFactory.parse_json_response(response.content)
+        reasoning = str(parsed.get("reasoning") or "").strip() if isinstance(parsed, dict) else ""
+        if reasoning:
+            plan_json["reasoning"] = reasoning
     except Exception as exc:
         logger.warning(
-            f"forecast_planner_node: LLM planning call failed or produced unparseable JSON ({exc}). "
-            f"Synthesizing plan directly from allocation decisions."
+            f"forecast_planner_node: LLM reasoning call failed ({exc}); "
+            f"using deterministic reasoning."
         )
-
-    # Fallback to deterministic synthesis if LLM returned non-dict or empty plan
-    if not isinstance(plan_json, dict) or (
-        not plan_json.get("reallocations")
-        and not plan_json.get("trainings")
-        and not plan_json.get("hirings")
-    ):
-        logger.info(
-            f"forecast_planner_node: synthesizing plan from {len(decisions)} state decisions"
-        )
-        plan_json = _build_plan_from_decisions(decisions)
-
-    plan_json.setdefault("recommendation_id", uuid.uuid4().hex)
-    plan_json.setdefault("revision_note", None)
-    plan_json.setdefault("created_at", datetime.utcnow().isoformat())
-
-    # Deduplicate reallocations so no employee is assigned twice
-    seen_realloc_emps = set()
-    deduped_reallocs = []
-    for r in plan_json.get("reallocations", []):
-        r_emp = r.get("employee_id") or r.get("id")
-        if r_emp and r_emp in seen_realloc_emps:
-            continue
-        if r_emp:
-            seen_realloc_emps.add(r_emp)
-        deduped_reallocs.append(r)
-    plan_json["reallocations"] = deduped_reallocs
 
     logger.info(
         f"forecast_planner_node: plan generated — "

@@ -15,8 +15,19 @@ from typing import Literal
 from dotenv import load_dotenv
 
 # Load .env from the bench_forecast directory (one level above src/)
-_env_path = Path(__file__).resolve().parents[2] / ".env"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_env_path = _REPO_ROOT / ".env"
 load_dotenv(dotenv_path=_env_path)
+
+
+def _abs_under_repo(value: str) -> str:
+    """Resolve a path against the bench_forecast root if it is relative.
+
+    Keeps filesystem paths CWD-independent so the app, seeder and scripts
+    always agree on where data lives (e.g. the ChromaDB directory).
+    """
+    p = Path(value)
+    return str(p if p.is_absolute() else (_REPO_ROOT / p))
 
 
 class Config:
@@ -25,11 +36,16 @@ class Config:
     # -----------------------------------------------------------------------
     # LLM Configuration
     # -----------------------------------------------------------------------
-    LLM_PROVIDER: Literal["groq", "ollama"] = os.getenv("LLM_PROVIDER", "ollama")
+    LLM_PROVIDER: Literal["groq", "ollama", "openai_compatible"] = os.getenv("LLM_PROVIDER", "ollama")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama2")
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Generic OpenAI-compatible endpoint (works with OpenCode Go / Groq / vLLM /
+    # LM Studio / any OpenAI-compatible gateway). Set LLM_PROVIDER=openai_compatible.
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "")
     # Embedding model served by Ollama — used by the Phase 2 ingestion pipeline.
     # Pull with: ollama pull nomic-embed-text
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
@@ -51,8 +67,11 @@ class Config:
 
     # -----------------------------------------------------------------------
     # Vector Store Configuration
+    # Single embedded ChromaDB path shared by the seeder, the agent and CV
+    # ingestion (see src/database/chroma_client.py). Absolute by default so the
+    # app and scripts never diverge based on the current working directory.
     # -----------------------------------------------------------------------
-    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
+    CHROMA_PERSIST_DIR: str = _abs_under_repo(os.getenv("CHROMA_PERSIST_DIR", "chroma_data"))
 
     # -----------------------------------------------------------------------
     # LangSmith Tracing Configuration
@@ -94,9 +113,23 @@ class Config:
                     "GROQ_API_KEY is required when LLM_PROVIDER=groq. "
                     "Set it in .env or switch to LLM_PROVIDER=ollama for local inference."
                 )
-        elif cls.LLM_PROVIDER not in ("groq", "ollama"):
+        elif cls.LLM_PROVIDER == "openai_compatible":
+            missing = [
+                name for name, val in (
+                    ("LLM_BASE_URL", cls.LLM_BASE_URL),
+                    ("LLM_API_KEY", cls.LLM_API_KEY),
+                    ("LLM_MODEL", cls.LLM_MODEL),
+                ) if not val
+            ]
+            if missing:
+                raise ValueError(
+                    "LLM_PROVIDER=openai_compatible requires "
+                    f"{', '.join(missing)} to be set in .env."
+                )
+        elif cls.LLM_PROVIDER not in ("groq", "ollama", "openai_compatible"):
             raise ValueError(
-                f"LLM_PROVIDER must be 'groq' or 'ollama', got '{cls.LLM_PROVIDER}'"
+                "LLM_PROVIDER must be 'groq', 'ollama' or 'openai_compatible', "
+                f"got '{cls.LLM_PROVIDER}'"
             )
 
         if cls.LANGCHAIN_TRACING_V2.lower() == "true" and not cls.LANGCHAIN_API_KEY:

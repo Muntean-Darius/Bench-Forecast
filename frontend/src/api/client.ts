@@ -69,14 +69,14 @@ export const api = {
     request<any[]>(`/employees?horizon_days=${horizonDays}`),
 
   // ── Demand & Projects ─────────────────────────────────────────────────────
-  getDemands: (minWinProbability = 0.75) =>
-    request<any[]>(`/demands?min_win_probability=${minWinProbability}`),
+  getDemands: (minWinProbability = 0.75, horizonDays = 365) =>
+    request<any[]>(`/demands?min_win_probability=${minWinProbability}&horizon_days=${horizonDays}`),
 
   getProjects: () =>
     request<any[]>('/projects'),
 
   // ── Forecast ──────────────────────────────────────────────────────────────
-  runForecast: (horizonDays = 90, projectId?: string) =>
+  runForecast: (horizonDays = 90, projectId?: string, minWinProbability = 0.75) =>
     request<{
       forecast_run_id: string
       status: string
@@ -90,6 +90,7 @@ export const api = {
       body: JSON.stringify({
         horizon_days: horizonDays,
         project_id: projectId || null,
+        min_win_probability: minWinProbability,
       }),
     }),
 
@@ -97,15 +98,6 @@ export const api = {
     request<{ id: string; status: string; run_date: string; forecast_horizon_days: number; triggered_by: string }>(
       `/forecast/runs/${runId}`,
     ),
-
-  reviewForecast: (runId: string, humanApproved: boolean, rejectionFeedback?: string) =>
-    request<any>(`/forecast/${runId}/review`, {
-      method: 'POST',
-      body: JSON.stringify({
-        human_approved: humanApproved,
-        rejection_feedback: rejectionFeedback ?? null,
-      }),
-    }),
 
   // ── HITL Allocations ──────────────────────────────────────────────────────
   getPendingAllocations: () =>
@@ -140,6 +132,16 @@ export const api = {
       body: JSON.stringify({ employee_id: employeeId }),
     }),
 
+  // ── External Hiring Recommendations ───────────────────────────────────────
+  getPendingHiring: () =>
+    request<any[]>('/api/hiring/pending'),
+
+  dismissHiring: (recommendationId: string, reviewerId?: string) =>
+    request<any>(`/api/hiring/${recommendationId}/dismiss`, {
+      method: 'POST',
+      body: JSON.stringify({ reviewer_id: reviewerId ?? null }),
+    }),
+
   // ── Employee Portal ───────────────────────────────────────────────────────
   getEmployeePortal: (employeeId: string) =>
     request<any>(`/employee/portal/${employeeId}`),
@@ -167,6 +169,51 @@ export const api = {
 
   getEmployeeDocuments: (employeeId: string) =>
     request<any[]>(`/documents/employee/${employeeId}`),
+
+  // ── Analytics (dashboard time series) ─────────────────────────────────────
+  getBenchTrend: (weeks = 8) =>
+    request<{
+      total_employees: number
+      weeks: { week_start: string; label: string; on_bench: number; allocated: number }[]
+    }>(`/analytics/bench-trend?weeks=${weeks}`),
+
+  getBenchBurnTrend: (months = 6) =>
+    request<{
+      months: {
+        year: number
+        month: number
+        label: string
+        total_bench_cost: number
+        total_workforce_cost: number
+      }[]
+    }>(`/analytics/bench-burn-trend?months=${months}`),
+
+  getKpiTrend: (days = 30) =>
+    request<{
+      days: {
+        date: string
+        label: string
+        bench_ratio_pct: number
+        mttr_days: number | null
+        human_intervention_pct: number
+      }[]
+    }>(`/analytics/kpi-trend?days=${days}`),
+
+  getProjectMargins: () =>
+    request<{
+      projects: {
+        project_id: string
+        name: string
+        status: string
+        allocated_fte: number
+        blended_bill_rate: number
+        blended_cost_rate: number
+        margin_pct: number
+        target_margin: number | null
+        monthly_revenue: number
+        monthly_margin: number
+      }[]
+    }>('/analytics/project-margins'),
 
   // ── Finance ───────────────────────────────────────────────────────────────
   getMonthlyBenchBurn: (year: number, month: number) =>

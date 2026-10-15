@@ -4,13 +4,17 @@ from typing import List, Any, Dict, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from langgraph.types import Command
 
 from src.database.database import get_db
 from src.api.deps import get_current_user
-from src.schemas.hitl import AllocationPendingResponse, ApproveRequest, RejectRequest
+from src.schemas.hitl import (
+    AllocationPendingResponse,
+    ApproveRequest,
+    RejectRequest,
+    HiringRecommendationResponse,
+    DismissHiringRequest,
+)
 from src.services.hitl_service import HITLService
-from src.agents.graph import build_forecast_graph
 
 logger = logging.getLogger(__name__)
 
@@ -19,71 +23,9 @@ router = APIRouter(
     tags=["HITL Review"],
 )
 
-class ReviewForecastRequest(BaseModel):
-    human_approved: bool = Field(..., description="True to approve execution, False to reject")
-    rejection_feedback: Optional[str] = Field(None, description="Guidance for revision if rejected")
-
-@router.post("/forecast/{run_id}/review", response_model=Dict[str, Any], status_code=status.HTTP_200_OK)
-async def review_forecast(
-    run_id: str,
-    payload: ReviewForecastRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """
-    Accepts manager input (approve/reject).
-    Reloads the graph checkpoint using thread_id (run_id), injects decision via Command(resume=...),
-    and triggers either execution or revision planning.
-    """
-    logger.info(f"Manager {current_user['username']} reviewing forecast {run_id}. Approved: {payload.human_approved}")
-    
-    # We must use thread_id = run_id to retrieve the checkpointed state
-    config = {"configurable": {"thread_id": run_id}}
-    graph = build_forecast_graph()
-    
-    # Inject the decision via LangGraph's Command(resume=...)
-    resume_payload: Dict[str, Any] = {
-        "human_approved": payload.human_approved,
-        "human_feedback": current_user["username"],
-    }
-    if not payload.human_approved and payload.rejection_feedback:
-        resume_payload["rejection_feedback"] = payload.rejection_feedback
-        
-    try:
-        # Pass Command(resume=...) directly to ainvoke
-        logger.info(f"Resuming graph for run {run_id} via Command(resume=...)")
-        result_state = await graph.ainvoke(Command(resume=resume_payload), config=config)
-        
-        execution_status = result_state.get("execution_status")
-        decisions = result_state.get("decisions", [])
-        
-        if payload.human_approved:
-            return {
-                "status": "completed",
-                "approved": True,
-                "execution_status": execution_status,
-                "decisions_processed": len(decisions)
-            }
-        elif payload.rejection_feedback and result_state.get("revision_count", 0) > 0:
-            return {
-                "status": "revised_for_review",
-                "revision_count": result_state.get("revision_count"),
-                "revision_feedback_applied": payload.rejection_feedback,
-                "decisions": decisions
-            }
-        else:
-            return {
-                "status": "rejected_terminated",
-                "approved": False,
-                "execution_status": "skipped_no_approval",
-                "decisions": decisions
-            }
-            
-    except Exception as e:
-        logger.error(f"Failed to resume graph for run {run_id}: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to execute review decision: {str(e)}"
-        )
+# HITL is handled by the allocation state machine (approve / reject / assign /
+# release below), not by a graph interrupt. See src/agents/graph.py for the
+# rationale.
 
 # Standard /api/v1/allocations endpoints
 allocations_router = APIRouter(
@@ -236,3 +178,50 @@ legacy_allocations_router.add_api_route("/{allocation_id}/reject", reject_alloca
 legacy_allocations_router.add_api_route("/assign", direct_assign_employee, methods=["POST"])
 legacy_allocations_router.add_api_route("/release", direct_release_employee, methods=["POST"])
 router.include_router(legacy_allocations_router)
+
+
+# ---------------------------------------------------------------------------
+# External-hire recommendations
+# ---------------------------------------------------------------------------
+
+hiring_router = APIRouter(
+    prefix="/hiring",
+    tags=["HITL Hiring"],
+)
+
+
+@hiring_router.get("/pending", response_model=List[HiringRecommendationResponse])
+async def get_pending_hiring(db: AsyncSession = Depends(get_db)):
+    """Fetch all open external-hire recommendations."""
+    hitl_service = HITLService(db)
+    try:
+        return await hitl_service.get_pending_hiring()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@hiring_router.post("/{recommendation_id}/dismiss", response_model=HiringRecommendationResponse)
+async def dismiss_hiring(
+    recommendation_id: uuid.UUID,
+    payload: Optional[DismissHiringRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Dismiss an external-hire recommendation."""
+    hitl_service = HITLService(db)
+    try:
+        return await hitl_service.dismiss_hiring(recommendation_id)
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+router.include_router(hiring_router)
+
+legacy_hiring_router = APIRouter(
+    prefix="/api/hiring",
+    tags=["Legacy HITL Hiring"],
+)
+legacy_hiring_router.add_api_route("/pending", get_pending_hiring, methods=["GET"], response_model=List[HiringRecommendationResponse])
+legacy_hiring_router.add_api_route("/{recommendation_id}/dismiss", dismiss_hiring, methods=["POST"], response_model=HiringRecommendationResponse)
+router.include_router(legacy_hiring_router)

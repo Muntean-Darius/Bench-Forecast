@@ -35,25 +35,24 @@ bench_forecast/src/
 *   **`src/agents/state.py`**
     Declares the `State` class (a `TypedDict`), defining the exact payload structure that flows between nodes during the pipeline run. It includes properties like `bench_employees`, `open_demands`, `recommendations`, and `human_approved`.
 *   **`src/agents/nodes.py`**
-    Houses the independent business-logic blocks (nodes) for the graph:
-    *   `data_extractor_node`: Fetches available talent and open demands from Postgres.
-    *   `skill_matcher_node` / `allocation_decider_node`: Retrieves RAG context via `vector_store.py` and uses an LLM to evaluate match fit and financial viability.
-    *   `forecast_planner_node`: Generates a consolidated plan.
-    *   `human_review_node`: Gatekeeper node evaluating the injected HITL decision.
-    *   `execution_engine_node`: Deterministically writes the approved reallocations back to Postgres.
+    Houses the independent processing nodes for the planner graph:
+    *   `data_extractor_node`: Fetches available talent (within the forecast horizon) and open demands (win probability ≥ threshold, needed within the horizon).
+    *   `skill_matcher_node` / `allocation_decider_node`: RAG context + deterministic skill/margin scoring; the LLM provides narrative only, and the best-match candidate per demand is selected deterministically.
+    *   `forecast_planner_node`: Generates a consolidated plan (reallocations / trainings / hirings).
+    *   *Retained HITL utilities (not wired into the graph):* `human_review_node`, `revision_planner_node`, `route_after_review`, `execution_engine_node`.
 *   **`src/agents/graph.py`**
-    Instantiates the `StateGraph`, registers all nodes from `nodes.py`, defining the directed edges (flow) and conditional routing. Critically, it configures `interrupt_before=["human_review"]` to pause the AI loop for human validation.
+    Compiles the **linear planner** graph: `data_extractor → skill_matcher → allocation_decider → forecast_planner → END`. There is **no interrupt and no checkpointer** — HITL is handled by the PostgreSQL allocation state machine (see below).
 *   **`src/services/forecast_runner.py`**
-    The service interface. It initializes a `ForecastRun` in the DB, sets up the initial LangGraph state with `forecast_run_id`, and triggers `graph.ainvoke(...)` to kick off the pipeline until it hits the interrupt pause.
+    Two-phase orchestration. `create_forecast_run` inserts a `ForecastRun` (status `queued`) and returns its id immediately; `execute_forecast_run` runs the planner, persists proposals + hire recommendations, and flips the status to `paused_for_review` (success) or `failed` (error). Runs execute as a FastAPI background task, so the API responds without blocking on the LLM.
 
 ### Data Flow
 
-1. **Trigger:** A request hits the service layer (`forecast_runner.py`), creating a `ForecastRun` and initializing the graph with `run_forecast_pipeline`.
-2. **Extraction:** The state enters `data_extractor_node`, which queries `AsyncSessionLocal` to populate `bench_employees` and `open_demands` in the state.
-3. **AI Planning:** The state transitions through the skill matcher and allocation decider, appending context from ChromaDB (`VectorStoreManager`) and invoking the LLM, finally resulting in a structured plan built by `forecast_planner_node`.
-4. **Pause (HITL):** The graph pauses exactly before `human_review_node`, saving the state to a `MemorySaver` checkpoint keyed by the `forecast_run_id`.
-5. **Resume:** A manager submits their review via a `Command(resume={"human_approved": True})`. The state updates and unpauses, allowing `human_review_node` and `execution_engine_node` to execute.
-6. **Execution:** The execution node writes `Allocation` records, decrements demand `headcount_needed`, updates the employee to `on_project` in PostgreSQL, and marks the `ForecastRun` as `completed`.
+1. **Queue:** `POST /forecast/run` calls `create_forecast_run` (status `queued`), schedules `execute_forecast_run` as a background task, and returns the run id immediately.
+2. **Extraction:** `data_extractor_node` populates `bench_employees` (available within the horizon) and `open_demands` (win probability ≥ threshold, needed within the horizon).
+3. **AI Planning:** `skill_matcher_node` → `allocation_decider_node` → `forecast_planner_node` produce per-demand decisions (allocate / train / hire).
+4. **Persist proposals:** `execute_forecast_run` writes `Allocation` rows as `pending_manager_approval` and `HiringRecommendation` rows, then sets the run to `paused_for_review`.
+5. **Review:** The manager approves / rejects each proposal in the UI (`POST /allocations/{id}/approve|reject`).
+6. **Execution:** `HITLService` applies the decision transactionally — allocation status, employee `bench_status` / `current_project`, demand `headcount_needed` / `filled` — and, once the run has no open proposals left, marks the `ForecastRun` `completed`. Rejections re-plan the role (or raise an external-hire recommendation).
 
 ---
 
@@ -61,53 +60,56 @@ bench_forecast/src/
 
 Follow these sequential steps to manually trigger a forecast, inspect the interrupted state, provide Human-In-The-Loop (HITL) approval, and verify the data changes in PostgreSQL.
 
-### Step 2.1: Open a Python Shell & Trigger the Pipeline
+### Step 2.1: Trigger the Planner
 
-Run a local Python REPL from the project root:
+Quickest path — the bundled smoke script:
 
 ```bash
 cd bench_forecast
-python -m asyncio
+./venv/bin/python tests/run_test.py
 ```
 
-Execute the pipeline in the REPL:
+Or inline in a script / REPL:
+
+```python
+from sqlalchemy import select
+from src.database.database import AsyncSessionLocal
+from src.database.models import User
+from src.services.forecast_runner import run_forecast_pipeline
+
+async with AsyncSessionLocal() as db:
+    user = await db.scalar(select(User).limit(1))
+
+# Runs the planner to completion and persists pending proposals.
+state = await run_forecast_pipeline(horizon_days=90, user_id=user.id)
+run_id = state["forecast_run_id"]
+print("Run:", run_id, "decisions:", len(state.get("decisions") or []))
+```
+
+Via the API the same operation is asynchronous: `POST /api/v1/forecast/run`
+returns `{ "forecast_run_id": ..., "status": "queued" }`, and the client polls
+`GET /api/v1/forecast/runs/{id}` until the status leaves `queued` / `running`.
+
+### Step 2.2: Approve a Proposal (HITL)
+
+Approvals are applied by the allocation state machine — there is no graph to resume:
 
 ```python
 import uuid
-from src.services.forecast_runner import run_forecast_pipeline
-from src.agents.graph import build_forecast_graph
-from langgraph.types import Command
+from sqlalchemy import select
+from src.database.database import AsyncSessionLocal
+from src.database.models import Allocation, AllocationStatusEnum
+from src.services.hitl_service import HITLService
 
-# 1. Trigger the forecast pipeline
-user_id = uuid.uuid4()
-horizon_days = 90
-
-# This will run the graph and PAUSE before human_review_node
-paused_state = await run_forecast_pipeline(horizon_days, user_id)
-
-print(f"Pipeline paused. Run ID: {paused_state['forecast_run_id']}")
-print(f"Generated Reallocations: {paused_state['recommendations'].get('reallocations')}")
-
-# Save the run ID for the resume step
-run_id = paused_state['forecast_run_id']
-```
-
-### Step 2.2: Resume the Pipeline with HITL Approval
-
-In the same Python session, inject the human approval using LangGraph's `Command(resume=...)`:
-
-```python
-# 2. Re-instantiate the graph configuration
-graph = build_forecast_graph()
-config = {"configurable": {"thread_id": run_id}}
-
-# 3. Inject approval
-approval_payload = {"human_approved": True, "human_feedback": "Looks good, approved."}
-
-# 4. Resume the graph execution
-final_state = await graph.ainvoke(Command(resume=approval_payload), config=config)
-
-print(f"Execution Status: {final_state.get('execution_status')}")
+async with AsyncSessionLocal() as db:
+    alloc = await db.scalar(
+        select(Allocation).where(
+            Allocation.forecast_run_id == uuid.UUID(run_id),
+            Allocation.status == AllocationStatusEnum.pending_manager_approval,
+        ).limit(1)
+    )
+    await HITLService(db).approve_allocation(alloc.id, reviewer_id=user.id)
+    print("approved", alloc.id)
 ```
 
 ### Step 2.3: Verify Results in PostgreSQL (psql)

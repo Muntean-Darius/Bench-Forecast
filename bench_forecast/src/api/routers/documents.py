@@ -165,6 +165,7 @@ class DocumentUploadResponse(BaseModel):
     chunks_ingested: int
     message: str
     summary: Optional[str] = None
+    extracted_skills: Optional[list] = None
 
 
 class DocumentMetadataResponse(BaseModel):
@@ -342,6 +343,7 @@ async def upload_cv(
         # ------------------------------------------------------------------
         logger.info("Generating anonymized professional CV summary via LLM: document_id=%s", doc_id)
         cv_summary: Optional[str] = None
+        skills_list: list = []
         try:
             llm = LLMFactory.get_chat_model()
             summary_prompt = (
@@ -391,17 +393,56 @@ async def upload_cv(
         except Exception as e_sum:
             logger.warning(f"LLM CV summarization failed (falling back to extracted text): {e_sum}")
 
-        # Update employee's profile_text (using anonymized summary) and cv_document_uri in database
+        # ------------------------------------------------------------------
+        # 6c. Extract skills from the CV itself and sync them onto the employee.
+        #     Skills come from two complementary sources:
+        #       (a) the LLM summary's `core_skills`,
+        #       (b) deterministic vocabulary matching over the raw CV text.
+        #     The union is stored in employees.skills so both the manager view
+        #     and the forecast agent use the employee's ACTUAL CV skills.
+        # ------------------------------------------------------------------
+        from src.agents.nodes import _extract_skills_from_text
+
+        cv_skills: list = []
+        for raw_skill in skills_list:
+            if raw_skill and str(raw_skill).strip():
+                cv_skills.append(str(raw_skill).strip())
+        cv_skills.extend(_extract_skills_from_text(full_text))
+
+        seen_skills: set = set()
+        deduped_skills: list = []
+        for skill in cv_skills:
+            key = skill.lower()
+            if key and key not in seen_skills:
+                seen_skills.add(key)
+                deduped_skills.append(skill)
+
+        extracted_skills = deduped_skills[:25]
+        skills_value = ", ".join(extracted_skills) if extracted_skills else None
+        logger.info(
+            "Extracted %d skill(s) from CV for employee=%s: %s",
+            len(extracted_skills),
+            employee_name,
+            extracted_skills[:10],
+        )
+
+        # Update employee's profile_text (using anonymized summary),
+        # cv_document_uri and skills in database.
         from datetime import datetime
         profile_text_to_save = cv_summary if cv_summary else full_text
+        update_values = {
+            "profile_text": profile_text_to_save,
+            "cv_document_uri": file_path,
+            "updated_at": datetime.utcnow(),
+        }
+        # Only overwrite skills when the CV actually yielded some, so an
+        # unparseable CV never wipes a previously known skill profile.
+        if skills_value:
+            update_values["skills"] = skills_value
         await db.execute(
             update(Employee)
             .where(Employee.id == emp_uuid)
-            .values(
-                profile_text=profile_text_to_save,
-                cv_document_uri=file_path,
-                updated_at=datetime.utcnow()
-            )
+            .values(**update_values)
         )
         await db.commit()
 
@@ -488,6 +529,7 @@ async def upload_cv(
             f"into ChromaDB collection 'employee_profiles'."
         ),
         summary=cv_summary,
+        extracted_skills=extracted_skills,
     )
 
 
