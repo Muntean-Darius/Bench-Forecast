@@ -1,6 +1,6 @@
 import uuid
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -21,6 +21,7 @@ router = APIRouter(
 
 class RunForecastRequest(BaseModel):
     horizon_days: int = Field(default=90, ge=30, le=365, description="Look-ahead window in days")
+    project_id: Optional[uuid.UUID] = Field(default=None, description="Optional target project ID to run forecast specifically for")
 
 class RunForecastResponse(BaseModel):
     forecast_run_id: str
@@ -44,14 +45,15 @@ async def trigger_forecast_run(
     Returns the forecast_run_id and initial paused state metadata.
     """
     user_uuid = uuid.UUID(current_user["id"])
-    logger.info(f"User {user_uuid} triggering forecast run with horizon {payload.horizon_days} days.")
+    logger.info(f"User {user_uuid} triggering forecast run with horizon {payload.horizon_days} days. Project ID: {payload.project_id}")
     
     try:
         # run_forecast_pipeline blocks until human_review_node interrupt fires,
         # at which point it returns the paused state.
         result_state = await run_forecast_pipeline(
             horizon_days=payload.horizon_days,
-            user_id=user_uuid
+            user_id=user_uuid,
+            project_id=payload.project_id
         )
         
         forecast_run_id = result_state.get("forecast_run_id")

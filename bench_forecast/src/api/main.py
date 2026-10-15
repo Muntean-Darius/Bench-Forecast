@@ -126,9 +126,10 @@ async def get_current_user_info(authorization: str = Header(None)):
 async def get_employee_portal(employee_id: str):
     """Get employee's current project and next assignment info."""
     from src.database.database import get_sync_db
-    from src.database.models import Employee, EmployeeCost, Allocation, ProjectDemand, DemandStatusEnum
+    from src.database.models import Employee, EmployeeCost, Allocation, ProjectDemand, DemandStatusEnum, AllocationStatusEnum
     from datetime import date
     from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
     import uuid
 
     try:
@@ -148,24 +149,52 @@ async def get_employee_portal(employee_id: str):
                 select(EmployeeCost).where(EmployeeCost.employee_id == emp_uuid)
             ).scalars().first()
 
+            # Only return completed (Done) and approved/active (Assigned) allocations.
+            # Exclude proposals pending manager approval or rejected.
             alloc_rows = session.execute(
                 select(Allocation)
-                .where(Allocation.employee_id == emp_uuid)
+                .options(
+                    joinedload(Allocation.project_demand).joinedload(ProjectDemand.project)
+                )
+                .where(
+                    Allocation.employee_id == emp_uuid,
+                    Allocation.status.in_([
+                        AllocationStatusEnum.approved_by_manager,
+                        AllocationStatusEnum.active,
+                        AllocationStatusEnum.completed,
+                    ])
+                )
                 .order_by(Allocation.start_date.desc().nulls_last())
             ).scalars().all()
 
-            allocations = [
-                {
+            allocations = []
+            for a in alloc_rows:
+                proj_name = None
+                if a.project_name:
+                    proj_name = a.project_name
+                elif a.project_demand and a.project_demand.project:
+                    proj_name = a.project_demand.project.name
+                elif a.role_on_project:
+                    proj_name = a.role_on_project
+                else:
+                    proj_name = "Assigned Project"
+
+                raw_st = a.status.value if hasattr(a.status, 'value') else str(a.status)
+                status_label = "Done" if raw_st == AllocationStatusEnum.completed.value else "Assigned"
+
+                allocations.append({
                     "id": str(a.id),
+                    "project_name": proj_name,
+                    "project_id": str(a.project_id) if a.project_id else None,
+                    "role": a.role_on_project,
                     "role_on_project": a.role_on_project,
                     "allocation_pct": float(a.allocation_pct),
                     "start_date": str(a.start_date) if a.start_date else None,
                     "end_date": str(a.end_date) if a.end_date else None,
-                    "status": a.status.value if hasattr(a.status, 'value') else str(a.status),
+                    "status": status_label,
+                    "raw_status": raw_st,
                     "ai_justification": a.ai_justification,
-                }
-                for a in alloc_rows
-            ]
+                })
 
             demand_rows = session.execute(
                 select(ProjectDemand).where(ProjectDemand.status == DemandStatusEnum.open)
@@ -348,14 +377,7 @@ async def get_employees(horizon_days: int = 90):
             stmt = (
                 select(Employee, EmployeeCost)
                 .outerjoin(EmployeeCost, Employee.id == EmployeeCost.employee_id)
-                .where(
-                    Employee.is_active == True,
-                    or_(
-                        Employee.bench_status.in_([BenchStatusEnum.bench, BenchStatusEnum.upcoming_bench]),
-                        Employee.bench_start_date <= cutoff,
-                        Employee.bench_start_date == None
-                    )
-                )
+                .where(Employee.is_active == True)
                 .order_by(Employee.bench_start_date.asc().nulls_last())
             )
             rows = session.execute(stmt).all()
@@ -453,4 +475,40 @@ async def get_demands(min_win_probability: float = 0.75):
             return demands
     except Exception as e:
         logger.error(f"Failed to fetch demands: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/projects", status_code=status.HTTP_200_OK)
+@app.get("/api/projects", status_code=status.HTTP_200_OK)
+async def get_projects():
+    from src.database.database import get_sync_db
+    from src.database.models import Project, ProjectDemand, DemandStatusEnum
+    from sqlalchemy import select, func
+
+    try:
+        with get_sync_db() as session:
+            stmt = select(Project).order_by(Project.name.asc())
+            projects_db = session.execute(stmt).scalars().all()
+            
+            # Count open demands per project
+            count_rows = session.execute(
+                select(ProjectDemand.project_id, func.count(ProjectDemand.id))
+                .where(ProjectDemand.status == DemandStatusEnum.open)
+                .group_by(ProjectDemand.project_id)
+            ).all()
+            dem_counts = {r[0]: r[1] for r in count_rows}
+
+            return [
+                {
+                    "id": str(p.id),
+                    "name": p.name,
+                    "status": p.status,
+                    "probability": p.probability,
+                    "target_margin": float(p.target_margin) if p.target_margin else 25.0,
+                    "total_budget": float(p.total_budget) if p.total_budget else 0.0,
+                    "open_demands_count": dem_counts.get(p.id, 0),
+                }
+                for p in projects_db
+            ]
+    except Exception as e:
+        logger.error(f"Failed to fetch projects: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

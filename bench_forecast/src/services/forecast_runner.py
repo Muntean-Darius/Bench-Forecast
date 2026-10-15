@@ -2,17 +2,21 @@ import logging
 import uuid
 from datetime import date
 from decimal import Decimal
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sqlalchemy import select, update
 
 from src.database.database import AsyncSessionLocal
-from src.database.models import ForecastRun, Allocation, AllocationStatusEnum
+from src.database.models import ForecastRun, Allocation, AllocationStatusEnum, ProjectDemand
 from src.agents.graph import build_forecast_graph
 
 logger = logging.getLogger(__name__)
 
-async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[str, Any]:
+async def run_forecast_pipeline(
+    horizon_days: int,
+    user_id: uuid.UUID,
+    project_id: Optional[uuid.UUID] = None
+) -> Dict[str, Any]:
     """
     Executes the forecast pipeline up to the human_review_node interrupt.
     
@@ -23,6 +27,7 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
     Args:
         horizon_days (int): Look-ahead window in days.
         user_id (uuid.UUID): ID of the user triggering the run.
+        project_id (Optional[uuid.UUID]): Project to forecast, or None for all open projects.
         
     Returns:
         Dict[str, Any]: The final state of the graph execution when it pauses.
@@ -30,7 +35,7 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
     forecast_run_id = uuid.uuid4()
     
     # 1. Create a new forecast_runs row in PostgreSQL
-    logger.info(f"Creating ForecastRun {forecast_run_id} triggered by user {user_id}")
+    logger.info(f"Creating ForecastRun {forecast_run_id} triggered by user {user_id} (project_id={project_id})")
     try:
         async with AsyncSessionLocal() as db:
             new_run = ForecastRun(
@@ -53,6 +58,7 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
         "forecast_run_id": str(forecast_run_id),
         "horizon_days": horizon_days,
         "user_id": str(user_id),
+        "target_project_id": str(project_id) if project_id else None,
         "min_win_probability": 0.75,
         "revision_count": 0,
         "human_approved": False,
@@ -91,25 +97,43 @@ async def run_forecast_pipeline(horizon_days: int, user_id: uuid.UUID) -> Dict[s
                 if run_rec:
                     run_rec.status = "paused_for_review"
 
-                # A new forecast run supersedes any proposals still awaiting
-                # review from previous runs. Cancel them first so the manager
-                # queue never shows the same employee twice (e.g. as a direct
-                # allocation from an old run AND a training allocation from
-                # this run). Cancelled rows are retained for audit history.
-                superseded = await db.execute(
-                    update(Allocation)
-                    .where(
+                # 4. Clean up / delete previous pending allocations for the targeted project
+                # This ensures running forecast on Project A replaces old proposals for Project A,
+                # while leaving allocations for other projects intact.
+                if project_id:
+                    old_allocs_stmt = (
+                        select(Allocation)
+                        .join(ProjectDemand, Allocation.demand_id == ProjectDemand.id)
+                        .where(
+                            ProjectDemand.project_id == project_id,
+                            Allocation.status.in_([
+                                AllocationStatusEnum.pending_manager_approval,
+                                AllocationStatusEnum.proposed_by_ai
+                            ])
+                        )
+                    )
+                    old_res = await db.execute(old_allocs_stmt)
+                    old_allocs = old_res.scalars().all()
+                    for old_a in old_allocs:
+                        await db.delete(old_a)
+                    if old_allocs:
+                        await db.flush()
+                        logger.info(f"Cleaned up {len(old_allocs)} old pending allocations for project {project_id}.")
+                else:
+                    old_allocs_stmt = select(Allocation).where(
                         Allocation.status.in_([
                             AllocationStatusEnum.pending_manager_approval,
-                            AllocationStatusEnum.proposed_by_ai,
+                            AllocationStatusEnum.proposed_by_ai
                         ])
                     )
-                    .values(status=AllocationStatusEnum.cancelled)
-                )
-                logger.info(
-                    f"Superseded {superseded.rowcount if superseded.rowcount is not None else 'existing'} "
-                    f"stale pending allocation(s) for new forecast run {forecast_run_id}."
-                )
+                    old_res = await db.execute(old_allocs_stmt)
+                    old_allocs = old_res.scalars().all()
+                    for old_a in old_allocs:
+                        await db.delete(old_a)
+                    if old_allocs:
+                        await db.flush()
+                        logger.info(f"Cleaned up {len(old_allocs)} old pending allocations across all projects.")
+
 
                 bench_ids_set = {str(b["id"]) for b in bench_employees if b.get("id")}
 

@@ -308,12 +308,22 @@ async def stage4_observability(session: AsyncSession, employees: list):
     
     allocs = (await session.execute(select(Allocation).limit(50))).scalars().all()
     
-    user = User(email="manager@example.com", role="manager")
-    session.add(user)
-    await session.flush()
+    from src.auth.auth import hash_password
+    user_res = await session.execute(select(User).where(User.username == "manager"))
+    user = user_res.scalars().first()
+    if not user:
+        user = User(
+            username="manager",
+            password_hash=hash_password("manager"),
+            email="manager@example.com",
+            full_name="Darius Muntean",
+            role="manager"
+        )
+        session.add(user)
+        await session.flush()
     
     for _ in range(10):
-        run = ForecastRun(forecast_horizon_days=90)
+        run = ForecastRun(forecast_horizon_days=90, triggered_by=user.id)
         session.add(run)
         
     await session.flush()
@@ -333,25 +343,44 @@ async def stage4_observability(session: AsyncSession, employees: list):
 async def stage5_present_day(session: AsyncSession, employees: list):
     print("Stage 5: Present Day State")
     proj = Project(
-        name="Active Needs Project", probability=80, 
-        target_margin=Decimal("30"), total_budget=Decimal("500000")
+        name="Active Needs Project",
+        probability=85,
+        target_margin=Decimal("30.00"),
+        total_budget=Decimal("500000.00"),
+        status="active"
     )
     session.add(proj)
     await session.flush()
     
-    for _ in range(5):
+    role_specs = [
+        ("Senior Cloud Engineer", ["AWS", "Docker", "Kubernetes", "Terraform", "Linux"], 120.0, 30.0),
+        ("Full-Stack Python/React Specialist", ["Python", "FastAPI", "React", "TypeScript", "PostgreSQL"], 105.0, 28.0),
+        ("DevOps Architect", ["CI/CD", "Docker", "Kubernetes", "Linux", "Terraform"], 115.0, 32.0),
+        ("Backend Services Engineer", ["Python", "FastAPI", "REST", "PostgreSQL", "Docker"], 95.0, 25.0),
+        ("Data & ML Engineer", ["Python", "SQL", "Pandas", "Machine Learning", "Docker"], 110.0, 29.0),
+    ]
+
+    for role_title, skills, bill_rate, margin in role_specs:
         demand = ProjectDemand(
             project_id=proj.id,
-            role="Senior Developer",
+            role=role_title,
+            required_skills=skills,
             headcount_needed=1,
-            status=DemandStatusEnum.open
+            target_bill_rate=Decimal(str(bill_rate)),
+            target_margin=Decimal(str(margin)),
+            win_probability=Decimal("0.85"),
+            status=DemandStatusEnum.open,
+            needed_by_date=date.today() + timedelta(days=14),
+            description=f"Core engineering role for {proj.name} requiring expertise in {', '.join(skills[:3])}."
         )
         session.add(demand)
         
-    bench_emps = random.sample(employees, 15)
+    bench_count = min(20, len(employees))
+    bench_emps = random.sample(employees, bench_count)
     for emp in bench_emps:
         emp.bench_status = BenchStatusEnum.bench
-        emp.bench_start_date = date.today() - timedelta(days=5)
+        emp.bench_start_date = date.today() - timedelta(days=random.randint(5, 40))
+        emp.current_project = None
         
     await session.commit()
 
@@ -366,6 +395,10 @@ async def main():
         await stage4_observability(session, emps)
         await stage5_present_day(session, emps)
         print("Data Seed Simulation complete.")
+
+    from src.auth.auth import init_auth_db
+    init_auth_db()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

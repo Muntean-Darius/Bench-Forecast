@@ -374,12 +374,19 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
                 employees.append(emp_dict)
 
             # Query open demands with their projects
+            target_project_id = state.get("target_project_id")
             dem_stmt = select(ProjectDemand).options(
                 selectinload(ProjectDemand.project)
             ).where(
                 ProjectDemand.status == DemandStatusEnum.open,
                 or_(ProjectDemand.win_probability >= min_win_prob, ProjectDemand.win_probability == None)
             )
+            if target_project_id:
+                try:
+                    target_uuid = uuid.UUID(target_project_id)
+                    dem_stmt = dem_stmt.where(ProjectDemand.project_id == target_uuid)
+                except ValueError:
+                    pass
             dem_res = await db.execute(dem_stmt)
             demands_db = dem_res.scalars().all()
 
@@ -1324,6 +1331,16 @@ async def execution_engine_node(state: State) -> Dict[str, Any]:
                 if employee:
                     employee.bench_status = BenchStatusEnum.on_project
                     employee.bench_start_date = None
+                    project_name = None
+                    if demand and getattr(demand, "project_id", None):
+                        proj_stmt = select(Project).where(Project.id == demand.project_id)
+                        proj_res = await db.execute(proj_stmt)
+                        proj = proj_res.scalars().first()
+                        if proj:
+                            project_name = proj.name
+                    if not project_name:
+                        project_name = reallocation.get("project_name") or role or "Assigned Project"
+                    employee.current_project = project_name
 
                 logger.info(f"  execution_engine: allocated {emp_id} → demand {demand_uuid} role='{role}' score={match_score:.2f}")
                 executed_count += 1

@@ -20,6 +20,8 @@ export interface Employee {
   experience_years?: number
   current_project?: string | null
   cost_rate?: number | null
+  bench_status?: string | null
+  job_title?: string | null
 }
 
 export interface Project {
@@ -168,9 +170,9 @@ export function marginBadgeClass(margin: number): string {
 
 export function categoryBadge(cat: ProposalCategory) {
   switch (cat) {
-    case 'direct':   return { cls: 'badge badge-green',  dot: '🟢', label: 'Direct Allocation' }
-    case 'training': return { cls: 'badge badge-yellow', dot: '🟡', label: 'Training Allocation' }
-    case 'hiring':   return { cls: 'badge badge-red',    dot: '🔴', label: 'Hiring Recommendation' }
+    case 'direct':   return { cls: 'badge badge-green',  dot: '', label: 'Direct Allocation' }
+    case 'training': return { cls: 'badge badge-yellow', dot: '', label: 'Training Allocation' }
+    case 'hiring':   return { cls: 'badge badge-red',    dot: '', label: 'Hiring Recommendation' }
   }
 }
 

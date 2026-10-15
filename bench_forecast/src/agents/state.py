@@ -55,3 +55,4 @@ class State(TypedDict, total=False):
     min_win_probability: float         # Pipeline filter threshold (default 0.75)
     # user_id stored as str for the same JSON-serialisation reason as forecast_run_id.
     user_id: Optional[str]
+    target_project_id: Optional[str]   # Optional single project UUID filter

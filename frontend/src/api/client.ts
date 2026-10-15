@@ -68,12 +68,15 @@ export const api = {
   getEmployees: (horizonDays = 90) =>
     request<any[]>(`/employees?horizon_days=${horizonDays}`),
 
-  // ── Demand ────────────────────────────────────────────────────────────────
+  // ── Demand & Projects ─────────────────────────────────────────────────────
   getDemands: (minWinProbability = 0.75) =>
     request<any[]>(`/demands?min_win_probability=${minWinProbability}`),
 
+  getProjects: () =>
+    request<any[]>('/projects'),
+
   // ── Forecast ──────────────────────────────────────────────────────────────
-  runForecast: (horizonDays = 90) =>
+  runForecast: (horizonDays = 90, projectId?: string) =>
     request<{
       forecast_run_id: string
       status: string
@@ -84,7 +87,10 @@ export const api = {
       }
     }>('/forecast/run', {
       method: 'POST',
-      body: JSON.stringify({ horizon_days: horizonDays }),
+      body: JSON.stringify({
+        horizon_days: horizonDays,
+        project_id: projectId || null,
+      }),
     }),
 
   getForecastRun: (runId: string) =>
@@ -115,6 +121,23 @@ export const api = {
     request<any>(`/api/allocations/${allocationId}/reject`, {
       method: 'POST',
       body: JSON.stringify({ reviewer_id: reviewerId, feedback, time_to_decision_seconds: timeToDecision }),
+    }),
+
+  assignEmployee: (employeeId: string, demandId?: string, projectName?: string, roleOnProject?: string) =>
+    request<any>('/api/allocations/assign', {
+      method: 'POST',
+      body: JSON.stringify({
+        employee_id: employeeId,
+        demand_id: demandId ?? null,
+        project_name: projectName ?? null,
+        role_on_project: roleOnProject ?? null,
+      }),
+    }),
+
+  releaseEmployee: (employeeId: string) =>
+    request<any>('/api/allocations/release', {
+      method: 'POST',
+      body: JSON.stringify({ employee_id: employeeId }),
     }),
 
   // ── Employee Portal ───────────────────────────────────────────────────────

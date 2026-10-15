@@ -14,6 +14,10 @@ from src.database.models import (
     Employee,
     HitlReviewEvent,
     HitlDecisionEnum,
+    BenchStatusEnum,
+    ProjectDemand,
+    DemandStatusEnum,
+    Project,
 )
 
 class HITLService:
@@ -42,6 +46,9 @@ class HITLService:
         if not allocation:
             raise ValueError(f"Allocation {allocation_id} not found")
 
+        if allocation.status == AllocationStatusEnum.approved_by_manager:
+            return allocation
+
         if allocation.status not in [
             AllocationStatusEnum.pending_manager_approval,
             AllocationStatusEnum.proposed_by_ai
@@ -51,6 +58,33 @@ class HITLService:
         allocation.status = AllocationStatusEnum.approved_by_manager
         allocation.approved_by = reviewer_id
         allocation.approved_at = datetime.utcnow()
+
+        # Update the associated Employee's bench status and current project
+        employee = await self.session.get(Employee, allocation.employee_id)
+        if employee:
+            employee.bench_status = BenchStatusEnum.on_project
+            employee.bench_start_date = None
+
+            project_name = None
+            if allocation.demand_id:
+                demand = await self.session.get(ProjectDemand, allocation.demand_id)
+                if demand:
+                    if demand.project_id:
+                        proj = await self.session.get(Project, demand.project_id)
+                        if proj:
+                            project_name = proj.name
+                    if not project_name and demand.role:
+                        project_name = f"Project ({demand.role})"
+                    
+                    if demand.headcount_needed and demand.headcount_needed > 0:
+                        demand.headcount_needed -= 1
+                    if demand.headcount_needed <= 0:
+                        demand.status = DemandStatusEnum.filled
+
+            if not project_name:
+                project_name = allocation.role_on_project or "Assigned Project"
+
+            employee.current_project = project_name
 
         event = HitlReviewEvent(
             forecast_run_id=allocation.forecast_run_id,
@@ -62,8 +96,18 @@ class HITLService:
         )
         self.session.add(event)
         await self.session.commit()
-        await self.session.refresh(allocation)
-        return allocation
+
+        # Re-fetch with joinedload for Pydantic serialization
+        stmt = (
+            select(Allocation)
+            .options(
+                joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
+                joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+            )
+            .where(Allocation.id == allocation_id)
+        )
+        res = await self.session.execute(stmt)
+        return res.scalars().first()
 
     async def reject_allocation(self, allocation_id: uuid.UUID, reviewer_id: uuid.UUID, feedback: str, time_to_decision_seconds: int = None) -> Allocation:
         """Rejects an allocation with manager feedback."""
@@ -85,15 +129,24 @@ class HITLService:
         )
         self.session.add(event)
         await self.session.commit()
-        await self.session.refresh(allocation)
-        return allocation
+
+        stmt = (
+            select(Allocation)
+            .options(
+                joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
+                joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+            )
+            .where(Allocation.id == allocation_id)
+        )
+        res = await self.session.execute(stmt)
+        return res.scalars().first()
 
     async def get_pending_allocations(self) -> List[Allocation]:
         """Fetch all allocations awaiting manager review."""
         stmt = (
             select(Allocation)
             .options(
-                joinedload(Allocation.project_demand),
+                joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
                 joinedload(Allocation.employee).selectinload(Employee.employee_costs),
             )
             .where(
