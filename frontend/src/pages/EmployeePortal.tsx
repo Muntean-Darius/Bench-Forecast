@@ -262,30 +262,21 @@ function PersonalDetails({
         </div>
       </div>
 
-      {/* Extracted CV Profile Text */}
+      {/* Current CV — PDF only (no extracted text shown) */}
       <div className="bg-white border border-gray-200">
         <div className="section-header flex items-center justify-between">
           <div>
-            <h3 className="section-title">Current CV Profile Text</h3>
-            <p className="text-[10px] text-gray-400 mt-0.5">Extracted from your uploaded CV for semantic AI matching</p>
+            <h3 className="section-title">Current CV</h3>
+            <p className="text-[10px] text-gray-400 mt-0.5">Open the CV currently on file as a PDF</p>
           </div>
           <a
             href={`/api/v1/documents/employee/${emp.id}/download`}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-xs text-blue-600 hover:text-blue-700 font-mono flex items-center gap-1.5"
+            className="btn-primary text-xs px-4 py-1.5 flex items-center gap-1.5"
           >
-            <DocumentIcon className="w-3.5 h-3.5" /> View Current PDF ↗
+            <DocumentIcon className="w-3.5 h-3.5" /> View CV (PDF)
           </a>
-        </div>
-        <div className="p-5">
-          {emp.profile_text ? (
-            <div className="bg-gray-50 p-4 rounded border border-gray-200 font-mono text-xs text-gray-700 leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto">
-              {emp.profile_text}
-            </div>
-          ) : (
-            <p className="text-sm text-gray-400">No profile text extracted yet. Upload a CV below to extract and update your profile.</p>
-          )}
         </div>
       </div>
 
