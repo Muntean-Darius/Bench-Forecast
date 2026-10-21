@@ -23,6 +23,7 @@ import os
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Literal, Optional
 
@@ -543,7 +544,11 @@ def skill_matcher_node(state: State) -> Dict[str, Any]:
     contents: List[str] = []
     if tasks:
         with ThreadPoolExecutor(max_workers=_LLM_PARALLELISM) as executor:
-            contents = list(executor.map(_invoke, tasks))
+            # copy_context() keeps the active observability workflow/span in the
+            # worker thread so concurrent LLM spans nest under the trace instead
+            # of becoming detached roots.
+            futures = [executor.submit(copy_context().run, _invoke, task) for task in tasks]
+            contents = [future.result() for future in futures]
 
     logger.info(
         f"skill_matcher_node: {len(tasks)} role(s) matched "
@@ -838,7 +843,9 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     responses: List[str] = []
     if llm_items:
         with ThreadPoolExecutor(max_workers=_LLM_PARALLELISM) as executor:
-            responses = list(executor.map(_evaluate, llm_items))
+            # Preserve the observability context per task (see skill_matcher).
+            futures = [executor.submit(copy_context().run, _evaluate, item) for item in llm_items]
+            responses = [future.result() for future in futures]
     for p, content in zip(llm_items, responses):
         p["response_content"] = content
 

@@ -4,10 +4,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import chromadb
 from chromadb.config import Settings
-from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
 
-# Instrument ChromaDB for Phoenix Tracing
-ChromaInstrumentor().instrument()
+# ChromaDB instrumentation is owned by the ai-observability SDK (its retriever
+# interceptor) when the platform is active. Only fall back to the standalone
+# OpenTelemetry instrumentor for the legacy Phoenix setup — installing both
+# would double-wrap Collection.query and emit duplicate spans.
+from src.core.observability import is_observability_active
+
+if not is_observability_active():
+    try:
+        from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
+
+        ChromaInstrumentor().instrument()
+    except Exception:  # optional dependency / already instrumented
+        pass
 
 
 class VectorStoreManager:

@@ -1,17 +1,36 @@
 """FastAPI backend for Bench Forecast allocation recommendations."""
 
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
 
-# OpenTelemetry / Phoenix Tracing Environment Variables
-os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = "http://localhost:6006/v1/traces"
-
 from src.core.config import Config
+
+# ---------------------------------------------------------------------------
+# Observability — MUST run before routers (and therefore LangChain clients)
+# are imported. The SDK installs the OpenInference instrumentors here; a
+# late init would miss the first clients and detach spans from the workflow.
+# ---------------------------------------------------------------------------
+from src.core.observability import (
+    init_observability,
+    observability_status,
+    shutdown_observability,
+)
 from src.core.tracing import setup_phoenix_tracing
+
+logger = logging.getLogger(__name__)
+
+_OBSERVABILITY_ACTIVE = init_observability()
+
+# Legacy Arize Phoenix is only used when the platform SDK is not active;
+# running both would duplicate every LLM/chain span.
+if not _OBSERVABILITY_ACTIVE:
+    setup_phoenix_tracing()
+else:
+    logger.info("AI observability SDK active — legacy Phoenix tracer skipped")
+
 from src.database.vector_store import VectorStoreManager
 from src.api.routers.documents import router as documents_router
 from src.api.routers.finance import router as finance_router
@@ -44,11 +63,9 @@ app.include_router(hitl_router)
 app.include_router(forecast_router)
 app.include_router(analytics_router)
 
-setup_phoenix_tracing()
-
 
 # ---------------------------------------------------------------------------
-# Startup
+# Startup / shutdown
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
@@ -65,7 +82,14 @@ async def startup():
     else:
         logger.info(f"Ollama Model: {Config.OLLAMA_MODEL} @ {Config.OLLAMA_BASE_URL}")
     logger.info(f"Database: {Config.SQLITE_DB_PATH}")
-    logger.info(f"Phoenix Tracing: {'Enabled' if Config.ENABLE_PHOENIX else 'Disabled'}")
+    logger.info(
+        "AI observability: "
+        f"{'Enabled' if _OBSERVABILITY_ACTIVE else 'Disabled'}"
+    )
+    logger.info(
+        f"Legacy Phoenix Tracing: "
+        f"{'Enabled' if (Config.ENABLE_PHOENIX and not _OBSERVABILITY_ACTIVE) else 'Disabled'}"
+    )
     logger.info("=" * 60)
     Config.validate()
 
@@ -94,6 +118,12 @@ async def startup():
             logger.warning(f"mock_data.json not found at {mock_data_path}")
     except Exception as e:
         logger.warning(f"ChromaDB seeding failed (non-fatal): {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Flush pending telemetry and uninstrument frameworks on app stop."""
+    shutdown_observability()
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +356,8 @@ async def health_check():
         "status": "healthy",
         "version": "2.0.0",
         "llm_provider": Config.LLM_PROVIDER,
-        "phoenix_enabled": Config.ENABLE_PHOENIX,
+        "phoenix_enabled": Config.ENABLE_PHOENIX and not _OBSERVABILITY_ACTIVE,
+        "observability": observability_status(),
     }
 
 @app.get("/", status_code=status.HTTP_200_OK)

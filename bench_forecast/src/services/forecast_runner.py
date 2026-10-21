@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 from sqlalchemy import select
 
 from src.core.config import Config
+from src.core.observability import span, workflow
 
 from src.database.database import AsyncSessionLocal
 from src.database.models import (
@@ -70,6 +71,51 @@ async def execute_forecast_run(
     project_id: Optional[uuid.UUID] = None,
     min_win_probability: float = 0.75,
 ) -> Dict[str, Any]:
+    """Execute one forecast run inside an observability **workflow**.
+
+    ``workflow_id`` is the persisted forecast-run id, so retries and the later
+    HITL approve/reject actions join the same trace. The span tree underneath
+    (LangGraph nodes, LLM/TOOL/RETRIEVER spans) is captured automatically by the
+    SDK's instrumentors.
+    """
+    model_name = (
+        Config.GROQ_MODEL
+        if Config.LLM_PROVIDER == "groq"
+        else Config.LLM_MODEL
+        if Config.LLM_PROVIDER == "openai_compatible"
+        else Config.OLLAMA_MODEL
+    )
+    context = {
+        "horizon_days": horizon_days,
+        "min_win_probability": min_win_probability,
+        "project_id": str(project_id) if project_id else None,
+        "llm_provider": Config.LLM_PROVIDER,
+        "llm_model": model_name,
+    }
+
+    with workflow(
+        name="bench-forecast",
+        workflow_id=str(forecast_run_id),
+        version="v2",
+        context=context,
+        user_id=str(user_id),
+    ):
+        return await _execute_forecast_run(
+            forecast_run_id=forecast_run_id,
+            horizon_days=horizon_days,
+            user_id=user_id,
+            project_id=project_id,
+            min_win_probability=min_win_probability,
+        )
+
+
+async def _execute_forecast_run(
+    forecast_run_id: uuid.UUID,
+    horizon_days: int,
+    user_id: uuid.UUID,
+    project_id: Optional[uuid.UUID] = None,
+    min_win_probability: float = 0.75,
+) -> Dict[str, Any]:
     """Run the planner graph, persist proposals, and update the run status."""
     started_at = time.time()
     await _set_run_status(forecast_run_id, "running")
@@ -93,7 +139,15 @@ async def execute_forecast_run(
     try:
         graph = build_forecast_graph()
         logger.info(f"Invoking forecast planner for run {forecast_run_id}")
-        result_state = await graph.ainvoke(initial_state)
+        with span(
+            "planner_graph",
+            context={
+                "forecast_run_id": str(forecast_run_id),
+                "horizon_days": horizon_days,
+                "project_id": str(project_id) if project_id else None,
+            },
+        ):
+            result_state = await graph.ainvoke(initial_state)
 
         open_demands = result_state.get("open_demands", [])
         decisions = result_state.get("decisions", [])

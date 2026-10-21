@@ -9,6 +9,8 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import joinedload, selectinload
 from sqlalchemy.orm.attributes import set_committed_value
 
+from src.core.observability import workflow
+
 from src.database.models import (
     Allocation,
     AllocationStatusEnum,
@@ -41,6 +43,28 @@ class HITLService:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    def _review_workflow(self, allocation: Allocation, decision: str, reviewer_id: uuid.UUID):
+        """Workflow boundary for one human approve/reject decision.
+
+        Reusing the allocation's ``forecast_run_id`` joins the human decision to
+        the same trace as the AI proposal (the platform treats retries and HITL
+        actions as part of one logical run). Allocations created outside a
+        forecast get their own stable ``hitl-<id>`` workflow id.
+        """
+        run_id = getattr(allocation, "forecast_run_id", None)
+        return workflow(
+            name="bench-forecast-review",
+            workflow_id=str(run_id) if run_id else f"hitl-{allocation.id}",
+            version="v2",
+            context={
+                "decision": decision,
+                "allocation_id": str(allocation.id),
+                "demand_id": str(allocation.demand_id) if allocation.demand_id else None,
+                "role": allocation.role_on_project,
+            },
+            user_id=str(reviewer_id),
+        )
 
     async def submit_proposal(self, allocation_id: uuid.UUID) -> Allocation:
         """Transitions an AI proposal to pending_manager_approval."""
@@ -92,60 +116,61 @@ class HITLService:
         ]:
             raise ValueError(f"Cannot approve allocation in status '{allocation.status}'")
 
-        allocation.status = AllocationStatusEnum.approved_by_manager
-        allocation.approved_by = reviewer_id
-        allocation.approved_at = datetime.utcnow()
+        with self._review_workflow(allocation, "approve", reviewer_id):
+            allocation.status = AllocationStatusEnum.approved_by_manager
+            allocation.approved_by = reviewer_id
+            allocation.approved_at = datetime.utcnow()
 
-        # Update the associated Employee's bench status and current project
-        employee = await self.session.get(Employee, allocation.employee_id)
-        if employee:
-            employee.bench_status = BenchStatusEnum.on_project
-            employee.bench_start_date = None
+            # Update the associated Employee's bench status and current project
+            employee = await self.session.get(Employee, allocation.employee_id)
+            if employee:
+                employee.bench_status = BenchStatusEnum.on_project
+                employee.bench_start_date = None
 
-            project_name = None
-            if allocation.demand_id:
-                demand = await self.session.get(ProjectDemand, allocation.demand_id)
-                if demand:
-                    if demand.project_id:
-                        proj = await self.session.get(Project, demand.project_id)
-                        if proj:
-                            project_name = proj.name
-                    if not project_name and demand.role:
-                        project_name = f"Project ({demand.role})"
-                    
-                    if demand.headcount_needed and demand.headcount_needed > 0:
-                        demand.headcount_needed -= 1
-                    if demand.headcount_needed <= 0:
-                        demand.status = DemandStatusEnum.filled
+                project_name = None
+                if allocation.demand_id:
+                    demand = await self.session.get(ProjectDemand, allocation.demand_id)
+                    if demand:
+                        if demand.project_id:
+                            proj = await self.session.get(Project, demand.project_id)
+                            if proj:
+                                project_name = proj.name
+                        if not project_name and demand.role:
+                            project_name = f"Project ({demand.role})"
 
-            if not project_name:
-                project_name = allocation.role_on_project or "Assigned Project"
+                        if demand.headcount_needed and demand.headcount_needed > 0:
+                            demand.headcount_needed -= 1
+                        if demand.headcount_needed <= 0:
+                            demand.status = DemandStatusEnum.filled
 
-            employee.current_project = project_name
+                if not project_name:
+                    project_name = allocation.role_on_project or "Assigned Project"
 
-        event = HitlReviewEvent(
-            forecast_run_id=allocation.forecast_run_id,
-            allocation_id=allocation.id,
-            reviewer_id=reviewer_id,
-            decision=HitlDecisionEnum.approved,
-            time_to_decision_seconds=time_to_decision_seconds,
-            reviewed_at=datetime.utcnow()
-        )
-        self.session.add(event)
-        await self._maybe_complete_run(allocation.forecast_run_id)
-        await self.session.commit()
+                employee.current_project = project_name
 
-        # Re-fetch with joinedload for Pydantic serialization
-        stmt = (
-            select(Allocation)
-            .options(
-                joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
-                joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+            event = HitlReviewEvent(
+                forecast_run_id=allocation.forecast_run_id,
+                allocation_id=allocation.id,
+                reviewer_id=reviewer_id,
+                decision=HitlDecisionEnum.approved,
+                time_to_decision_seconds=time_to_decision_seconds,
+                reviewed_at=datetime.utcnow()
             )
-            .where(Allocation.id == allocation_id)
-        )
-        res = await self.session.execute(stmt)
-        return res.scalars().first()
+            self.session.add(event)
+            await self._maybe_complete_run(allocation.forecast_run_id)
+            await self.session.commit()
+
+            # Re-fetch with joinedload for Pydantic serialization
+            stmt = (
+                select(Allocation)
+                .options(
+                    joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
+                    joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+                )
+                .where(Allocation.id == allocation_id)
+            )
+            res = await self.session.execute(stmt)
+            return res.scalars().first()
 
     async def reject_allocation(self, allocation_id: uuid.UUID, reviewer_id: uuid.UUID, feedback: str, time_to_decision_seconds: int = None) -> Allocation:
         """Rejects an allocation with manager feedback.
@@ -160,55 +185,56 @@ class HITLService:
         if not allocation:
             raise ValueError(f"Allocation {allocation_id} not found")
 
-        allocation.status = AllocationStatusEnum.rejected_by_manager
-        allocation.manager_notes = feedback
+        with self._review_workflow(allocation, "reject", reviewer_id):
+            allocation.status = AllocationStatusEnum.rejected_by_manager
+            allocation.manager_notes = feedback
 
-        event = HitlReviewEvent(
-            forecast_run_id=allocation.forecast_run_id,
-            allocation_id=allocation.id,
-            reviewer_id=reviewer_id,
-            decision=HitlDecisionEnum.rejected,
-            rejection_feedback=feedback,
-            time_to_decision_seconds=time_to_decision_seconds,
-            reviewed_at=datetime.utcnow()
-        )
-        self.session.add(event)
-
-        # Generate a replacement proposal for the same role. A failure here
-        # must NOT roll back the rejection itself, so it is isolated in a
-        # try/except and only logged.
-        try:
-            replacement = await self._propose_replacement(allocation)
-            if replacement:
-                logger.info(
-                    f"reject_allocation: generated replacement proposal "
-                    f"{replacement.id} for demand {allocation.demand_id}"
-                )
-            else:
-                logger.info(
-                    f"reject_allocation: no replacement candidate available "
-                    f"for demand {allocation.demand_id}"
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                f"reject_allocation: failed to generate replacement proposal "
-                f"for demand {allocation.demand_id}: {exc}",
-                exc_info=True,
+            event = HitlReviewEvent(
+                forecast_run_id=allocation.forecast_run_id,
+                allocation_id=allocation.id,
+                reviewer_id=reviewer_id,
+                decision=HitlDecisionEnum.rejected,
+                rejection_feedback=feedback,
+                time_to_decision_seconds=time_to_decision_seconds,
+                reviewed_at=datetime.utcnow()
             )
+            self.session.add(event)
 
-        await self._maybe_complete_run(allocation.forecast_run_id)
-        await self.session.commit()
+            # Generate a replacement proposal for the same role. A failure here
+            # must NOT roll back the rejection itself, so it is isolated in a
+            # try/except and only logged.
+            try:
+                replacement = await self._propose_replacement(allocation)
+                if replacement:
+                    logger.info(
+                        f"reject_allocation: generated replacement proposal "
+                        f"{replacement.id} for demand {allocation.demand_id}"
+                    )
+                else:
+                    logger.info(
+                        f"reject_allocation: no replacement candidate available "
+                        f"for demand {allocation.demand_id}"
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    f"reject_allocation: failed to generate replacement proposal "
+                    f"for demand {allocation.demand_id}: {exc}",
+                    exc_info=True,
+                )
 
-        stmt = (
-            select(Allocation)
-            .options(
-                joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
-                joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+            await self._maybe_complete_run(allocation.forecast_run_id)
+            await self.session.commit()
+
+            stmt = (
+                select(Allocation)
+                .options(
+                    joinedload(Allocation.project_demand).joinedload(ProjectDemand.project),
+                    joinedload(Allocation.employee).selectinload(Employee.employee_costs),
+                )
+                .where(Allocation.id == allocation_id)
             )
-            .where(Allocation.id == allocation_id)
-        )
-        res = await self.session.execute(stmt)
-        return res.scalars().first()
+            res = await self.session.execute(stmt)
+            return res.scalars().first()
 
     async def _propose_replacement(self, rejected: Allocation) -> Optional[Allocation]:
         """Re-run candidate selection for a rejected allocation's demand.

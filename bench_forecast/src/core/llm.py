@@ -28,10 +28,14 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field, field_validator, model_validator
-from openinference.instrumentation.langchain import LangChainInstrumentor
 
-# Instrument LangChain for Phoenix Tracing
-LangChainInstrumentor().instrument()
+# NOTE: LangChain instrumentation is owned by src.core.observability (the
+# ai-observability-sdk provider) or, as a legacy fallback, by
+# src.core.tracing.PhoenixTracer. Installing an instrumentor here at import
+# time would bind LangChain to the process-global tracer provider *before*
+# init_observability() runs, which makes the SDK skip LangChain with an
+# "already instrumented" warning and detaches framework spans from the
+# workflow root.
 
 from src.core.config import Config
 

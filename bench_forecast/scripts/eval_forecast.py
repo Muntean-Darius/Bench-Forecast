@@ -30,7 +30,17 @@ from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.agents.nodes import _employee_skill_profile, _match_skills, allocation_decider_node
+# Initialise observability before importing the agent (the SDK must install
+# its instrumentors before the first LangChain/Ollama client is created).
+from src.core.observability import (  # noqa: E402
+    flush_observability,
+    init_observability,
+    workflow,
+)
+
+init_observability()
+
+from src.agents.nodes import _employee_skill_profile, _match_skills, allocation_decider_node  # noqa: E402
 
 
 def _emp(name: str, skills: List[str], cost: float = 95.0, seniority: str = "Senior") -> Dict[str, Any]:
@@ -153,6 +163,12 @@ def run_case(case: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+@workflow(
+    name="bench-forecast-eval",
+    workflow_id=f"eval-{int(time.time())}",
+    version="v2",
+    context={"suite": "allocation_decider", "cases": len(CASES)},
+)
 def main() -> int:
     print("=" * 78)
     print("Allocation agent evaluation")
@@ -184,4 +200,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    flush_observability()
+    raise SystemExit(exit_code)
