@@ -93,7 +93,7 @@ CASES: List[Dict[str, Any]] = [
     {
         "name": "partial match -> train/allocate",
         "bench": [_emp("Bob", ["Java", "SQL"])],
-        "demand": _demand("Java Backend", ["Java", "Spring", "SQL", "REST"]),
+        "demand": _demand("Java Backend", ["Java", "Spring", "SQL", "REST"], margin=10.0),
         "expect_actions": {"train", "allocate"},
         "employee_required": True,
     },

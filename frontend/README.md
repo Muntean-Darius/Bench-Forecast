@@ -1,92 +1,83 @@
-# Bench Forecast — React Frontend
+# Bench Forecast — Frontend
 
-Production React + TypeScript + Tailwind frontend for the Bench Forecasting AI system.
+React + TypeScript + Vite frontend for Bench Forecast.
 
-## Tech Stack
+> **The repository root [`README.md`](../README.md) is the canonical project guide** — setup, roles, database, migrations, seeding, APIs, testing and operations all live there. This file only covers frontend-specific structure.
 
-| Layer | Library |
-|---|---|
-| Framework | React 18 + TypeScript |
-| Build | Vite 5 |
-| Routing | React Router 6 |
-| Styling | Tailwind CSS 3 |
-| Data fetching | TanStack React Query 5 |
-| Charts | Recharts 2 |
+## Stack
 
-## Project Structure
+- React 18
+- TypeScript
+- Vite 5
+- React Router 6
+- Tailwind CSS 3
+- TanStack React Query 5
+- Recharts 2
 
-```
-frontend/
-├── src/
-│   ├── api/
-│   │   └── client.ts          # fetch wrapper → FastAPI /api/v1/*
-│   ├── data/
-│   │   └── mockData.ts        # Seeded from bench_forecast/data/mock_data.json
-│   ├── pages/
-│   │   ├── Dashboard.tsx      # Page A — KPIs + charts + quick actions
-│   │   ├── BenchPipeline.tsx  # Page B — Bench (supply) + Projects (demand) tables
-│   │   ├── ActionQueue.tsx    # Page C — AI Action Queue (HITL list)
-│   │   ├── HITLApproval.tsx   # Page D — Full-page HITL Approval view
-│   │   └── Settings.tsx       # Forecast engine + API config
-│   ├── types/
-│   │   └── index.ts           # TypeScript types mirroring SQLAlchemy models
-│   ├── App.tsx                # Shell: fixed sidebar + React Router routes
-│   ├── main.tsx               # Entry point + QueryClientProvider
-│   └── index.css              # Tailwind + component classes
-├── tailwind.config.ts
-├── vite.config.ts             # Dev server proxies /api → http://localhost:8000
-└── package.json
-```
+## Run
 
-## Getting Started
+From the repository root:
 
 ```bash
-cd frontend
-npm install
-npm run dev          # → http://localhost:3000
+cp .env.example .env
+make setup
+make api     # terminal 1 → http://localhost:8000
+make web     # terminal 2 → http://localhost:3000
 ```
 
-The Vite dev server proxies `/api` requests to the FastAPI backend on `http://localhost:8000`.  
-Start the backend first:
-
-```bash
-cd bench_forecast
-uvicorn src.api.main:app --reload --port 8000
-```
+Vite proxies `/api` and `/health` to `VITE_API_PROXY_TARGET`
+(default `http://localhost:8000`) from the single root `.env`.
 
 ## Routes
 
-| Path | Component | Description |
+| Path | Page | Access |
 |---|---|---|
-| `/` | `Dashboard` | Global overview — KPIs, charts, urgent queue |
-| `/bench` | `BenchPipeline` | Sortable/filterable bench + pipeline tables |
-| `/queue` | `ActionQueue` | AI-generated proposals by category |
-| `/queue/:id` | `HITLApproval` | Full-page HITL review with approve / upskill / reject |
-| `/settings` | `Settings` | Forecast horizon, win probability threshold, API base URL |
+| `/` | Dashboard | Admin; managers redirect to `/team` |
+| `/projects` | Project directory | Admin / manager |
+| `/projects/:id` | Project detail, roster, assign drawer, AI recommendations | Admin / manager |
+| `/team` | Team workload / My Team | Admin / manager |
+| `/approvals` | CV approval queue and diff modal | Admin / manager |
+| `/trainings` | Training assignment and completion | Admin / manager |
+| `/bench` | Bench & Pipeline | Admin / manager |
+| `/queue` | AI Action Queue | Admin / manager |
+| `/queue/:id` | HITL approval | Admin / manager |
+| `/settings` | Forecast settings | Admin / manager |
+| employee portal | Projects & Workload / Trainings / Profile & CV | Employee |
 
-## Financial Logic
+## Structure
 
-Margin is computed at display time from the SQLAlchemy formula:
-
+```text
+src/
+├── api/client.ts            # typed fetch wrapper + structured ApiError
+├── components/
+│   ├── cv/                  # CVDiffView, CVStatusCard
+│   ├── icons/               # inline SVG icon set
+│   ├── projects/            # summary card, roster, assign drawer, AI panel
+│   ├── shared/              # CapacityBar, badges
+│   └── trainings/           # TrainingCard
+├── contexts/AuthContext.tsx # admin | manager | employee session
+├── hooks/                   # pending CV badge count
+├── pages/                   # role-aware pages
+├── types/index.ts           # API response types
+├── App.tsx                  # role-aware shell and routes
+├── main.tsx                 # entry point
+└── index.css                # Tailwind + shared component classes
 ```
-projected_margin = (target_bill_rate - hourly_cost_rate) / target_bill_rate * 100
+
+## Build
+
+```bash
+cd frontend
+npm run build
 ```
 
-Color coding: ≥ 30% → green · 15–30% → amber · < 15% → red.
+Current status: TypeScript compilation and Vite production build pass. The only
+advisory is Vite's non-blocking large-chunk warning.
 
-## Connecting to Live API
+## Demo logins
 
-Replace mock data imports with TanStack Query hooks that call `src/api/client.ts`:
+See the root README’s **Roles and Demo Accounts** section. Seeded accounts:
 
-```typescript
-import { useQuery } from '@tanstack/react-query'
-import { api } from '../api/client'
-
-const { data } = useQuery({
-  queryKey: ['health'],
-  queryFn: api.health,
-})
-```
-
-The `GenerateForecastRequest` and `ExecuteForecastRequest` types in `src/types/index.ts`
-match the FastAPI Pydantic schemas exactly.
+- `admin` / `admin`
+- `manager` / `manager`
+- generated employee username / `employee`

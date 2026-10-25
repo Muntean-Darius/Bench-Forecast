@@ -1,5 +1,10 @@
 # Bench Forecast: Architecture & Manual Testing Guide
 
+> **The repository root [`README.md`](../README.md) is the canonical project guide**
+> for setup, roles, schema, migrations, seeding, APIs, capacity rules, CV review,
+> trainings, notifications, frontend routes and verification. This document
+> focuses on the forecast/RAG internals and manual testing flow.
+
 This document provides a comprehensive overview of the **Bench Forecast** backend system. It details the directory structure, the responsibilities of core files, the data flow of the LangGraph state machine, and provides a step-by-step guide to manually testing the pipeline locally.
 
 ---

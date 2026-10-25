@@ -1,6 +1,6 @@
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import clsx from 'clsx'
-import { AuthProvider, useAuth } from './contexts/AuthContext'
+import { AuthProvider, useAuth, type UserRole } from './contexts/AuthContext'
 import Login from './pages/Login'
 import EmployeePortal from './pages/EmployeePortal'
 import Dashboard from './pages/Dashboard'
@@ -8,6 +8,12 @@ import BenchPipeline from './pages/BenchPipeline'
 import ActionQueue from './pages/ActionQueue'
 import HITLApproval from './pages/HITLApproval'
 import Settings from './pages/Settings'
+import Projects from './pages/Projects'
+import ProjectDetail from './pages/ProjectDetail'
+import Team from './pages/Team'
+import CVApprovals from './pages/CVApprovals'
+import Trainings from './pages/Trainings'
+import { usePendingCvCount } from './hooks/usePendingCvCount'
 
 // ─── Icons (inline SVG, no external dep) ─────────────────────────────────────
 
@@ -25,6 +31,10 @@ function Icon({ d, className }: { d: string; className?: string }) {
 
 const ICONS = {
   dashboard: 'M3 4a1 1 0 011-1h12a1 1 0 011 1v2a1 1 0 01-1 1H4a1 1 0 01-1-1V4zm0 6a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H4a1 1 0 01-1-1v-6zm10 0a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z',
+  projects: 'M2 5a2 2 0 012-2h4l2 2h6a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V5z',
+  team: 'M7 9a3 3 0 100-6 3 3 0 000 6zm7 0a3 3 0 100-6 3 3 0 000 6zM1 17a5 5 0 0110 0v1H1v-1zm12-4a5 5 0 016 4.9V18h-6v-1a6.9 6.9 0 00-1.2-4H13z',
+  approvals: 'M4 2a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2V7l-5-5H4zm7 1.5L15.5 8H11V3.5zM6 11h8v2H6v-2zm0 3.5h6v2H6v-2z',
+  trainings: 'M10 2L1 6l9 4 7-3.1V14h2V6L10 2zM5 10.6V14c0 1.7 2.2 3 5 3s5-1.3 5-3v-3.4l-5 2.2-5-2.2z',
   bench: 'M9 6a3 3 0 11-6 0 3 3 0 016 0zm8 0a3 3 0 11-6 0 3 3 0 016 0zM5 14a5 5 0 0110 0v1H5v-1z',
   queue: 'M9 2a1 1 0 000 2h2a1 1 0 100-2H9z M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z',
   settings: 'M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947z M10 13a3 3 0 100-6 3 3 0 000 6z',
@@ -32,18 +42,48 @@ const ICONS = {
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
 
-const NAV_ITEMS = [
-  { to: '/',        label: 'Dashboard',   icon: ICONS.dashboard },
-  { to: '/bench',   label: 'Bench & Pipeline', icon: ICONS.bench },
-  { to: '/queue',   label: 'AI Action Queue',  icon: ICONS.queue },
-  { to: '/settings',label: 'Settings',    icon: ICONS.settings },
+interface NavItem {
+  to: string
+  label: string
+  icon: string
+  badgeKey?: 'cv'
+}
+
+const ADMIN_NAV: NavItem[] = [
+  { to: '/', label: 'Dashboard', icon: ICONS.dashboard },
+  { to: '/projects', label: 'Projects', icon: ICONS.projects },
+  { to: '/team', label: 'Team Workload', icon: ICONS.team },
+  { to: '/approvals', label: 'CV Approvals', icon: ICONS.approvals, badgeKey: 'cv' },
+  { to: '/trainings', label: 'Trainings', icon: ICONS.trainings },
+  { to: '/bench', label: 'Bench & Pipeline', icon: ICONS.bench },
+  { to: '/queue', label: 'AI Action Queue', icon: ICONS.queue },
+  { to: '/settings', label: 'Settings', icon: ICONS.settings },
 ]
 
-function Sidebar() {
+const MANAGER_NAV: NavItem[] = [
+  { to: '/team', label: 'My Team', icon: ICONS.team },
+  { to: '/projects', label: 'Projects', icon: ICONS.projects },
+  { to: '/approvals', label: 'CV Approvals', icon: ICONS.approvals, badgeKey: 'cv' },
+  { to: '/trainings', label: 'Trainings', icon: ICONS.trainings },
+  { to: '/bench', label: 'Bench', icon: ICONS.bench },
+  { to: '/queue', label: 'AI Action Queue', icon: ICONS.queue },
+  { to: '/settings', label: 'Settings', icon: ICONS.settings },
+]
+
+function Sidebar({
+  role,
+  pendingCvCount,
+}: {
+  role: UserRole
+  pendingCvCount: number
+}) {
   const { pathname } = useLocation()
   const { user, logout } = useAuth()
+  const navItems = role === 'admin' ? ADMIN_NAV : MANAGER_NAV
 
-  const initials = user?.full_name?.split(' ').map(n => n[0]).join('') || '??'
+  const initials = user?.full_name?.split(' ').map((n) => n[0]).join('') || '??'
+  const roleLabel =
+    role === 'admin' ? 'Admin' : role === 'manager' ? 'People Manager' : 'Employee'
 
   return (
     <aside className="fixed inset-y-0 left-0 z-30 w-56 bg-white border-r border-gray-200 flex flex-col">
@@ -51,7 +91,7 @@ function Sidebar() {
       <div className="flex items-center gap-2.5 px-4 h-14 border-b border-gray-200 shrink-0">
         <div className="w-6 h-6 bg-gray-900 rounded flex items-center justify-center">
           <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
-            <path d="M8 1L1 5v6l7 4 7-4V5L8 1zm0 2.18L13.09 6 8 8.82 2.91 6 8 3.18zM3 7.27l4.5 2.57v3.9L3 11.17V7.27zm5.5 6.47v-3.9L13 7.27v3.9l-4.5 2.57z"/>
+            <path d="M8 1L1 5v6l7 4 7-4V5L8 1zm0 2.18L13.09 6 8 8.82 2.91 6 8 3.18zM3 7.27l4.5 2.57v3.9L3 11.17V7.27zm5.5 6.47v-3.9L13 7.27v3.9l-4.5 2.57z" />
           </svg>
         </div>
         <div>
@@ -62,8 +102,9 @@ function Sidebar() {
 
       {/* Nav */}
       <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
-        {NAV_ITEMS.map(({ to, label, icon }) => {
+        {navItems.map(({ to, label, icon, badgeKey }) => {
           const isActive = to === '/' ? pathname === '/' : pathname.startsWith(to)
+          const showBadge = badgeKey === 'cv' && pendingCvCount > 0
           return (
             <NavLink
               key={to}
@@ -71,7 +112,12 @@ function Sidebar() {
               className={clsx('nav-item', { active: isActive })}
             >
               <Icon d={icon} />
-              {label}
+              <span className="truncate">{label}</span>
+              {showBadge && (
+                <span className="ml-auto inline-flex min-w-5 h-5 items-center justify-center rounded-full bg-yellow-400 px-1 text-[10px] font-semibold text-gray-900 tabnum">
+                  {pendingCvCount > 99 ? '99+' : pendingCvCount}
+                </span>
+              )}
             </NavLink>
           )
         })}
@@ -86,7 +132,7 @@ function Sidebar() {
             </div>
             <div className="min-w-0">
               <p className="text-xs font-medium text-gray-800 truncate">{user?.full_name}</p>
-              <p className="text-[10px] text-gray-400 font-mono capitalize">{user?.role}</p>
+              <p className="text-[10px] text-gray-400 font-mono">{roleLabel}</p>
             </div>
           </div>
           <button
@@ -104,19 +150,30 @@ function Sidebar() {
   )
 }
 
-// ─── Manager Layout ───────────────────────────────────────────────────────────
+// ─── Manager / Admin Layout ───────────────────────────────────────────────────
 
-function ManagerLayout() {
+function ManagerLayout({ role }: { role: 'admin' | 'manager' }) {
+  const pendingCvCount = usePendingCvCount()
+
   return (
     <div className="flex h-screen overflow-hidden">
-      <Sidebar />
+      <Sidebar role={role} pendingCvCount={pendingCvCount} />
       <main className="flex-1 ml-56 overflow-y-auto bg-gray-50">
         <Routes>
-          <Route path="/"          element={<Dashboard />} />
-          <Route path="/bench"     element={<BenchPipeline />} />
-          <Route path="/queue"     element={<ActionQueue />} />
+          <Route
+            path="/"
+            element={role === 'admin' ? <Dashboard /> : <Navigate to="/team" replace />}
+          />
+          <Route path="/projects" element={<Projects />} />
+          <Route path="/projects/:id" element={<ProjectDetail />} />
+          <Route path="/team" element={<Team />} />
+          <Route path="/approvals" element={<CVApprovals />} />
+          <Route path="/trainings" element={<Trainings />} />
+          <Route path="/bench" element={<BenchPipeline />} />
+          <Route path="/queue" element={<ActionQueue />} />
           <Route path="/queue/:id" element={<HITLApproval />} />
-          <Route path="/settings"  element={<Settings />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<Navigate to={role === 'admin' ? '/' : '/team'} replace />} />
         </Routes>
       </main>
     </div>
@@ -134,7 +191,7 @@ function AppContent() {
         <div className="flex items-center gap-3">
           <div className="w-6 h-6 bg-gray-900 rounded flex items-center justify-center animate-pulse">
             <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
-              <path d="M8 1L1 5v6l7 4 7-4V5L8 1zm0 2.18L13.09 6 8 8.82 2.91 6 8 3.18zM3 7.27l4.5 2.57v3.9L3 11.17V7.27zm5.5 6.47v-3.9L13 7.27v3.9l-4.5 2.57z"/>
+              <path d="M8 1L1 5v6l7 4 7-4V5L8 1zm0 2.18L13.09 6 8 8.82 2.91 6 8 3.18zM3 7.27l4.5 2.57v3.9L3 11.17V7.27zm5.5 6.47v-3.9L13 7.27v3.9l-4.5 2.57z" />
             </svg>
           </div>
           <p className="text-sm text-gray-500">Loading...</p>
@@ -151,7 +208,7 @@ function AppContent() {
     return <EmployeePortal />
   }
 
-  return <ManagerLayout />
+  return <ManagerLayout role={user.role === 'admin' ? 'admin' : 'manager'} />
 }
 
 export default function App() {

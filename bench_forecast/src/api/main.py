@@ -1,7 +1,6 @@
 """FastAPI backend for Bench Forecast allocation recommendations."""
 
 import logging
-from pathlib import Path
 from typing import Any, Dict
 from fastapi import FastAPI, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +36,11 @@ from src.api.routers.finance import router as finance_router
 from src.api.routers.hitl import router as hitl_router
 from src.api.routers.forecast import router as forecast_router
 from src.api.routers.analytics import router as analytics_router
+from src.api.routers.projects import router as projects_router
+from src.api.routers.team import router as team_router
+from src.api.routers.cv_reviews import router as cv_reviews_router
+from src.api.routers.trainings import router as trainings_router
+from src.api.routers.notifications import router as notifications_router
 
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,11 @@ app.include_router(finance_router)
 app.include_router(hitl_router)
 app.include_router(forecast_router)
 app.include_router(analytics_router)
+app.include_router(projects_router)
+app.include_router(team_router)
+app.include_router(cv_reviews_router)
+app.include_router(trainings_router)
+app.include_router(notifications_router)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +90,10 @@ async def startup():
         logger.info(f"OpenAI-compatible Model: {Config.LLM_MODEL} @ {Config.LLM_BASE_URL}")
     else:
         logger.info(f"Ollama Model: {Config.OLLAMA_MODEL} @ {Config.OLLAMA_BASE_URL}")
-    logger.info(f"Database: {Config.SQLITE_DB_PATH}")
+    logger.info(
+        f"Database: postgresql://{Config.POSTGRES_HOST}:{Config.POSTGRES_PORT}/"
+        f"{Config.POSTGRES_DB}"
+    )
     logger.info(
         "AI observability: "
         f"{'Enabled' if _OBSERVABILITY_ACTIVE else 'Disabled'}"
@@ -104,20 +116,18 @@ async def startup():
     from src.auth.auth import init_auth_db
     init_auth_db()
 
-    # Auto-seed ChromaDB from mock_data.json if empty
+    # ChromaDB is populated by the seeder (`make seed`). Report status only.
     try:
-        mock_data_path = Path(__file__).resolve().parents[2] / "data" / "mock_data.json"
-        if mock_data_path.exists():
-            vector_mgr = VectorStoreManager()
-            if vector_mgr.collection.count() == 0:
-                count = vector_mgr.load_and_index_mock_data(str(mock_data_path))
-                logger.info(f"✓ ChromaDB auto-seeded: {count} employee profiles indexed")
-            else:
-                logger.info(f"✓ ChromaDB already seeded ({vector_mgr.collection.count()} profiles)")
+        vector_mgr = VectorStoreManager()
+        count = vector_mgr.collection.count()
+        if count == 0:
+            logger.warning(
+                "ChromaDB is empty — run `make seed` to load employee profiles"
+            )
         else:
-            logger.warning(f"mock_data.json not found at {mock_data_path}")
+            logger.info(f"✓ ChromaDB ready ({count} employee profiles)")
     except Exception as e:
-        logger.warning(f"ChromaDB seeding failed (non-fatal): {e}")
+        logger.warning(f"ChromaDB check failed (non-fatal): {e}")
 
 
 @app.on_event("shutdown")
@@ -168,7 +178,20 @@ async def get_current_user_info(authorization: str = Header(None)):
 async def get_employee_portal(employee_id: str):
     """Get employee's current project and next assignment info."""
     from src.database.database import get_sync_db
-    from src.database.models import Employee, EmployeeCost, Allocation, ProjectDemand, DemandStatusEnum, AllocationStatusEnum
+    from src.database.models import (
+        Employee,
+        EmployeeCost,
+        Allocation,
+        ProjectDemand,
+        DemandStatusEnum,
+        AllocationStatusEnum,
+        CvApprovalStatusEnum,
+        CvReviewRequest,
+        Document,
+        DocumentTypeEnum,
+        TrainingAssignment,
+        TrainingStatusEnum,
+    )
     from datetime import date
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
@@ -231,6 +254,9 @@ async def get_employee_portal(employee_id: str):
                     "role": a.role_on_project,
                     "role_on_project": a.role_on_project,
                     "allocation_pct": float(a.allocation_pct),
+                    "allocated_hours_per_day": float(
+                        a.allocated_hours_per_day or 0
+                    ),
                     "start_date": str(a.start_date) if a.start_date else None,
                     "end_date": str(a.end_date) if a.end_date else None,
                     "status": status_label,
@@ -239,7 +265,12 @@ async def get_employee_portal(employee_id: str):
                 })
 
             demand_rows = session.execute(
-                select(ProjectDemand).where(ProjectDemand.status == DemandStatusEnum.open)
+                select(ProjectDemand).where(
+                    ProjectDemand.status.in_([
+                        DemandStatusEnum.open,
+                        DemandStatusEnum.partially_filled,
+                    ])
+                )
             ).scalars().all()
 
             open_demands = []
@@ -257,6 +288,13 @@ async def get_employee_portal(employee_id: str):
                     "role": d.role,
                     "required_skills": skills,
                     "project_id": str(d.project_id),
+                    "hours_per_day": float(d.hours_per_day or 0),
+                    "seniority_level": (
+                        d.required_experience_level.value
+                        if d.required_experience_level is not None
+                        and hasattr(d.required_experience_level, "value")
+                        else None
+                    ),
                     "start_date": str(d.needed_by_date) if d.needed_by_date else str(date.today()),
                     "win_probability": float(d.win_probability) if d.win_probability else 0.8,
                     "description": d.description or f"Demand for {d.role}",
@@ -277,6 +315,123 @@ async def get_employee_portal(employee_id: str):
                 sen_defaults = {"junior": 40.0, "mid": 65.0, "senior": 95.0, "lead": 125.0, "principal": 160.0}
                 cost_rate = sen_defaults.get(sen_val, 65.0)
 
+            from src.services.workforce_service import summarize_allocations
+
+            capacity = summarize_allocations(emp, emp.allocations)
+
+            training_rows = session.execute(
+                select(TrainingAssignment)
+                .where(
+                    TrainingAssignment.employee_id == emp_uuid,
+                    TrainingAssignment.status.in_([
+                        TrainingStatusEnum.assigned,
+                        TrainingStatusEnum.in_progress,
+                        TrainingStatusEnum.completed,
+                    ]),
+                )
+                .order_by(TrainingAssignment.assigned_at.desc())
+            ).scalars().all()
+            trainings = [
+                {
+                    "id": str(t.id),
+                    "title": t.title,
+                    "targeted_skills": t.targeted_skills or [],
+                    "ai_upskilling_path": t.ai_upskilling_path,
+                    "status": (
+                        t.status.value if hasattr(t.status, "value") else str(t.status)
+                    ),
+                    "assigned_at": str(t.assigned_at) if t.assigned_at else None,
+                    "target_completion_date": (
+                        str(t.target_completion_date)
+                        if t.target_completion_date
+                        else None
+                    ),
+                    "completed_at": str(t.completed_at) if t.completed_at else None,
+                    "notes": t.notes,
+                }
+                for t in training_rows
+            ]
+
+            pending_review = session.execute(
+                select(CvReviewRequest)
+                .where(
+                    CvReviewRequest.employee_id == emp_uuid,
+                    CvReviewRequest.status == CvApprovalStatusEnum.pending_approval,
+                )
+                .order_by(CvReviewRequest.requested_at.desc())
+            ).scalars().first()
+            latest_rejected = session.execute(
+                select(CvReviewRequest)
+                .where(
+                    CvReviewRequest.employee_id == emp_uuid,
+                    CvReviewRequest.status == CvApprovalStatusEnum.rejected,
+                )
+                .order_by(CvReviewRequest.reviewed_at.desc())
+            ).scalars().first()
+            current_doc = session.execute(
+                select(Document)
+                .where(
+                    Document.employee_id == emp_uuid,
+                    Document.document_type == DocumentTypeEnum.cv,
+                    Document.approval_status == CvApprovalStatusEnum.approved,
+                    Document.is_current.is_(True),
+                )
+                .order_by(Document.uploaded_at.desc())
+            ).scalars().first()
+
+            if pending_review is not None:
+                cv_status = {
+                    "state": "pending_approval",
+                    "label": "Pending Manager Approval",
+                    "review_id": str(pending_review.id),
+                    "document_id": str(pending_review.document_id),
+                    "version": None,
+                    "manager_id": str(emp.manager_id) if emp.manager_id else None,
+                    "manager_name": (
+                        f"{emp.manager.first_name} {emp.manager.last_name}".strip()
+                        if emp.manager else None
+                    ),
+                    "manager_comment": None,
+                    "proposed_skills": pending_review.proposed_skills or [],
+                    "submitted_at": str(pending_review.requested_at),
+                }
+            elif latest_rejected is not None and (
+                current_doc is None
+                or latest_rejected.reviewed_at is None
+                or latest_rejected.reviewed_at > current_doc.uploaded_at
+            ):
+                cv_status = {
+                    "state": "changes_requested",
+                    "label": "Changes Requested",
+                    "review_id": str(latest_rejected.id),
+                    "document_id": str(latest_rejected.document_id),
+                    "version": None,
+                    "manager_id": str(emp.manager_id) if emp.manager_id else None,
+                    "manager_name": (
+                        f"{emp.manager.first_name} {emp.manager.last_name}".strip()
+                        if emp.manager else None
+                    ),
+                    "manager_comment": latest_rejected.manager_comment,
+                    "proposed_skills": latest_rejected.proposed_skills or [],
+                    "submitted_at": str(latest_rejected.requested_at),
+                }
+            else:
+                cv_status = {
+                    "state": "live",
+                    "label": "Live / Active",
+                    "review_id": None,
+                    "document_id": str(current_doc.id) if current_doc else None,
+                    "version": current_doc.version if current_doc else None,
+                    "manager_id": str(emp.manager_id) if emp.manager_id else None,
+                    "manager_name": (
+                        f"{emp.manager.first_name} {emp.manager.last_name}".strip()
+                        if emp.manager else None
+                    ),
+                    "manager_comment": None,
+                    "proposed_skills": [],
+                    "submitted_at": str(current_doc.uploaded_at) if current_doc else None,
+                }
+
             return {
                 "employee": {
                     "id": str(emp.id),
@@ -287,9 +442,32 @@ async def get_employee_portal(employee_id: str):
                     "experience_years": float(emp.experience_years) if emp.experience_years else 3.0,
                     "cost_rate": cost_rate,
                     "profile_text": emp.profile_text or "",
+                    "employment_type": (
+                        emp.employment_type.value
+                        if hasattr(emp.employment_type, "value")
+                        else str(emp.employment_type or "full_time")
+                    ),
+                    "daily_capacity_hours": float(capacity["daily_capacity_hours"]),
+                    "committed_hours_per_day": float(capacity["committed_hours_per_day"]),
+                    "remaining_available_hours": float(capacity["remaining_available_hours"]),
+                    "utilization_pct": float(capacity["utilization_pct"]),
+                    "manager_id": str(emp.manager_id) if emp.manager_id else None,
+                    "manager_name": (
+                        f"{emp.manager.first_name} {emp.manager.last_name}".strip()
+                        if emp.manager else None
+                    ),
+                },
+                "capacity": {
+                    "daily_capacity_hours": float(capacity["daily_capacity_hours"]),
+                    "committed_hours_per_day": float(capacity["committed_hours_per_day"]),
+                    "reserved_hours_per_day": float(capacity["reserved_hours_per_day"]),
+                    "remaining_available_hours": float(capacity["remaining_available_hours"]),
+                    "utilization_pct": float(capacity["utilization_pct"]),
                 },
                 "allocations": allocations,
                 "open_demands": open_demands,
+                "trainings": trainings,
+                "cv_status": cv_status,
             }
     except HTTPException:
         raise
@@ -327,6 +505,14 @@ async def update_employee_profile(employee_id: str, payload: UpdateProfileReques
     import uuid
 
     user = await get_current_user(authorization)
+    if str(user.get("role") or "").lower() != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Direct profile edits are disabled. Employees and managers must "
+                "upload a CV PDF; employee updates are staged for manager approval."
+            ),
+        )
     try:
         emp_uuid = uuid.UUID(employee_id)
     except ValueError:
@@ -454,6 +640,14 @@ async def get_employees(horizon_days: int = 90):
                     2.0 if emp.experience_level.value == 'mid' else 1.0
                 )
 
+                from src.services.workforce_service import summarize_allocations
+
+                capacity = summarize_allocations(emp, emp.allocations)
+                manager_name = (
+                    f"{emp.manager.first_name} {emp.manager.last_name}".strip()
+                    if emp.manager
+                    else None
+                )
                 result.append({
                     "id": str(emp.id),
                     "name": full_name,
@@ -466,7 +660,18 @@ async def get_employees(horizon_days: int = 90):
                     "profile_text": emp.profile_text or "",
                     "job_title": emp.job_title or "",
                     "experience_level": emp.experience_level.value if emp.experience_level else "",
-                    "bench_status": emp.bench_status.value if emp.bench_status else "bench"
+                    "bench_status": emp.bench_status.value if emp.bench_status else "bench",
+                    "manager_id": str(emp.manager_id) if emp.manager_id else None,
+                    "manager_name": manager_name,
+                    "employment_type": (
+                        emp.employment_type.value
+                        if hasattr(emp.employment_type, "value")
+                        else str(emp.employment_type)
+                    ),
+                    "daily_capacity_hours": float(capacity["daily_capacity_hours"]),
+                    "committed_hours_per_day": float(capacity["committed_hours_per_day"]),
+                    "remaining_available_hours": float(capacity["remaining_available_hours"]),
+                    "utilization_pct": float(capacity["utilization_pct"]),
                 })
             return result
     except Exception as e:
@@ -486,7 +691,12 @@ async def get_demands(min_win_probability: float = 0.75, horizon_days: int = 365
             stmt = (
                 select(ProjectDemand)
                 .join(Project, ProjectDemand.project_id == Project.id)
-                .where(ProjectDemand.status == DemandStatusEnum.open)
+                .where(
+                    ProjectDemand.status.in_([
+                        DemandStatusEnum.open,
+                        DemandStatusEnum.partially_filled,
+                    ])
+                )
             )
             results = session.execute(stmt).scalars().all()
 
@@ -517,6 +727,11 @@ async def get_demands(min_win_probability: float = 0.75, horizon_days: int = 365
                     "project_name": d.project.name if d.project else f"Project {str(d.project_id)[:8]}",
                     "start_date": str(d.needed_by_date) if d.needed_by_date else str(date.today()),
                     "headcount": d.headcount_needed,
+                    "headcount_required": d.headcount_required,
+                    "hours_per_day": float(d.hours_per_day or 0),
+                    "status": (
+                        d.status.value if hasattr(d.status, "value") else str(d.status)
+                    ),
                     "win_probability": win_prob,
                     "description": d.description or f"Demand for {d.role}",
                     "target_bill_rate": float(d.target_bill_rate) if d.target_bill_rate else 100.0,
@@ -527,9 +742,8 @@ async def get_demands(min_win_probability: float = 0.75, horizon_days: int = 365
         logger.error(f"Failed to fetch demands: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/v1/projects", status_code=status.HTTP_200_OK)
 @app.get("/api/projects", status_code=status.HTTP_200_OK)
-async def get_projects():
+async def get_projects_legacy():
     from src.database.database import get_sync_db
     from src.database.models import Project, ProjectDemand, DemandStatusEnum
     from sqlalchemy import select, func

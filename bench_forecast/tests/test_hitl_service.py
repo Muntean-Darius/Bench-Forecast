@@ -34,6 +34,8 @@ def _make_employee(name: str, skills: str, cost: float) -> Employee:
         profile_text=skills,
     )
     emp.employee_costs = []
+    emp.allocations = []
+    emp.daily_capacity_hours = Decimal("8.00")
     emp.hourly_cost_rate = Decimal(str(cost))
     return emp
 
@@ -77,13 +79,11 @@ async def test_reject_allocation_proposes_replacement_for_same_demand():
 
     taken_result = MagicMock()
     taken_result.scalars.return_value.all.return_value = [rejected_employee_id]
-    busy_result = MagicMock()
-    busy_result.scalars.return_value.all.return_value = []
     emp_result = MagicMock()
     emp_result.scalars.return_value.all.return_value = [weak, strong]
 
     session.get.side_effect = [demand]
-    session.execute.side_effect = [taken_result, busy_result, emp_result]
+    session.execute.side_effect = [taken_result, emp_result]
 
     replacement = await service._propose_replacement(rejected)
 
@@ -141,8 +141,7 @@ async def test_propose_replacement_recommends_hire_when_no_candidates():
     session.get.side_effect = [demand]
     session.execute.side_effect = [
         _empty_result(),   # demand allocations
-        _empty_result(),   # busy allocations
-        _empty_result(),   # bench candidates
+        _empty_result(),   # candidate pool
         _empty_result(),   # existing open hire recommendation
     ]
 
@@ -182,13 +181,11 @@ async def test_propose_replacement_honours_feedback_skill_requirement():
 
     taken_result = MagicMock()
     taken_result.scalars.return_value.all.return_value = []
-    busy_result = MagicMock()
-    busy_result.scalars.return_value.all.return_value = []
     emp_result = MagicMock()
     emp_result.scalars.return_value.all.return_value = [candidate]
 
     session.get.side_effect = [demand]
-    session.execute.side_effect = [taken_result, busy_result, emp_result, _empty_result()]
+    session.execute.side_effect = [taken_result, emp_result, _empty_result()]
 
     replacement = await service._propose_replacement(rejected)
 

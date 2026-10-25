@@ -89,6 +89,7 @@ class ChromaIngestionStore:
         internal_hourly_cost: float,
         chunks: list[str],
         embeddings: list[list[float]],
+        skills: Optional[str] = None,
     ) -> str:
         """Upsert all chunks of a single document into ChromaDB.
 
@@ -149,6 +150,7 @@ class ChromaIngestionStore:
                     # queries on; keep internal_hourly_cost for backward compat.
                     "internal_hourly_cost": float(internal_hourly_cost),
                     "hourly_cost_rate": float(internal_hourly_cost),
+                    "skills": str(skills or ""),
                 }
             )
 

@@ -124,7 +124,16 @@ def infer_role_from_skills(skills, category: str = "") -> tuple:
 #   fill = number of seats already staffed (allocations); the remainder becomes
 #   an open ProjectDemand.
 # ---------------------------------------------------------------------------
-def _role(title, skills, bill_rate, margin, headcount=1, fill=0):
+def _role(
+    title,
+    skills,
+    bill_rate,
+    margin,
+    headcount=1,
+    fill=0,
+    hours_per_day=8,
+    seniority=None,
+):
     return {
         "title": title,
         "required_skills": skills,
@@ -132,6 +141,8 @@ def _role(title, skills, bill_rate, margin, headcount=1, fill=0):
         "target_margin": margin,
         "headcount": headcount,
         "fill": fill,
+        "hours_per_day": hours_per_day,
+        "seniority": seniority,
     }
 
 
@@ -223,11 +234,11 @@ PROJECT_BLUEPRINTS = [
         "start_days_ago": 95,
         "duration_days": 240,
         "roles": [
-            _role("Database Developer", ["SQL", "Oracle", "SQL Server"], 110, 29, headcount=8, fill=8),
-            _role("Java Backend Developer", ["Java", "Spring", "REST"], 116, 28, headcount=8, fill=8),
-            _role("Data Analyst", ["SQL", "Excel", "Statistics"], 98, 30, headcount=5, fill=5),
-            _role("QA Engineer", ["Selenium", "QA", "Test Automation"], 90, 26, headcount=4, fill=4),
-            _role("Systems/Network Engineer", ["Linux", "Networking", "Firewall"], 108, 28, headcount=5, fill=5),
+            _role("Database Developer", ["SQL", "Oracle", "SQL Server"], 110, 29, headcount=8, fill=8, hours_per_day=4, seniority="senior"),
+            _role("Java Backend Developer", ["Java", "Spring", "REST"], 116, 28, headcount=8, fill=8, hours_per_day=8, seniority="senior"),
+            _role("Data Analyst", ["SQL", "Excel", "Statistics"], 98, 30, headcount=5, fill=5, hours_per_day=4, seniority="mid"),
+            _role("QA Engineer", ["Selenium", "QA", "Test Automation"], 90, 26, headcount=4, fill=3, hours_per_day=4, seniority="mid"),
+            _role("Systems/Network Engineer", ["Linux", "Networking", "Firewall"], 108, 28, headcount=5, fill=5, hours_per_day=4, seniority="senior"),
         ],
     },
     {
@@ -240,12 +251,12 @@ PROJECT_BLUEPRINTS = [
         "start_days_ago": 70,
         "duration_days": 260,
         "roles": [
-            _role("Frontend Developer", ["JavaScript", "HTML", "CSS"], 100, 26, headcount=6, fill=6),
-            _role("Java Backend Developer", ["Java", "Spring", "SQL"], 116, 28, headcount=6, fill=6),
-            _role("Database Developer", ["SQL", "MySQL", "Oracle"], 106, 27, headcount=6, fill=6),
-            _role("Systems/Network Engineer", ["Linux", "Networking", "TCP/IP"], 108, 27, headcount=5, fill=5),
-            _role("Security Analyst", ["Cybersecurity", "SIEM", "TCP/IP"], 120, 28, headcount=3, fill=3),
-            _role("Business Analyst", ["Business Analysis", "Stakeholder Management", "Agile"], 88, 25, headcount=4, fill=4),
+            _role("Frontend Developer", ["JavaScript", "HTML", "CSS"], 100, 26, headcount=6, fill=6, hours_per_day=4, seniority="mid"),
+            _role("Java Backend Developer", ["Java", "Spring", "SQL"], 116, 28, headcount=6, fill=6, hours_per_day=8, seniority="senior"),
+            _role("Database Developer", ["SQL", "MySQL", "Oracle"], 106, 27, headcount=6, fill=6, hours_per_day=4, seniority="senior"),
+            _role("Systems/Network Engineer", ["Linux", "Networking", "TCP/IP"], 108, 27, headcount=5, fill=5, hours_per_day=4, seniority="senior"),
+            _role("Security Analyst", ["Cybersecurity", "SIEM", "TCP/IP"], 120, 28, headcount=3, fill=3, hours_per_day=4, seniority="senior"),
+            _role("Business Analyst", ["Business Analysis", "Stakeholder Management", "Agile"], 88, 25, headcount=4, fill=3, hours_per_day=2, seniority="mid"),
         ],
     },
     {
@@ -258,11 +269,11 @@ PROJECT_BLUEPRINTS = [
         "start_days_ago": 130,
         "duration_days": 300,
         "roles": [
-            _role("Java Backend Developer", ["Java", "Spring", "SQL"], 108, 28, headcount=6, fill=6),
-            _role("Frontend Developer", ["JavaScript", "HTML", "CSS"], 100, 27, headcount=5, fill=5),
-            _role("Database Developer", ["SQL", "Oracle", "MySQL"], 106, 28, headcount=4, fill=4),
-            _role("Systems/Network Engineer", ["Linux", "Networking", "Active Directory"], 108, 28, headcount=3, fill=3),
-            _role("QA Engineer", ["Selenium", "QA", "Manual Testing"], 90, 26, headcount=2, fill=2),
+            _role("Java Backend Developer", ["Java", "Spring", "SQL"], 108, 28, headcount=6, fill=6, hours_per_day=8, seniority="senior"),
+            _role("Frontend Developer", ["JavaScript", "HTML", "CSS"], 100, 27, headcount=5, fill=5, hours_per_day=4, seniority="mid"),
+            _role("Database Developer", ["SQL", "Oracle", "MySQL"], 106, 28, headcount=4, fill=4, hours_per_day=4, seniority="senior"),
+            _role("Systems/Network Engineer", ["Linux", "Networking", "Active Directory"], 108, 28, headcount=3, fill=3, hours_per_day=4, seniority="mid"),
+            _role("QA Engineer", ["Selenium", "QA", "Manual Testing"], 90, 26, headcount=2, fill=2, hours_per_day=2, seniority="mid"),
         ],
     },
     # ---------------- Upcoming (Pipeline) ----------------
@@ -337,6 +348,8 @@ OPEN_DEMANDS = [
         "target_margin": 28.0,
         "win_probability": 0.85,
         "needed_in_days": 21,
+        "hours_per_day": 4,
+        "seniority": "senior",
         "description": "Design schemas and tune queries across Oracle and MySQL estates.",
     },
     {
@@ -364,6 +377,8 @@ OPEN_DEMANDS = [
         "target_margin": 27.0,
         "win_probability": 0.80,
         "needed_in_days": 60,
+        "hours_per_day": 4,
+        "seniority": "mid",
         "description": "Deliver trading and merchandising insight to the retail business.",
     },
     {
@@ -373,6 +388,8 @@ OPEN_DEMANDS = [
         "target_margin": 25.0,
         "win_probability": 0.85,
         "needed_in_days": 21,
+        "hours_per_day": 2,
+        "seniority": "mid",
         "description": "Own regression and manual QA for the omnichannel releases.",
     },
     {

@@ -27,8 +27,10 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       PGDATA: /var/lib/postgresql/data/pgdata
+    # Host port 5434 avoids the local Homebrew/Postgres.app instance that
+    # commonly owns 127.0.0.1:5432. Keep POSTGRES_PORT in the root .env in sync.
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -53,13 +55,15 @@ services:
       IS_PERSISTENT: "TRUE"
       PERSIST_DIRECTORY: /chroma/chroma
       ANONYMIZED_TELEMETRY: "FALSE"
-      CHROMA_SERVER_HTTP_PORT: "8200"
     ports:
-      - "8200:8200"
+      # Chroma listens on 8000 inside the container; expose it on 8200 so it
+      # does not collide with local services. Note: the app itself uses the
+      # embedded PersistentClient (CHROMA_PERSIST_DIR); this service is optional.
+      - "8200:8000"
     volumes:
       - chroma_data:/chroma/chroma
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8200/api/v1/heartbeat || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v2/heartbeat', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -76,6 +80,7 @@ services:
     image: elestio/minio:latest
     container_name: bench_minio
     restart: unless-stopped
+    command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -84,12 +89,6 @@ services:
       - "9001:9001"   # MinIO Console UI
     volumes:
       - minio_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
     networks:
       - bench_net
 
@@ -111,12 +110,8 @@ services:
       - "4318:4318"   # OTLP HTTP
     volumes:
       - phoenix_data:/mnt/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6006 || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    # The Phoenix image is distroless (no /bin/sh or curl), so an in-container
+    # healthcheck cannot run. Check http://localhost:6006 from the host instead.
     networks:
       - bench_net
 

@@ -51,6 +51,7 @@ async def create_document_record(
     file_size_bytes: Optional[int] = None,
     mime_type: str = "application/pdf",
     version: int = 1,
+    is_current: bool = True,
 ) -> Document:
     """Insert a new ``documents`` row with ``ingestion_status='pending'``.
 
@@ -73,16 +74,17 @@ async def create_document_record(
         The newly created, flushed (but not yet committed) ``Document`` ORM
         instance.  The session commit is the caller's responsibility.
     """
-    # Mark previous current version as no longer current
-    await db.execute(
-        update(Document)
-        .where(
-            Document.employee_id == employee_id,
-            Document.document_type == document_type,
-            Document.is_current.is_(True),
+    # A staged CV is not current until its review is approved.
+    if is_current:
+        await db.execute(
+            update(Document)
+            .where(
+                Document.employee_id == employee_id,
+                Document.document_type == document_type,
+                Document.is_current.is_(True),
+            )
+            .values(is_current=False)
         )
-        .values(is_current=False)
-    )
 
     doc = Document(
         id=uuid.uuid4(),
@@ -93,7 +95,7 @@ async def create_document_record(
         mime_type=mime_type,
         file_size_bytes=file_size_bytes,
         version=version,
-        is_current=True,
+        is_current=is_current,
         ingestion_status=IngestionStatusEnum.pending,
         uploaded_at=_utcnow(),
     )

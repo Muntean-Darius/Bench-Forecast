@@ -1722,7 +1722,7 @@ def render_post_decision_tab() -> None:
             with c1:
                 render_pipeline_node("1", "HUMAN REVIEW", "PENDING", "pending", "Gate waiting for manager sign-off")
             with c2:
-                render_pipeline_node("2", "DATABASE SYNC", "PENDING", "pending", "Atomic commit to mock_db.sqlite")
+                render_pipeline_node("2", "DATABASE SYNC", "PENDING", "pending", "Atomic commit to PostgreSQL")
             with c3:
                 render_pipeline_node("3", "PROJECT HANDOVER", "PENDING", "pending", "Delivery team notification")
             with c4:

@@ -70,6 +70,7 @@ class AllocationPendingResponse(BaseModel):
     project_name: Optional[str] = None
     role_on_project: str
     allocation_pct: Decimal
+    allocated_hours_per_day: Optional[Decimal] = None
     status: AllocationStatusEnum
     ai_justification: Optional[str] = None
     ai_match_score: Optional[Decimal] = None

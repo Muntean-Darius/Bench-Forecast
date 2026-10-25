@@ -34,11 +34,13 @@ import importlib
 import logging
 import os
 from typing import Any, Callable, Optional
+from urllib.error import HTTPError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
-# Importing Config loads bench_forecast/.env (dotenv) before init() resolves its
+# Importing Config loads the root .env (dotenv) before init() resolves its
 # environment variables. This matters for scripts that initialise observability
 # before importing the rest of the application.
 try:  # pragma: no cover - simple import guard
@@ -80,6 +82,23 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def _endpoint_is_healthy(endpoint: str, timeout: float = 3.0) -> bool:
+    """Return True when the collector answers with a non-5xx status.
+
+    A down/Cloudflare-error endpoint makes the OTLP exporter retry forever,
+    flooding logs with 5-second timeouts. A short preflight lets us fail open
+    (tracing disabled) instead of degrading the whole process.
+    """
+    try:
+        request = Request(endpoint, method="GET", headers={"User-Agent": "bench-forecast-preflight"})
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 - configured endpoint
+            return int(getattr(response, "status", 200)) < 500
+    except HTTPError as exc:
+        return int(exc.code) < 500
+    except Exception:
+        return False
 
 
 def _warn_if_endpoint_is_this_api(endpoint: str) -> None:
@@ -184,6 +203,23 @@ def init_observability() -> bool:
             "(set AI_OBSERVABILITY_API_KEY and AI_OBSERVABILITY_ENDPOINT); tracing disabled"
         )
         return False
+
+    # Fail open when the collector is unreachable/unhealthy. Without this, the
+    # OTLP exporter retries every batch forever and floods the logs with
+    # timeouts while the app is otherwise healthy.
+    if endpoint and _env_bool("AI_OBSERVABILITY_PREFLIGHT", True):
+        if not _endpoint_is_healthy(endpoint):
+            logger.warning(
+                "AI observability endpoint %s is unreachable or unhealthy; "
+                "tracing disabled for this process. Fix the collector or set "
+                "AI_OBSERVABILITY_ENABLED=false to silence this check.",
+                endpoint,
+            )
+            return False
+
+    # Cap exporter timeouts so a slow collector cannot hold a batch for 10s.
+    os.environ.setdefault("OTEL_EXPORTER_OTLP_TIMEOUT", "5000")
+    os.environ.setdefault("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "5000")
 
     kwargs: dict[str, Any] = {
         "service_name": (

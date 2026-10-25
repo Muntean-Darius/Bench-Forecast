@@ -27,10 +27,14 @@ from src.database.models import (
     DemandStatusEnum,
     Employee,
     ForecastRun,
+    HiringRecommendation,
+    HiringRecommendationStatusEnum,
     Project,
     ProjectDemand,
+    TrainingAssignment,
     User,
 )
+from src.agents.nodes import data_extractor_node
 from src.services.hitl_service import HITLService
 
 RUN_TAG = uuid.uuid4().hex[:8]
@@ -191,6 +195,120 @@ async def test_approval_executes_allocation_and_completes_run(setup_test_db):
 
         run = await db.get(ForecastRun, ids["run_id"])
         assert run.status == "completed", "Run should auto-complete once it has no open proposals"
+
+
+@pytest.mark.asyncio
+async def test_approval_of_training_allocation_preserves_upskilling(setup_test_db):
+    """A training allocation is approved like any other and keeps its upskilling path."""
+    ids = setup_test_db
+    async with AsyncSessionLocal() as db:
+        alloc = Allocation(
+            id=uuid.uuid4(),
+            employee_id=ids["emp_id"],
+            demand_id=ids["demand_id"],
+            role_on_project="E2E Tester",
+            allocation_pct=Decimal("100.00"),
+            status=AllocationStatusEnum.pending_manager_approval,
+            ai_upskilling_path="Complete a Selenium course to close the gap.",
+            forecast_run_id=ids["run_id"],
+            created_by=ids["user_id"],
+            start_date=date.today(),
+        )
+        db.add(alloc)
+        await db.commit()
+        alloc_id = alloc.id
+
+    async with AsyncSessionLocal() as db:
+        await HITLService(db).approve_allocation(
+            alloc_id, reviewer_id=ids["user_id"]
+        )
+
+    async with AsyncSessionLocal() as db:
+        alloc = await db.get(Allocation, alloc_id)
+        assert alloc.status == AllocationStatusEnum.approved_by_manager
+        assert alloc.ai_upskilling_path == "Complete a Selenium course to close the gap."
+
+        emp = await db.get(Employee, ids["emp_id"])
+        assert emp.bench_status == BenchStatusEnum.on_project
+
+        demand = await db.get(ProjectDemand, ids["demand_id"])
+        assert demand.headcount_needed == 0
+        assert demand.status == DemandStatusEnum.filled
+
+        training = (
+            await db.execute(
+                select(TrainingAssignment).where(
+                    TrainingAssignment.employee_id == ids["emp_id"],
+                    TrainingAssignment.demand_id == ids["demand_id"],
+                )
+            )
+        ).scalars().first()
+        assert training is not None, "Approved train proposal must create a training assignment"
+        assert training.ai_upskilling_path == alloc.ai_upskilling_path
+        assert training.targeted_skills
+
+
+@pytest.mark.asyncio
+async def test_run_stays_paused_until_open_hire_is_dismissed(setup_test_db):
+    """A run is not complete while a hiring recommendation is still open."""
+    ids = setup_test_db
+    alloc_id = await _create_pending_allocation(ids)
+
+    async with AsyncSessionLocal() as db:
+        hire = HiringRecommendation(
+            id=uuid.uuid4(),
+            project_id=ids["project_id"],
+            demand_id=ids["demand_id"],
+            role="E2E Hire",
+            required_skills=["Testing"],
+            headcount=1,
+            justification="No internal candidate.",
+            status=HiringRecommendationStatusEnum.open,
+            forecast_run_id=ids["run_id"],
+            created_by=ids["user_id"],
+        )
+        db.add(hire)
+        await db.commit()
+        hire_id = hire.id
+
+    async with AsyncSessionLocal() as db:
+        await HITLService(db).approve_allocation(
+            alloc_id, reviewer_id=ids["user_id"]
+        )
+
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ForecastRun, ids["run_id"])
+        assert run.status == "paused_for_review"
+
+    async with AsyncSessionLocal() as db:
+        await HITLService(db).dismiss_hiring(hire_id)
+
+    async with AsyncSessionLocal() as db:
+        run = await db.get(ForecastRun, ids["run_id"])
+        assert run.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_approved_allocation_is_excluded_from_next_forecast(setup_test_db):
+    """An approved allocation must leave the bench and close its demand."""
+    ids = setup_test_db
+    alloc_id = await _create_pending_allocation(ids)
+
+    async with AsyncSessionLocal() as db:
+        await HITLService(db).approve_allocation(
+            alloc_id, reviewer_id=ids["user_id"]
+        )
+
+    updates = await data_extractor_node({
+        "horizon_days": 90,
+        "min_win_probability": 0.0,
+        "target_project_id": str(ids["project_id"]),
+    })
+
+    bench_ids = {str(e["id"]) for e in updates["bench_employees"]}
+    demand_ids = {str(d["id"]) for d in updates["open_demands"]}
+    assert str(ids["emp_id"]) not in bench_ids, "approved employee is still on the bench"
+    assert str(ids["demand_id"]) not in demand_ids, "filled demand is still open"
 
 
 @pytest.mark.asyncio

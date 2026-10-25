@@ -27,6 +27,7 @@ from src.core.observability import span, workflow
 
 from src.database.database import AsyncSessionLocal
 from src.database.models import (
+    Employee,
     ForecastRun,
     Allocation,
     AllocationStatusEnum,
@@ -34,6 +35,7 @@ from src.database.models import (
     HiringRecommendation,
     HiringRecommendationStatusEnum,
 )
+from src.services.workforce_service import effective_capacity
 from src.agents.graph import build_forecast_graph
 
 logger = logging.getLogger(__name__)
@@ -193,9 +195,19 @@ async def _execute_forecast_run(
 
                 emp_id_str = str(dec["employee_id"])
                 if emp_id_str not in bench_ids_set:
-                    logger.warning(
-                        f"Employee {emp_id_str} in decision for demand {demand_id_str} "
-                        f"is not in bench_employees"
+                    # Defense in depth: the decider grounds every id, but if an
+                    # ungrounded one ever reaches here, degrade to an external
+                    # hire instead of silently dropping the demand's proposal.
+                    logger.error(
+                        f"Employee {emp_id_str} in decision for demand "
+                        f"{demand_id_str} is not in bench_employees; "
+                        f"converting to an external-hire recommendation"
+                    )
+                    dec["action_type"] = "hire"
+                    dec["employee_id"] = None
+                    dec["justification"] = (
+                        f"No valid internal candidate could be resolved for "
+                        f"'{demand.get('role', 'role')}'. External hire recommended."
                     )
                     continue
 
@@ -204,12 +216,26 @@ async def _execute_forecast_run(
                 if match_score_val <= 0:
                     match_score_val = float(dec.get("similarity_score") or 0.0)
 
+                hours = Decimal(str(
+                    demand.get("hours_per_day")
+                    or dec.get("hours_per_day")
+                    or 8
+                ))
+                employee = await db.get(Employee, uuid.UUID(emp_id_str))
+                capacity = effective_capacity(employee) if employee else Decimal("8")
+                pct = (
+                    (hours / capacity * Decimal("100")).quantize(Decimal("0.01"))
+                    if capacity > 0
+                    else Decimal("100.00")
+                )
+
                 db.add(Allocation(
                     id=uuid.uuid4(),
                     employee_id=uuid.UUID(emp_id_str),
                     demand_id=uuid.UUID(demand_id_str),
                     role_on_project=demand.get("role", "Engineer"),
-                    allocation_pct=Decimal("100.00"),
+                    allocated_hours_per_day=hours,
+                    allocation_pct=pct,
                     status=AllocationStatusEnum.pending_manager_approval,
                     ai_justification=(
                         dec.get("justification")
@@ -287,6 +313,9 @@ async def _execute_forecast_run(
                     "demands": len(open_demands),
                     "bench": len(bench_employees),
                     "skill_matches": len(result_state.get("skill_matches", [])),
+                    # Full plan (deterministic summary + advisory alternatives)
+                    # retained for audit/HITL context.
+                    "plan": result_state.get("recommendations", {}),
                 }
                 run.latency_seconds = Decimal(str(round(time.time() - started_at, 2)))
                 run.llm_provider = Config.LLM_PROVIDER

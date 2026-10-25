@@ -3,7 +3,53 @@
  * Vite proxy forwards /api → http://localhost:8000 in development.
  */
 
+import type {
+  Candidate,
+  CvDiff,
+  CvReviewSummary,
+  CvStatus,
+  EmployeeCapacity,
+  ProjectDetail,
+  ProjectSummary,
+  TeamMember,
+  TrainingAssignment,
+} from '../types'
+
 const BASE = '/api/v1'
+
+// ─── Structured API errors ───────────────────────────────────────────────────
+
+export interface ApiErrorDetail {
+  code?: string
+  message?: string
+  [key: string]: unknown
+}
+
+export class ApiError extends Error {
+  status: number
+  detail: ApiErrorDetail | string
+
+  constructor(status: number, detail: ApiErrorDetail | string) {
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail?.message || JSON.stringify(detail)
+    super(`API ${status}: ${message}`)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+  }
+}
+
+async function parseError(res: Response): Promise<ApiError> {
+  const text = await res.text()
+  try {
+    const parsed = JSON.parse(text)
+    return new ApiError(res.status, parsed.detail ?? parsed)
+  } catch {
+    return new ApiError(res.status, text)
+  }
+}
 
 // ─── Token helper ─────────────────────────────────────────────────────────────
 
@@ -28,10 +74,7 @@ async function request<T>(
     ...options,
     headers,
   })
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`API ${res.status}: ${body}`)
-  }
+  if (!res.ok) throw await parseError(res)
   return res.json() as Promise<T>
 }
 
@@ -50,10 +93,7 @@ async function uploadFile<T>(
     headers,
     body: formData,
   })
-  if (!res.ok) {
-    const body = await res.text()
-    throw new Error(`API ${res.status}: ${body}`)
-  }
+  if (!res.ok) throw await parseError(res)
   return res.json() as Promise<T>
 }
 
@@ -73,7 +113,106 @@ export const api = {
     request<any[]>(`/demands?min_win_probability=${minWinProbability}&horizon_days=${horizonDays}`),
 
   getProjects: () =>
-    request<any[]>('/projects'),
+    request<ProjectSummary[]>('/projects'),
+
+  getProject: (projectId: string) =>
+    request<ProjectDetail>(`/projects/${projectId}`),
+
+  getProjectRecommendations: (projectId: string, demandId: string) =>
+    request<Candidate[]>(
+      `/projects/${projectId}/recommendations?demand_id=${demandId}`,
+    ),
+
+  assignToDemand: (
+    projectId: string,
+    demandId: string,
+    body: {
+      employee_id: string
+      allocated_hours_per_day?: number
+      start_date?: string | null
+      end_date?: string | null
+      ai_justification?: string
+    },
+  ) =>
+    request<any>(`/projects/${projectId}/demands/${demandId}/assign`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  // ── Team & capacity ───────────────────────────────────────────────────────
+  getTeam: () =>
+    request<TeamMember[]>('/team'),
+
+  getTeamCandidates: (demandId: string, minHours?: number) =>
+    request<Candidate[]>(
+      `/team/candidates?demand_id=${demandId}` +
+        (minHours !== undefined ? `&min_hours=${minHours}` : ''),
+    ),
+
+  getEmployeeCapacity: (employeeId: string) =>
+    request<EmployeeCapacity>(`/employees/${employeeId}/capacity`),
+
+  getEmployeeSkills: (employeeId: string) =>
+    request<Record<string, any>>(`/employees/${employeeId}/skills`),
+
+  // ── CV reviews ────────────────────────────────────────────────────────────
+  getCvReviews: (status?: string) =>
+    request<CvReviewSummary[]>(
+      `/cv-reviews${status ? `?status=${status}` : ''}`,
+    ),
+
+  getCvReview: (reviewId: string) =>
+    request<CvDiff>(`/cv-reviews/${reviewId}`),
+
+  approveCvReview: (reviewId: string, comment?: string) =>
+    request<CvReviewSummary>(`/cv-reviews/${reviewId}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({ comment: comment ?? null }),
+    }),
+
+  rejectCvReview: (reviewId: string, comment: string) =>
+    request<CvReviewSummary>(`/cv-reviews/${reviewId}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ comment }),
+    }),
+
+  getCvStatus: (employeeId: string) =>
+    request<CvStatus>(`/employees/${employeeId}/cv-status`),
+
+  // ── Trainings ─────────────────────────────────────────────────────────────
+  getTrainings: (params?: { employeeId?: string; status?: string }) => {
+    const query = new URLSearchParams()
+    if (params?.employeeId) query.set('employee_id', params.employeeId)
+    if (params?.status) query.set('status', params.status)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<TrainingAssignment[]>(`/trainings${suffix}`)
+  },
+
+  createTraining: (body: {
+    employee_id: string
+    title: string
+    targeted_skills: string[]
+    ai_upskilling_path?: string
+    project_id?: string | null
+    demand_id?: string | null
+    target_completion_date?: string | null
+    notes?: string
+  }) =>
+    request<TrainingAssignment>('/trainings', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  updateTraining: (trainingId: string, body: Record<string, unknown>) =>
+    request<TrainingAssignment>(`/trainings/${trainingId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  completeTraining: (trainingId: string) =>
+    request<TrainingAssignment>(`/trainings/${trainingId}/complete`, {
+      method: 'POST',
+    }),
 
   // ── Forecast ──────────────────────────────────────────────────────────────
   runForecast: (horizonDays = 90, projectId?: string, minWinProbability = 0.75) =>
@@ -101,22 +240,22 @@ export const api = {
 
   // ── HITL Allocations ──────────────────────────────────────────────────────
   getPendingAllocations: () =>
-    request<any[]>('/api/allocations/pending'),
+    request<any[]>('/allocations/pending'),
 
   approveAllocation: (allocationId: string, reviewerId: string, timeToDecision: number) =>
-    request<any>(`/api/allocations/${allocationId}/approve`, {
+    request<any>(`/allocations/${allocationId}/approve`, {
       method: 'POST',
       body: JSON.stringify({ reviewer_id: reviewerId, time_to_decision_seconds: timeToDecision }),
     }),
 
   rejectAllocation: (allocationId: string, reviewerId: string, feedback: string, timeToDecision: number) =>
-    request<any>(`/api/allocations/${allocationId}/reject`, {
+    request<any>(`/allocations/${allocationId}/reject`, {
       method: 'POST',
       body: JSON.stringify({ reviewer_id: reviewerId, feedback, time_to_decision_seconds: timeToDecision }),
     }),
 
   assignEmployee: (employeeId: string, demandId?: string, projectName?: string, roleOnProject?: string) =>
-    request<any>('/api/allocations/assign', {
+    request<any>('/allocations/assign', {
       method: 'POST',
       body: JSON.stringify({
         employee_id: employeeId,
@@ -127,17 +266,17 @@ export const api = {
     }),
 
   releaseEmployee: (employeeId: string) =>
-    request<any>('/api/allocations/release', {
+    request<any>('/allocations/release', {
       method: 'POST',
       body: JSON.stringify({ employee_id: employeeId }),
     }),
 
   // ── External Hiring Recommendations ───────────────────────────────────────
   getPendingHiring: () =>
-    request<any[]>('/api/hiring/pending'),
+    request<any[]>('/hiring/pending'),
 
   dismissHiring: (recommendationId: string, reviewerId?: string) =>
-    request<any>(`/api/hiring/${recommendationId}/dismiss`, {
+    request<any>(`/hiring/${recommendationId}/dismiss`, {
       method: 'POST',
       body: JSON.stringify({ reviewer_id: reviewerId ?? null }),
     }),

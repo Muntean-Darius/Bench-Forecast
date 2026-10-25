@@ -47,6 +47,7 @@ from demo_catalog import (
     title_with_seniority,
 )
 from src.agents.nodes import _extract_skills_from_text
+from src.core.config import Config
 from src.database.database import SyncSessionLocal, init_db_sync
 from src.database.models import (
     Allocation,
@@ -54,12 +55,16 @@ from src.database.models import (
     BenchCost,
     BenchHistory,
     BenchStatusEnum,
+    CvApprovalStatusEnum,
+    CvReviewRequest,
     DemandStatusEnum,
     Department,
     Document,
     DocumentTypeEnum,
     Employee,
     EmployeeCost,
+    EmployeeSkill,
+    EmployeeSkillEvidence,
     EmploymentTypeEnum,
     ExperienceLevelEnum,
     ForecastRun,
@@ -69,6 +74,11 @@ from src.database.models import (
     KpiSnapshot,
     Project,
     ProjectDemand,
+    ProficiencyLevelEnum,
+    Skill,
+    SkillOriginEnum,
+    TrainingAssignment,
+    TrainingStatusEnum,
     User,
 )
 from src.services.finance import compute_internal_costs
@@ -110,10 +120,12 @@ ROLE_MULTIPLIER = {
 def reset_database(session) -> None:
     """Delete all domain rows so the seed starts from a clean slate."""
     for table in [
-        "hitl_review_events", "allocations", "hiring_recommendations", "documents",
-        "employee_skills", "bench_costs", "bench_history", "employee_costs",
-        "kpi_snapshots", "forecast_runs", "project_demands", "project_roles",
-        "projects", "employees", "departments", "skills", "users",
+        "email_notifications", "training_assignments", "cv_review_requests",
+        "employee_skill_evidence", "hitl_review_events", "allocations",
+        "hiring_recommendations", "documents", "employee_skills",
+        "bench_costs", "bench_history", "employee_costs", "kpi_snapshots",
+        "forecast_runs", "project_demands", "project_roles", "projects",
+        "employees", "departments", "skills", "users",
     ]:
         session.execute(text(f"DELETE FROM {table}"))
     session.commit()
@@ -209,6 +221,22 @@ def stage1_employees(session) -> list:
         salary = deduce_salary(level, title)
         daily, hourly = compute_internal_costs(salary, Decimal("1.35"))
 
+        # ~78% full-time, ~17% part-time (4h/day), ~5% contractors (8h/day)
+        employment_type = random.choices(
+            [
+                EmploymentTypeEnum.full_time,
+                EmploymentTypeEnum.part_time,
+                EmploymentTypeEnum.contractor,
+            ],
+            weights=[78, 17, 5],
+            k=1,
+        )[0]
+        capacity = (
+            Decimal("4.00")
+            if employment_type == EmploymentTypeEnum.part_time
+            else Decimal("8.00")
+        )
+
         first, last = fake.first_name(), fake.last_name()
         emp = Employee(
             id=uuid.uuid4(),
@@ -219,7 +247,8 @@ def stage1_employees(session) -> list:
             department_id=dept_by_name.get(dept_name, dept_by_name["Software Engineering"]),
             job_title=title,
             experience_level=level,
-            employment_type=EmploymentTypeEnum.full_time,
+            employment_type=employment_type,
+            daily_capacity_hours=capacity,
             bench_status=BenchStatusEnum.on_project,
             hire_date=date.today() - timedelta(days=random.randint(120, 1400)),
             profile_text=resume,
@@ -247,13 +276,144 @@ def stage1_employees(session) -> list:
             "title": title,
             "daily_cost": daily,
             "hourly_cost": hourly,
+            "employment_type": employment_type,
+            "daily_capacity_hours": capacity,
             "resume": resume,
             "cv_path": None,
+            "is_manager": False,
         })
 
     session.commit()
     print(f"  -> {len(emps)} employees created (skills/title/level/salary from CV)")
     return emps
+
+
+# ===========================================================================
+# Stage 1b — normalised skills with provenance
+# ===========================================================================
+
+def stage1b_skills(session, emps: list) -> None:
+    """Materialise CV-derived skills in the taxonomy + employee_skills."""
+    print("Stage 1b: skills taxonomy + employee_skills")
+    cache: dict[str, Skill] = {
+        skill.name.lower(): skill
+        for skill in session.execute(select(Skill)).scalars().all()
+    }
+    created = 0
+    linked = 0
+
+    for meta in emps:
+        emp = meta["orm"]
+        seen_for_employee: set[str] = set()
+        for raw in meta["skills"]:
+            name = str(raw).strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen_for_employee:
+                continue
+            seen_for_employee.add(key)
+            skill = cache.get(key)
+            if skill is None:
+                skill = Skill(name=name, is_verified=False)
+                session.add(skill)
+                session.flush()
+                cache[key] = skill
+                created += 1
+            session.add(
+                EmployeeSkill(
+                    employee_id=emp.id,
+                    skill_id=skill.id,
+                    proficiency_level=ProficiencyLevelEnum.intermediate,
+                    source=SkillOriginEnum.cv,
+                    is_locked=False,
+                )
+            )
+            linked += 1
+
+    session.commit()
+    print(f"  -> {created} skills created, {linked} CV skill links")
+
+
+# ===========================================================================
+# Stage 1c — manager hierarchy
+# ===========================================================================
+
+_LEVEL_RANK = {
+    "principal": 5,
+    "lead": 4,
+    "senior": 3,
+    "mid": 2,
+    "junior": 1,
+}
+
+
+def stage1c_hierarchy(session, emps: list, team_size: int = 10) -> list:
+    """Assign every employee a direct manager (except the global head).
+
+    Each department is split into teams of roughly ``team_size`` people. The
+    most senior member of each team becomes its lead, which gives the People
+    Manager portal realistic scoped teams instead of one manager per department.
+    """
+    print("Stage 1c: manager hierarchy")
+    by_department: dict = {}
+    for meta in emps:
+        by_department.setdefault(meta["orm"].department_id, []).append(meta)
+
+    def _lead_key(meta):
+        return (
+            _LEVEL_RANK.get(meta["level"], 1),
+            -(meta["orm"].hire_date.toordinal() if meta["orm"].hire_date else 0),
+        )
+
+    team_leads: list = []
+    for members in by_department.values():
+        ordered = sorted(members, key=_lead_key, reverse=True)
+        team_count = max(1, (len(ordered) + team_size - 1) // team_size)
+        leads = ordered[:team_count]
+        for lead in leads:
+            lead["is_manager"] = True
+            team_leads.append(lead)
+
+    if not team_leads:
+        return []
+
+    global_head = max(team_leads, key=_lead_key)
+    global_head["is_manager"] = True
+
+    for lead in team_leads:
+        if lead["orm"].id != global_head["orm"].id:
+            lead["orm"].manager_id = global_head["orm"].id
+
+    # Round-robin non-leads across their department's team leads.
+    lead_ids = {lead["orm"].id for lead in team_leads}
+    cursor: dict = {}
+    for dept_id, members in by_department.items():
+        dept_leads = [
+            lead for lead in team_leads
+            if (lead["orm"].department_id == dept_id)
+        ]
+        if not dept_leads:
+            dept_leads = [global_head]
+        for meta in sorted(members, key=_lead_key, reverse=True):
+            emp = meta["orm"]
+            if emp.id in lead_ids:
+                continue
+            idx = cursor.get(dept_id, 0)
+            lead = dept_leads[idx % len(dept_leads)]
+            cursor[dept_id] = idx + 1
+            if lead["orm"].id != emp.id:
+                emp.manager_id = lead["orm"].id
+
+    global_head["orm"].manager_id = None
+
+    session.commit()
+    managers = [m for m in emps if m["is_manager"]]
+    print(
+        f"  -> {len(managers)} team leads, global head: "
+        f"{global_head['orm'].first_name} {global_head['orm'].last_name}"
+    )
+    return managers
 
 
 # ===========================================================================
@@ -313,6 +473,9 @@ def stage2_documents(session, emps: list) -> None:
             text_content=meta["resume"][:20000],
             chroma_doc_id=f"{emp.id}__cv" if SEED_EMBEDDINGS else None,
             ingestion_status=IngestionStatusEnum.ingested if SEED_EMBEDDINGS else IngestionStatusEnum.pending,
+            approval_status=CvApprovalStatusEnum.approved,
+            extracted_skills=meta["skills"],
+            profile_applied_at=datetime.utcnow(),
         ))
         if (idx + 1) % 25 == 0:
             print(f"  -> embedded {idx + 1}/{len(emps)}")
@@ -332,26 +495,36 @@ def stage3_projects(session) -> dict:
 
     for bp in PROJECT_BLUEPRINTS:
         start = today + timedelta(days=bp["start_days_ago"]) if bp["start_days_ago"] < 0 else today - timedelta(days=bp["start_days_ago"])
+        duration_days = int(bp.get("duration_days", 180))
         proj = Project(
             id=uuid.uuid4(),
             name=bp["name"],
+            client_name=bp.get("client"),
             status=bp["status"],
             probability=bp["probability"],
             target_margin=Decimal(str(bp["target_margin"])),
             total_budget=Decimal(str(bp["total_budget"])),
+            start_date=start,
+            end_date=start + timedelta(days=duration_days),
         )
         session.add(proj)
         session.flush()
 
         demands = []
         for role in bp["roles"]:
+            seniority = role.get("seniority")
             demand = ProjectDemand(
                 id=uuid.uuid4(),
                 project_id=proj.id,
                 role=role["title"],
                 description=f"{role['title']} on {bp['name']} ({bp['client']}).",
                 required_skills=role["required_skills"],
+                hours_per_day=Decimal(str(role.get("hours_per_day", 8))),
+                required_experience_level=(
+                    ExperienceLevelEnum(seniority) if seniority else None
+                ),
                 headcount_needed=role["headcount"] - role["fill"],
+                headcount_required=role["headcount"],
                 min_proficiency="intermediate",
                 target_bill_rate=Decimal(str(role["bill_rate"])),
                 target_margin=Decimal(str(role["target_margin"])),
@@ -369,18 +542,28 @@ def stage3_projects(session) -> dict:
     open_demands = []
     for spec in OPEN_DEMANDS:
         needed_by = today + timedelta(days=int(spec.get("needed_in_days", 14)))
+        seniority = spec.get("seniority")
         demand = ProjectDemand(
             id=uuid.uuid4(),
             project_id=primary["orm"].id,
             role=spec["role"],
             description=spec["description"],
             required_skills=spec["required_skills"],
+            hours_per_day=Decimal(str(spec.get("hours_per_day", 8))),
+            required_experience_level=(
+                ExperienceLevelEnum(seniority) if seniority else None
+            ),
             headcount_needed=1,
+            headcount_required=1,
             min_proficiency="intermediate",
             target_bill_rate=Decimal(str(spec["target_bill_rate"])),
             target_margin=Decimal(str(spec["target_margin"])),
             win_probability=Decimal(str(spec["win_probability"])),
-            status=DemandStatusEnum.open,
+            status=(
+                DemandStatusEnum.requires_training
+                if spec["role"] == "Python Data Engineer"
+                else DemandStatusEnum.open
+            ),
             needed_by_date=needed_by,
         )
         session.add(demand)
@@ -405,13 +588,27 @@ def _pick_best(pool, required):
     return max(pool, key=lambda m: _overlap(m["skills"], required))
 
 
-def _make_allocations_for_demand(session, demand, emp_meta, status, start, end):
+def _make_allocations_for_demand(
+    session,
+    demand,
+    emp_meta,
+    status,
+    start,
+    end,
+    hours_per_day=None,
+):
+    """Create one allocation, respecting the employee's daily capacity."""
+    capacity = Decimal(str(emp_meta.get("daily_capacity_hours") or 8))
+    requested = Decimal(str(hours_per_day or demand.hours_per_day or 8))
+    hours = min(requested, capacity)
+    pct = (hours / capacity * Decimal("100")).quantize(Decimal("0.01"))
     session.add(Allocation(
         id=uuid.uuid4(),
         employee_id=emp_meta["orm"].id,
         demand_id=demand.id,
         role_on_project=demand.role,
-        allocation_pct=Decimal("100.00"),
+        allocation_pct=pct,
+        allocated_hours_per_day=hours,
         start_date=start,
         end_date=end,
         status=status,
@@ -420,7 +617,7 @@ def _make_allocations_for_demand(session, demand, emp_meta, status, start, end):
 
 
 def stage4_staffing(session, emps: list, catalog: dict) -> dict:
-    print("Stage 4: staffing (history + active + bench)")
+    print("Stage 4: staffing (history + active + fractional allocations)")
     today = date.today()
     projects = catalog["projects"]
     open_demands = catalog["open_demands"]
@@ -438,7 +635,7 @@ def stage4_staffing(session, emps: list, catalog: dict) -> dict:
             break
         bench_ids.add(m["orm"].id)
 
-    # ---- 2. Active seats: staff everyone not on the bench ------------------
+    # ---- 2. Active seats: fill fractional roles up to each hard cap --------
     active_seats = []
     for p in projects:
         if p["bp"]["status"] != "active":
@@ -448,26 +645,45 @@ def stage4_staffing(session, emps: list, catalog: dict) -> dict:
                 active_seats.append((p, d))
 
     available = [m for m in emps if m["orm"].id not in bench_ids]
+    remaining_hours = {
+        m["orm"].id: Decimal(str(m["daily_capacity_hours"] or 8))
+        for m in available
+    }
+    project_assignments = set()
     assigned = set()
+
     for p, d in active_seats:
-        pool = [m for m in available if m["orm"].id not in assigned]
+        needed_hours = Decimal(str(d["spec"].get("hours_per_day", 8)))
+        pool = [
+            m for m in available
+            if remaining_hours.get(m["orm"].id, Decimal("0")) >= needed_hours
+            and (m["orm"].id, p["orm"].id) not in project_assignments
+        ]
         if not pool:
-            break
+            continue
         best = _pick_best(pool, d["spec"]["required_skills"])
+        remaining_hours[best["orm"].id] -= needed_hours
+        project_assignments.add((best["orm"].id, p["orm"].id))
         assigned.add(best["orm"].id)
-        _make_allocations_for_demand(session, d["demand"], best, AllocationStatusEnum.active, p["start"], None)
+        _make_allocations_for_demand(
+            session,
+            d["demand"],
+            best,
+            AllocationStatusEnum.active,
+            p["start"],
+            None,
+            hours_per_day=needed_hours,
+        )
         best["orm"].bench_status = BenchStatusEnum.on_project
         best["orm"].current_project = p["orm"].name
         best["orm"].bench_start_date = None
 
-    # Anyone not assigned to an active seat is on the bench.
+    # Anyone with no active hours is on the bench.
     for m in emps:
         if m["orm"].id not in assigned:
             bench_ids.add(m["orm"].id)
 
     # ---- 3. Historical allocations on completed projects -------------------
-    # Spread history so most employees have 1–2 prior projects; anyone with no
-    # history ends up benched (which is exactly the "never worked" case).
     hist_count = {m["orm"].id: 0 for m in emps}
 
     def _pick_history(required):
@@ -487,7 +703,15 @@ def stage4_staffing(session, emps: list, catalog: dict) -> dict:
                     continue
                 start = p["start"] + timedelta(days=seat * 7)
                 end = min(proj_end, start + timedelta(days=random.randint(90, p["bp"]["duration_days"])))
-                _make_allocations_for_demand(session, d["demand"], best, AllocationStatusEnum.completed, start, end)
+                _make_allocations_for_demand(
+                    session,
+                    d["demand"],
+                    best,
+                    AllocationStatusEnum.completed,
+                    start,
+                    end,
+                    hours_per_day=d["spec"].get("hours_per_day", 8),
+                )
 
     session.flush()
 
@@ -500,8 +724,220 @@ def stage4_staffing(session, emps: list, catalog: dict) -> dict:
         emp.bench_start_date = today - timedelta(days=random.randint(5, 45))
 
     session.commit()
-    print(f"  -> {len(assigned)} on active projects, {len(bench_meta)} on bench, history created")
+    print(
+        f"  -> {len(assigned)} on active projects, {len(bench_meta)} on bench, "
+        "fractional + historical allocations created"
+    )
     return {"bench_ids": bench_ids}
+
+
+# ===========================================================================
+# Stage 4b — project-earned skills + training paths
+# ===========================================================================
+
+def _skill_lookup(session) -> dict:
+    return {
+        skill.name.lower(): skill
+        for skill in session.execute(select(Skill)).scalars().all()
+    }
+
+
+def _ensure_skill(session, cache: dict, name: str) -> Skill:
+    key = str(name).strip().lower()
+    skill = cache.get(key)
+    if skill is None:
+        skill = Skill(name=str(name).strip(), is_verified=False)
+        session.add(skill)
+        session.flush()
+        cache[key] = skill
+    return skill
+
+
+def stage4b_skills_trainings(session, emps: list, catalog: dict) -> None:
+    """Grant project skills and create realistic upskilling assignments."""
+    print("Stage 4b: project skills + trainings")
+    cache = _skill_lookup(session)
+    emps_by_id = {m["orm"].id: m for m in emps}
+
+    allocations = session.execute(select(Allocation)).scalars().all()
+    evidence_seen = {
+        (e.employee_id, e.skill_id, e.source, e.source_ref)
+        for e in session.execute(select(EmployeeSkillEvidence)).scalars().all()
+    }
+    existing_links = {
+        (es.employee_id, es.skill_id): es
+        for es in session.execute(select(EmployeeSkill)).scalars().all()
+    }
+
+    project_links = 0
+    for allocation in allocations:
+        if allocation.status not in {
+            AllocationStatusEnum.active,
+            AllocationStatusEnum.approved_by_manager,
+            AllocationStatusEnum.completed,
+        }:
+            continue
+        demand = session.get(ProjectDemand, allocation.demand_id)
+        if not demand:
+            continue
+        raw_skills = demand.required_skills or []
+        if isinstance(raw_skills, dict):
+            raw_skills = raw_skills.get("skills", list(raw_skills.keys()))
+        if not isinstance(raw_skills, list):
+            raw_skills = []
+
+        for raw in raw_skills:
+            skill = _ensure_skill(session, cache, raw)
+            link = existing_links.get((allocation.employee_id, skill.id))
+            if link is None:
+                link = EmployeeSkill(
+                    employee_id=allocation.employee_id,
+                    skill_id=skill.id,
+                    proficiency_level=ProficiencyLevelEnum.intermediate,
+                    source=SkillOriginEnum.project,
+                    source_ref=demand.id,
+                    is_locked=True,
+                )
+                session.add(link)
+                existing_links[(allocation.employee_id, skill.id)] = link
+                project_links += 1
+            else:
+                link.source = SkillOriginEnum.project
+                link.source_ref = demand.id
+                link.is_locked = True
+
+            key = (allocation.employee_id, skill.id, SkillOriginEnum.project, demand.id)
+            if key not in evidence_seen:
+                session.add(EmployeeSkillEvidence(
+                    employee_id=allocation.employee_id,
+                    skill_id=skill.id,
+                    source=SkillOriginEnum.project,
+                    source_ref=demand.id,
+                    note=f"Earned on {demand.role}.",
+                ))
+                evidence_seen.add(key)
+    session.flush()
+
+    # ---- Trainings for bench employees ------------------------------------
+    bench_meta = [
+        m for m in emps
+        if m["orm"].bench_status == BenchStatusEnum.bench
+    ]
+    open_demands = catalog["open_demands"]
+    trainings = 0
+    completed = 0
+
+    for idx, meta in enumerate(bench_meta[:18]):
+        demand = open_demands[idx % len(open_demands)]
+        required = [
+            str(s).strip()
+            for s in (demand.required_skills or [])
+            if str(s).strip()
+        ]
+        missing = [
+            s for s in required
+            if s.lower() not in {x.lower() for x in meta["skills"]}
+        ]
+        if not missing:
+            missing = required[:2]
+        if not missing:
+            continue
+
+        target_date = date.today() + timedelta(days=random.randint(21, 90))
+        is_done = idx % 5 == 0
+        training = TrainingAssignment(
+            employee_id=meta["orm"].id,
+            project_id=demand.project_id,
+            demand_id=demand.id,
+            title=f"{demand.role} upskilling path",
+            targeted_skills=missing,
+            ai_upskilling_path=(
+                f"Week 1-2: {missing[0]} fundamentals; "
+                f"week 3-4: hands-on {demand.role} scenarios; "
+                f"week 5-6: shadowing and assessment."
+            ),
+            status=(
+                TrainingStatusEnum.completed
+                if is_done
+                else TrainingStatusEnum.assigned
+            ),
+            target_completion_date=(
+                date.today() - timedelta(days=7) if is_done else target_date
+            ),
+            completed_at=datetime.utcnow() if is_done else None,
+            notes="Seeded upskilling path.",
+        )
+        session.add(training)
+        session.flush()
+        trainings += 1
+        if is_done:
+            completed += 1
+            for raw in missing:
+                skill = _ensure_skill(session, cache, raw)
+                link = existing_links.get((meta["orm"].id, skill.id))
+                if link is None:
+                    link = EmployeeSkill(
+                        employee_id=meta["orm"].id,
+                        skill_id=skill.id,
+                        proficiency_level=ProficiencyLevelEnum.intermediate,
+                        source=SkillOriginEnum.training,
+                        source_ref=training.id,
+                        is_locked=False,
+                    )
+                    session.add(link)
+                    existing_links[(meta["orm"].id, skill.id)] = link
+                key = (
+                    meta["orm"].id,
+                    skill.id,
+                    SkillOriginEnum.training,
+                    training.id,
+                )
+                if key not in evidence_seen:
+                    session.add(EmployeeSkillEvidence(
+                        employee_id=meta["orm"].id,
+                        skill_id=skill.id,
+                        source=SkillOriginEnum.training,
+                        source_ref=training.id,
+                        note=f"Completed {training.title}.",
+                    ))
+                    evidence_seen.add(key)
+
+    # ---- Refresh demand roster statuses from actual allocations -----------
+    statuses = {DemandStatusEnum.open: 0, DemandStatusEnum.partially_filled: 0,
+                DemandStatusEnum.filled: 0, DemandStatusEnum.requires_training: 0}
+    for demand in session.execute(select(ProjectDemand)).scalars().all():
+        if demand.status == DemandStatusEnum.requires_training:
+            statuses[DemandStatusEnum.requires_training] += 1
+            continue
+        filled = session.execute(
+            select(Allocation).where(
+                Allocation.demand_id == demand.id,
+                Allocation.status.in_([
+                    AllocationStatusEnum.active,
+                    AllocationStatusEnum.approved_by_manager,
+                    AllocationStatusEnum.pending_manager_approval,
+                    AllocationStatusEnum.completed,
+                ]),
+            )
+        ).scalars().all()
+        required = max(int(demand.headcount_required or 1), 1)
+        demand.headcount_needed = max(required - len(filled), 0)
+        if len(filled) >= required:
+            demand.status = DemandStatusEnum.filled
+        elif len(filled) > 0:
+            demand.status = DemandStatusEnum.partially_filled
+        else:
+            demand.status = DemandStatusEnum.open
+        statuses[demand.status] += 1
+
+    session.commit()
+    print(
+        f"  -> {project_links} project skill links, "
+        f"{trainings} trainings ({completed} completed), "
+        f"demands: {statuses[DemandStatusEnum.filled]} filled / "
+        f"{statuses[DemandStatusEnum.partially_filled]} partial / "
+        f"{statuses[DemandStatusEnum.open]} open"
+    )
 
 
 # ===========================================================================
@@ -640,24 +1076,134 @@ def stage6_observability(session) -> None:
 
 
 # ===========================================================================
+# Stage 6b — demo CV approval queue
+# ===========================================================================
+
+def stage6b_cv_reviews(session, emps: list) -> None:
+    """Seed pending/rejected CV reviews without touching active profiles."""
+    print("Stage 6b: CV approval queue")
+    candidates = [m for m in emps if m["orm"].manager_id is not None][:3]
+    pending = 0
+    rejected = 0
+
+    for idx, meta in enumerate(candidates):
+        emp = meta["orm"]
+        proposed = list(dict.fromkeys(
+            [str(s) for s in (meta["skills"] or [])][:8]
+            + ["Kafka", "Docker", "Terraform"]
+        ))
+        is_rejected = idx == 2
+        status = (
+            CvApprovalStatusEnum.rejected
+            if is_rejected
+            else CvApprovalStatusEnum.pending_approval
+        )
+        summary = (
+            f"Updated professional summary for {emp.first_name} {emp.last_name}. "
+            f"Highlights: {', '.join(proposed[:5])}."
+        )
+
+        doc = Document(
+            employee_id=emp.id,
+            document_type=DocumentTypeEnum.cv,
+            file_name=f"{emp.first_name}_{emp.last_name}_CV_v2.txt",
+            file_path=f"storage/cv/{emp.id}_v2.txt",
+            mime_type="text/plain",
+            file_size_bytes=len(meta["resume"] or ""),
+            version=2,
+            is_current=False,
+            text_content=(meta["resume"] or "")[:20000],
+            ingestion_status=IngestionStatusEnum.pending,
+            approval_status=status,
+            extracted_skills=proposed,
+            extracted_summary=summary,
+            pending_profile_updates={
+                "summary": summary,
+                "skills": proposed,
+                "document_id": str(uuid.uuid4()),
+            },
+            review_comment=(
+                "Please attach evidence for the Terraform claim."
+                if is_rejected else None
+            ),
+            reviewed_at=datetime.utcnow() if is_rejected else None,
+        )
+        session.add(doc)
+        session.flush()
+
+        session.add(CvReviewRequest(
+            document_id=doc.id,
+            employee_id=emp.id,
+            manager_id=emp.manager_id,
+            status=status,
+            proposed_skills=proposed,
+            proposed_summary=summary,
+            manager_comment=(
+                "Please attach evidence for the Terraform claim."
+                if is_rejected else None
+            ),
+            reviewed_at=datetime.utcnow() if is_rejected else None,
+        ))
+        if is_rejected:
+            rejected += 1
+        else:
+            pending += 1
+
+    session.commit()
+    print(f"  -> {pending} pending CV review(s), {rejected} rejected example(s)")
+
+
+# ===========================================================================
 # Orchestration
 # ===========================================================================
 
+def _print_summary() -> None:
+    """Print the target database and the row counts the UI depends on."""
+    print("\nSeed summary")
+    print(f"  target : {Config.POSTGRES_HOST}:{Config.POSTGRES_PORT}/{Config.POSTGRES_DB}")
+    with SyncSessionLocal() as session:
+        counts = {}
+        for table in (
+            "employees",
+            "projects",
+            "project_demands",
+            "allocations",
+            "employee_skills",
+            "training_assignments",
+            "cv_review_requests",
+            "forecast_runs",
+            "hitl_review_events",
+            "users",
+        ):
+            counts[table] = session.execute(text(f"SELECT count(*) FROM {table}")).scalar()
+        for table, count in counts.items():
+            print(f"  {table:<22} {count}")
+
+
 def main() -> None:
+    print(
+        "Seeding PostgreSQL at "
+        f"{Config.POSTGRES_HOST}:{Config.POSTGRES_PORT}/{Config.POSTGRES_DB}"
+    )
     init_db_sync()
     with SyncSessionLocal() as session:
         reset_database(session)
         emps = stage1_employees(session)
+        stage1b_skills(session, emps)
+        stage1c_hierarchy(session, emps)
         stage2_documents(session, emps)
         catalog = stage3_projects(session)
         staffing = stage4_staffing(session, emps, catalog)
+        stage4b_skills_trainings(session, emps, catalog)
         stage5_financials(session, emps, staffing)
-        # ensure the manager exists before observability history
+        stage6b_cv_reviews(session, emps)
+        # ensure the manager/admin accounts exist before observability history
         from src.auth.auth import init_auth_db
         init_auth_db()
         stage6_observability(session)
 
     init_auth_db()
+    _print_summary()
     print("Data seed simulation complete.")
 
 

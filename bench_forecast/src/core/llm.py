@@ -106,6 +106,14 @@ class AllocationDecision(BaseModel):
         None,
         description="Semantic match score between 0.0 and 1.0",
     )
+    alternatives: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Optional ranked alternatives (max 2) with employee_id, "
+            "projected_margin and rationale. Never used for persistence; "
+            "stored for audit and HITL context."
+        ),
+    )
 
     @field_validator("projected_margin")
     @classmethod
@@ -114,6 +122,16 @@ class AllocationDecision(BaseModel):
         if math.isnan(v) or math.isinf(v):
             raise ValueError(f"projected_margin must be a finite number, got {v}")
         return round(v, 2)
+
+    @field_validator("alternatives", mode="before")
+    @classmethod
+    def alternatives_must_be_a_list(cls, v: Any) -> List[Any]:
+        """Treat a malformed alternatives payload as empty, not fatal.
+
+        Alternatives are advisory only; a small model returning a string or
+        null here must not invalidate an otherwise correct primary decision.
+        """
+        return v if isinstance(v, list) else []
 
     @model_validator(mode="after")
     def hire_has_no_employee(self) -> "AllocationDecision":
@@ -242,7 +260,9 @@ class LLMFactory:
             return ChatGroq(
                 api_key=Config.GROQ_API_KEY,
                 model_name=model_name or Config.GROQ_MODEL,
-                temperature=0.3,  # Lower temperature for deterministic financial reasoning
+                temperature=Config.LLM_TEMPERATURE,
+                max_retries=Config.LLM_MAX_RETRIES,
+                timeout=Config.LLM_TIMEOUT,
             )
 
         elif provider == "ollama":
@@ -250,7 +270,7 @@ class LLMFactory:
             return ChatOllama(
                 base_url=Config.OLLAMA_BASE_URL,
                 model=model_name or Config.OLLAMA_MODEL,
-                temperature=0.3,
+                temperature=Config.LLM_TEMPERATURE,
                 format="json",
                 num_predict=8192,
             )
@@ -274,7 +294,7 @@ class LLMFactory:
                 base_url=Config.LLM_BASE_URL,
                 api_key=Config.LLM_API_KEY,
                 model=model_name or Config.LLM_MODEL,
-                temperature=0.3,
+                temperature=Config.LLM_TEMPERATURE,
             )
 
         else:
@@ -405,7 +425,10 @@ CRITICAL RULES:
       "projected_margin": <float>,
       "justification": "<string, min 20 chars, cite specific skills/evidence>",
       "upskilling_path": "<string>" | null,
-      "match_score": <float 0.0-1.0>
+      "match_score": <float 0.0-1.0>,
+      "alternatives": [
+        {"employee_id": "<uuid-string>", "projected_margin": <float>, "rationale": "<string>"}
+      ]
     }
   - projected_margin = (bill_rate - cost_rate) / bill_rate * 100
   - justification MUST name the specific skills the candidate HAS that the role
@@ -416,7 +439,15 @@ CRITICAL RULES:
     to close the Java gap").
   - upskilling_path is REQUIRED when action_type = "train", null otherwise.
   - employee_id MUST be null when action_type = "hire".
+  - employee_id MUST be copied verbatim from the [bracketed] value in the
+    candidate list. NEVER use the list number/position as the employee_id.
   - Do not invent employee IDs not present in the candidate list.
+  - Include up to 2 ranked `alternatives` (same candidate pool). Alternatives
+    are advisory only; the primary decision is the one that will be reviewed.
+  - TRADE-OFF POLICY (balanced): prefer candidates that meet target_margin. You
+    MAY choose a below-target candidate when their skill coverage is materially
+    stronger, but you MUST explain that trade-off in the justification.
+    Never choose a candidate with a negative projected_margin.
 """
 
     # -----------------------------------------------------------------------
@@ -451,7 +482,9 @@ CRITICAL RULES:
         Returns:
             Tuple of (SystemMessage, HumanMessage) for the LLM.
         """
-        candidates_block = _format_candidates_block(candidates, target_bill_rate)
+        candidates_block = _format_candidates_block(
+            candidates, target_bill_rate, target_margin
+        )
 
         rag_block = ""
         if rag_passages:
@@ -477,6 +510,9 @@ Review each candidate's semantic similarity AND projected_margin_pct.
 Select the action_type that best serves both technical fit and financial health.
 If no candidate meets both criteria, recommend hiring.
 
+employee_id MUST be copied verbatim from the [bracketed] UUID — never the list
+number. employee_id MUST be null when action_type is "hire".
+
 Respond with ONLY the JSON object."""
 
         return (
@@ -495,6 +531,7 @@ Respond with ONLY the JSON object."""
         open_roles_count: int,
         rejection_feedback: Optional[str] = None,
         previous_plan: Optional[Dict[str, Any]] = None,
+        plan_facts: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """Build aggregate workforce planning prompt.
 
@@ -540,7 +577,7 @@ Your response MUST be a single JSON object with this exact structure:
         {"role": "Data Scientist", "required_skills": ["Python", "ML"], "headcount": 2}
     ],
     "confidence_score": 0.82,
-    "reasoning": "string — minimum 50 characters explaining overall strategy including financial rationale"
+    "reasoning": "<2-4 sentences citing the actual allocation, training and hire counts and the margin rationale>"
 }
 
 Financial Guidelines:
@@ -549,6 +586,8 @@ Financial Guidelines:
 - Include trainings for: 0.45 <= match_score < 0.70 AND resource is cost-effective
 - Recommend hiring when no internal candidate satisfies both skill AND margin requirements
 - confidence_score: 0.0-1.0 reflecting recommendation certainty
+- reasoning: write a specific 2-4 sentence strategy summary grounded in the FACTS
+  block below. Do NOT copy this example and do NOT return the schema description.
 """
 
         compact_matches = [
@@ -578,6 +617,14 @@ the same reallocations or reasoning.
 ---
 """
 
+        facts_block = ""
+        if plan_facts:
+            facts_block = (
+                "\nFACTS FROM THE DETERMINISTIC PLAN (your reasoning must agree "
+                "with these numbers and roles):\n"
+                f"{json.dumps(plan_facts, indent=2)}\n"
+            )
+
         human_prompt = f"""Generate a financially-optimised workforce allocation plan:{revision_block}
 
 TOP SKILL MATCHES (sorted by match_score):
@@ -586,7 +633,7 @@ TOP SKILL MATCHES (sorted by match_score):
 CONTEXT:
 - Available bench employees: {employees_count}
 - Open positions:            {open_roles_count}
-
+{facts_block}
 Respond with ONLY the JSON object."""
 
         return SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)
@@ -728,7 +775,7 @@ Rules:
         for c in candidates:
             emp = c.get("employee", {})
             skills = ", ".join(emp.get("skills") or [])
-            passages = "\n".join(c.get("passages") or [])[:1200]
+            passages = "\n".join(c.get("passages") or [])[:500]
             blocks.append(
                 f"CANDIDATE employee_id={emp.get('id')}\n"
                 f"Name: {emp.get('name') or emp.get('full_name') or ''}\n"
@@ -753,6 +800,7 @@ Rules:
         open_roles_count: int,
         rejection_feedback: Optional[str] = None,
         previous_plan: Optional[Dict[str, Any]] = None,
+        plan_facts: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """Build prompt for allocation planning — delegates to FinancialMatchPrompts."""
         return FinancialMatchPrompts.build_planning_prompt(
@@ -761,6 +809,7 @@ Rules:
             open_roles_count=open_roles_count,
             rejection_feedback=rejection_feedback,
             previous_plan=previous_plan,
+            plan_facts=plan_facts,
         )
 
 
@@ -771,16 +820,32 @@ Rules:
 def _format_candidates_block(
     candidates: List[Dict[str, Any]],
     target_bill_rate: float,
+    target_margin: float,
 ) -> str:
-    """Format candidate list as a readable table for prompt injection."""
+    """Format candidate list as a readable table for prompt injection.
+
+    The leading number is a *list index only*. Small local models regularly
+    return it as ``employee_id``; the instructions and the decider's grounding
+    guard both defend against that, but the label is kept explicit here.
+    """
     if not candidates:
         return "No financially viable candidates found in ChromaDB."
 
-    lines = []
+    lines = [
+        "Each candidate is prefixed with a LIST NUMBER (1, 2, 3...) for readability.",
+        "employee_id MUST be the value inside [brackets], copied verbatim — "
+        "never the list number.",
+        "",
+    ]
     for i, c in enumerate(candidates, 1):
         cost = float(c.get("hourly_cost_rate", 0))
         margin = float(c.get("projected_margin_pct", 0))
-        viability = "✓ above target" if margin > 0 else "✗ negative margin"
+        if margin < 0:
+            viability = "✗ negative margin"
+        elif margin >= target_margin:
+            viability = "✓ meets target"
+        else:
+            viability = "✗ below target"
         lines.append(
             f"{i}. [{c.get('employee_id', 'N/A')}] {c.get('full_name', 'Unknown')} "
             f"({c.get('seniority', '')} {c.get('primary_role', '')})"
@@ -788,7 +853,7 @@ def _format_candidates_block(
         lines.append(
             f"   Similarity: {c.get('similarity_score', 0):.2f} | "
             f"Cost Rate: ${cost:.2f}/h | "
-            f"Projected Margin: {margin:.1f}% ({viability})"
+            f"Projected Margin: {margin:.1f}% (target {target_margin:.1f}% — {viability})"
         )
         matched = c.get("matched_skills") or []
         missing = c.get("missing_skills") or []
@@ -797,9 +862,28 @@ def _format_candidates_block(
                 f"   Matching skills: {', '.join(matched) if matched else 'none'} | "
                 f"Missing skills: {', '.join(missing) if missing else 'none'}"
             )
-        # Ground the LLM in the retrieved CV passage (longer excerpt gives the
-        # model real evidence to reason over, not just the numeric scores).
-        excerpt = (c.get("document_excerpt") or "")[:600]
+
+        # The skill_matcher's independent LLM assessment, when available. This
+        # lets the decider reason about transferable skills instead of only the
+        # deterministic keyword overlap.
+        llm_score = c.get("llm_match_score")
+        if llm_score is not None:
+            try:
+                score = float(llm_score)
+            except (TypeError, ValueError):
+                score = None
+            if score is not None:
+                llm_missing = c.get("llm_missing_skills") or []
+                rationale = str(c.get("llm_reasoning") or "").strip()[:300]
+                lines.append(
+                    f"   Skill-matcher assessment: {score:.2f}"
+                    + (f" | missing: {', '.join(llm_missing)}" if llm_missing else "")
+                    + (f" | rationale: {rationale}" if rationale else "")
+                )
+        # Ground the LLM in the retrieved CV passage. Keep excerpts short: the
+        # prompt already carries up to six candidates and small local models
+        # lose accuracy as the context grows.
+        excerpt = (c.get("document_excerpt") or "")[:300]
         if excerpt:
             lines.append(f"   CV Excerpt: {excerpt}")
         lines.append("")

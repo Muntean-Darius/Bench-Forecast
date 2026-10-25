@@ -1,8 +1,8 @@
-"""init_full_schema
+"""baseline schema
 
-Revision ID: c91461490574
+Revision ID: 806bfe6b3200
 Revises: 
-Create Date: 2026-10-07 18:16:56.819352
+Create Date: 2026-10-24 16:06:32.078805
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = 'c91461490574'
+revision: str = '806bfe6b3200'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -128,17 +128,29 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_project_roles_project_id'), 'project_roles', ['project_id'], unique=False)
-    op.create_table('users',
+    op.create_table('bench_costs',
     sa.Column('id', sa.UUID(), nullable=False),
-    sa.Column('email', sa.String(length=255), nullable=False),
-    sa.Column('role', sa.String(length=50), nullable=False),
-    sa.Column('department_id', sa.UUID(), nullable=True),
-    sa.Column('is_active', sa.Boolean(), nullable=False),
+    sa.Column('employee_id', sa.UUID(), nullable=False),
+    sa.Column('period_start', sa.Date(), nullable=False),
+    sa.Column('period_end', sa.Date(), nullable=False),
+    sa.Column('bench_days', sa.Integer(), nullable=False),
+    sa.Column('daily_cost', sa.Numeric(precision=10, scale=2), nullable=False),
+    sa.Column('total_cost', sa.Numeric(precision=12, scale=2), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, comment='Row creation timestamp (UTC)'),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, comment='Row last-updated timestamp (UTC)'),
-    sa.ForeignKeyConstraint(['department_id'], ['departments.id'], ondelete='SET NULL'),
-    sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('email')
+    sa.ForeignKeyConstraint(['employee_id'], ['employees.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_table('bench_history',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('employee_id', sa.UUID(), nullable=False),
+    sa.Column('bench_start', sa.Date(), nullable=False),
+    sa.Column('bench_end', sa.Date(), nullable=True),
+    sa.Column('duration_days', sa.Integer(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, comment='Row creation timestamp (UTC)'),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, comment='Row last-updated timestamp (UTC)'),
+    sa.ForeignKeyConstraint(['employee_id'], ['employees.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
     )
     op.create_table('documents',
     sa.Column('id', sa.UUID(), nullable=False, comment='Document UUID PK'),
@@ -159,6 +171,18 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_documents_chroma_doc_id'), 'documents', ['chroma_doc_id'], unique=False)
     op.create_index(op.f('ix_documents_employee_id'), 'documents', ['employee_id'], unique=False)
+    op.create_table('employee_costs',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('employee_id', sa.UUID(), nullable=False),
+    sa.Column('effective_date', sa.Date(), nullable=False),
+    sa.Column('annual_salary', sa.Numeric(precision=12, scale=2), nullable=False),
+    sa.Column('internal_daily_cost', sa.Numeric(precision=10, scale=2), nullable=False),
+    sa.Column('internal_hourly_cost', sa.Numeric(precision=8, scale=2), nullable=False),
+    sa.Column('currency', sa.String(length=3), nullable=False),
+    sa.Column('overhead_multiplier', sa.Numeric(precision=4, scale=2), nullable=False),
+    sa.ForeignKeyConstraint(['employee_id'], ['employees.id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('id')
+    )
     op.create_table('employee_skills',
     sa.Column('employee_id', sa.UUID(), nullable=False, comment='FK → employees.id'),
     sa.Column('skill_id', sa.UUID(), nullable=False, comment='FK → skills.id'),
@@ -170,6 +194,25 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['skill_id'], ['skills.id'], ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('employee_id', 'skill_id')
     )
+    op.create_table('users',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('username', sa.String(length=255), nullable=False),
+    sa.Column('password_hash', sa.String(length=255), nullable=False),
+    sa.Column('email', sa.String(length=255), nullable=True),
+    sa.Column('full_name', sa.String(length=255), nullable=False),
+    sa.Column('role', sa.String(length=50), nullable=False),
+    sa.Column('employee_id', sa.UUID(), nullable=True),
+    sa.Column('department_id', sa.UUID(), nullable=True),
+    sa.Column('cv_uri', sa.String(length=512), nullable=True),
+    sa.Column('is_active', sa.Boolean(), nullable=False),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, comment='Row creation timestamp (UTC)'),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, comment='Row last-updated timestamp (UTC)'),
+    sa.ForeignKeyConstraint(['department_id'], ['departments.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['employee_id'], ['employees.id'], ondelete='SET NULL'),
+    sa.PrimaryKeyConstraint('id'),
+    sa.UniqueConstraint('email'),
+    sa.UniqueConstraint('username')
+    )
     op.create_table('forecast_runs',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('run_date', sa.DateTime(timezone=True), nullable=False),
@@ -179,6 +222,10 @@ def upgrade() -> None:
     sa.Column('ragas_faithfulness', sa.Numeric(precision=5, scale=4), nullable=True),
     sa.Column('ragas_answer_relevance', sa.Numeric(precision=5, scale=4), nullable=True),
     sa.Column('ragas_context_recall', sa.Numeric(precision=5, scale=4), nullable=True),
+    sa.Column('decision_metrics', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('latency_seconds', sa.Numeric(precision=10, scale=2), nullable=True),
+    sa.Column('llm_provider', sa.String(length=50), nullable=True),
+    sa.Column('llm_model', sa.String(length=120), nullable=True),
     sa.ForeignKeyConstraint(['triggered_by'], ['users.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
@@ -210,6 +257,28 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['forecast_run_id'], ['forecast_runs.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('hiring_recommendations',
+    sa.Column('id', sa.UUID(), nullable=False),
+    sa.Column('project_id', sa.UUID(), nullable=True),
+    sa.Column('demand_id', sa.UUID(), nullable=True),
+    sa.Column('role', sa.String(length=200), nullable=False),
+    sa.Column('required_skills', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+    sa.Column('headcount', sa.Integer(), nullable=False),
+    sa.Column('justification', sa.Text(), nullable=True),
+    sa.Column('status', sa.Enum('open', 'dismissed', 'fulfilled', name='hiringrecommendationstatusenum', create_constraint=True), nullable=False),
+    sa.Column('forecast_run_id', sa.UUID(), nullable=True),
+    sa.Column('created_by', sa.UUID(), nullable=True),
+    sa.Column('created_at', sa.DateTime(timezone=True), nullable=False, comment='Row creation timestamp (UTC)'),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False, comment='Row last-updated timestamp (UTC)'),
+    sa.ForeignKeyConstraint(['created_by'], ['users.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['demand_id'], ['project_demands.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['forecast_run_id'], ['forecast_runs.id'], ondelete='SET NULL'),
+    sa.ForeignKeyConstraint(['project_id'], ['projects.id'], ondelete='SET NULL'),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_hiring_recommendations_demand_id'), 'hiring_recommendations', ['demand_id'], unique=False)
+    op.create_index(op.f('ix_hiring_recommendations_project_id'), 'hiring_recommendations', ['project_id'], unique=False)
+    op.create_index(op.f('ix_hiring_recommendations_status'), 'hiring_recommendations', ['status'], unique=False)
     op.create_table('hitl_review_events',
     sa.Column('id', sa.UUID(), nullable=False),
     sa.Column('forecast_run_id', sa.UUID(), nullable=True),
@@ -232,13 +301,20 @@ def downgrade() -> None:
     """Downgrade schema."""
     # ### commands auto generated by Alembic - please adjust! ###
     op.drop_table('hitl_review_events')
+    op.drop_index(op.f('ix_hiring_recommendations_status'), table_name='hiring_recommendations')
+    op.drop_index(op.f('ix_hiring_recommendations_project_id'), table_name='hiring_recommendations')
+    op.drop_index(op.f('ix_hiring_recommendations_demand_id'), table_name='hiring_recommendations')
+    op.drop_table('hiring_recommendations')
     op.drop_table('allocations')
     op.drop_table('forecast_runs')
+    op.drop_table('users')
     op.drop_table('employee_skills')
+    op.drop_table('employee_costs')
     op.drop_index(op.f('ix_documents_employee_id'), table_name='documents')
     op.drop_index(op.f('ix_documents_chroma_doc_id'), table_name='documents')
     op.drop_table('documents')
-    op.drop_table('users')
+    op.drop_table('bench_history')
+    op.drop_table('bench_costs')
     op.drop_index(op.f('ix_project_roles_project_id'), table_name='project_roles')
     op.drop_table('project_roles')
     op.drop_table('project_demands')

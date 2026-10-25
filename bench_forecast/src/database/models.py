@@ -121,7 +121,30 @@ class AllocationStatusEnum(str, enum.Enum):
 
 class DemandStatusEnum(str, enum.Enum):
     open = "open"
+    partially_filled = "partially_filled"
     filled = "filled"
+    requires_training = "requires_training"
+    cancelled = "cancelled"
+
+
+class CvApprovalStatusEnum(str, enum.Enum):
+    not_required = "not_required"
+    pending_approval = "pending_approval"
+    approved = "approved"
+    rejected = "rejected"
+
+
+class SkillOriginEnum(str, enum.Enum):
+    cv = "cv"
+    project = "project"
+    training = "training"
+    manual = "manual"
+
+
+class TrainingStatusEnum(str, enum.Enum):
+    assigned = "assigned"
+    in_progress = "in_progress"
+    completed = "completed"
     cancelled = "cancelled"
 
 
@@ -223,6 +246,13 @@ class Employee(TimestampMixin, Base):
 
     __tablename__ = "employees"
 
+    __table_args__ = (
+        CheckConstraint(
+            "daily_capacity_hours > 0 AND daily_capacity_hours <= 8.0",
+            name="ck_employee_daily_capacity",
+        ),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
@@ -281,6 +311,12 @@ class Employee(TimestampMixin, Base):
         nullable=False,
         default=EmploymentTypeEnum.full_time,
         comment="Contract type: full_time | part_time | contractor",
+    )
+    daily_capacity_hours: Mapped[Decimal] = mapped_column(
+        Numeric(4, 2),
+        nullable=False,
+        default=Decimal("8.00"),
+        comment="Contracted daily working hours (hard cap 8.0)",
     )
     location: Mapped[Optional[str]] = mapped_column(
         String(200),
@@ -399,6 +435,12 @@ class Employee(TimestampMixin, Base):
         cascade="all, delete-orphan",
         lazy="select",
     )
+    skill_evidence: Mapped[list["EmployeeSkillEvidence"]] = relationship(
+        "EmployeeSkillEvidence",
+        back_populates="employee",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
     documents: Mapped[list["Document"]] = relationship(
         "Document",
         back_populates="employee",
@@ -431,18 +473,71 @@ class Employee(TimestampMixin, Base):
         cascade="all, delete-orphan",
         lazy="select",
     )
+    training_assignments: Mapped[list["TrainingAssignment"]] = relationship(
+        "TrainingAssignment",
+        back_populates="employee",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+    cv_review_requests: Mapped[list["CvReviewRequest"]] = relationship(
+        "CvReviewRequest",
+        foreign_keys="CvReviewRequest.employee_id",
+        back_populates="employee",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+    @property
+    def effective_daily_capacity(self) -> Decimal:
+        """Contracted capacity, hard-capped at 8 hours/day."""
+        return min(Decimal(self.daily_capacity_hours or 8), Decimal("8.00"))
+
+    @property
+    def committed_daily_hours(self) -> Decimal:
+        """Hours consumed by approved/active allocations."""
+        committed_statuses = {
+            AllocationStatusEnum.approved_by_manager,
+            AllocationStatusEnum.active,
+        }
+        total = sum(
+            (a.allocated_hours_per_day or Decimal("0"))
+            for a in self.allocations
+            if a.status in committed_statuses
+        )
+        return Decimal(total or 0)
+
+    @property
+    def reserved_daily_hours(self) -> Decimal:
+        """Hours held by AI proposals / pending approvals."""
+        reserved_statuses = {
+            AllocationStatusEnum.proposed_by_ai,
+            AllocationStatusEnum.pending_manager_approval,
+        }
+        total = sum(
+            (a.allocated_hours_per_day or Decimal("0"))
+            for a in self.allocations
+            if a.status in reserved_statuses
+        )
+        return Decimal(total or 0)
+
+    @property
+    def remaining_daily_hours(self) -> Decimal:
+        """Hours still available after committed + reserved work."""
+        return max(
+            Decimal("0.00"),
+            self.effective_daily_capacity
+            - self.committed_daily_hours
+            - self.reserved_daily_hours,
+        )
 
     @property
     def utilization_rate(self) -> Decimal:
-        """
-        Dynamically calculates the sum of active allocation percentages.
-        TODO: Consider replacing with a SQL view / hybrid property in the future.
-        """
-        active_allocations = [
-            a.allocation_pct for a in self.allocations 
-            if a.status == AllocationStatusEnum.active
-        ]
-        return sum(active_allocations) if active_allocations else Decimal("0.00")
+        """Daily utilization as a percentage of the contracted capacity."""
+        capacity = self.effective_daily_capacity
+        if capacity <= 0:
+            return Decimal("0.00")
+        pct = self.committed_daily_hours / capacity * Decimal("100")
+        return Decimal(pct).quantize(Decimal("0.01"))
 
     def __repr__(self) -> str:  # pragma: no cover
         return (
@@ -550,6 +645,29 @@ class EmployeeSkill(Base):
         nullable=False,
         default=False,
         comment="True = top skill highlighted on profile. False = secondary / supporting.",
+    )
+    source: Mapped[SkillOriginEnum] = mapped_column(
+        SQLEnum(SkillOriginEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+        default=SkillOriginEnum.cv,
+        comment="Where this skill came from: cv | project | training | manual",
+    )
+    source_ref: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment="Demand / project / document UUID that produced this skill",
+    )
+    is_locked: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="True = project-earned; CV updates must never prune it",
+    )
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+        comment="When the skill was acquired / first attached",
     )
 
     # Relationships
@@ -669,6 +787,47 @@ class Document(Base):
         default=IngestionStatusEnum.pending,
         comment="ChromaDB ingestion state: pending | ingested | failed",
     )
+    approval_status: Mapped[CvApprovalStatusEnum] = mapped_column(
+        SQLEnum(CvApprovalStatusEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+        default=CvApprovalStatusEnum.not_required,
+        comment="Human review state: not_required | pending_approval | approved | rejected",
+    )
+    pending_profile_updates: Mapped[Optional[dict]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Staged summary/skills, applied only after manager approval",
+    )
+    extracted_skills: Mapped[Optional[list]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Skills extracted from the document at upload time",
+    )
+    extracted_summary: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Anonymised professional summary generated at upload time",
+    )
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Manager / admin who approved or rejected this CV",
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    review_comment: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Manager feedback, especially on rejection",
+    )
+    profile_applied_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the staged profile was applied to employees + ChromaDB",
+    )
     uploaded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -678,6 +837,12 @@ class Document(Base):
 
     # Relationships
     employee: Mapped["Employee"] = relationship("Employee", back_populates="documents")
+    cv_review: Mapped[Optional["CvReviewRequest"]] = relationship(
+        "CvReviewRequest",
+        back_populates="document",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover
         return (
@@ -722,6 +887,11 @@ class Project(Base):
         nullable=False,
         comment="Human-readable project name",
     )
+    client_name: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Client / account the project belongs to",
+    )
     status: Mapped[str] = mapped_column(
         String(60),
         nullable=False,
@@ -744,7 +914,23 @@ class Project(Base):
         nullable=False,
         comment="Total project budget",
     )
+    start_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+        comment="Project start date",
+    )
+    end_date: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+        comment="Planned / actual project end date (roll-off signal)",
+    )
 
+    demands: Mapped[list["ProjectDemand"]] = relationship(
+        "ProjectDemand",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
     roles: Mapped[list["ProjectRole"]] = relationship(
         "ProjectRole",
         back_populates="project",
@@ -835,6 +1021,10 @@ class Allocation(TimestampMixin, Base):
 
     __table_args__ = (
         CheckConstraint("end_date >= start_date", name="ck_allocation_date_order"),
+        CheckConstraint(
+            "allocated_hours_per_day > 0 AND allocated_hours_per_day <= 8.0",
+            name="ck_allocation_hours_per_day",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -842,6 +1032,12 @@ class Allocation(TimestampMixin, Base):
     demand_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("project_demands.id", ondelete="SET NULL"), nullable=True)
     role_on_project: Mapped[str] = mapped_column(String(200), nullable=False)
     allocation_pct: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    allocated_hours_per_day: Mapped[Decimal] = mapped_column(
+        Numeric(4, 2),
+        nullable=False,
+        default=Decimal("8.00"),
+        comment="Hours/day consumed from the employee's daily capacity",
+    )
     start_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     
@@ -862,7 +1058,11 @@ class Allocation(TimestampMixin, Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     employee: Mapped["Employee"] = relationship("Employee", foreign_keys=[employee_id], back_populates="allocations")
-    project_demand: Mapped[Optional["ProjectDemand"]] = relationship("ProjectDemand", foreign_keys=[demand_id])
+    project_demand: Mapped[Optional["ProjectDemand"]] = relationship(
+        "ProjectDemand",
+        foreign_keys=[demand_id],
+        back_populates="allocations",
+    )
 
     @property
     def project_id(self) -> Optional[uuid.UUID]:
@@ -930,14 +1130,60 @@ class ProjectDemand(TimestampMixin, Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     required_skills: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     min_proficiency: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    hours_per_day: Mapped[Decimal] = mapped_column(
+        Numeric(4, 2),
+        nullable=False,
+        default=Decimal("8.00"),
+        comment="Daily hours required by this role",
+    )
+    required_experience_level: Mapped[Optional[ExperienceLevelEnum]] = mapped_column(
+        SQLEnum(ExperienceLevelEnum, native_enum=True, create_constraint=True),
+        nullable=True,
+        comment="Seniority required for the role",
+    )
     headcount_needed: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    headcount_required: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        comment="Original number of seats requested",
+    )
     target_bill_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     target_margin: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 2), nullable=True)
     win_probability: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4), nullable=True)
     status: Mapped[DemandStatusEnum] = mapped_column(SQLEnum(DemandStatusEnum, native_enum=True, create_constraint=True), nullable=False, default=DemandStatusEnum.open)
     needed_by_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
 
-    project: Mapped["Project"] = relationship("Project")
+    project: Mapped["Project"] = relationship("Project", back_populates="demands")
+    allocations: Mapped[list["Allocation"]] = relationship(
+        "Allocation",
+        back_populates="project_demand",
+        foreign_keys="Allocation.demand_id",
+        lazy="select",
+    )
+
+    @property
+    def filled_seats(self) -> int:
+        committed = {
+            AllocationStatusEnum.approved_by_manager,
+            AllocationStatusEnum.pending_manager_approval,
+            AllocationStatusEnum.active,
+        }
+        return len([a for a in self.allocations if a.status in committed])
+
+    @property
+    def roster_status(self) -> DemandStatusEnum:
+        if self.status == DemandStatusEnum.requires_training:
+            return DemandStatusEnum.requires_training
+        if self.headcount_needed <= 0:
+            return DemandStatusEnum.filled
+        filled = self.filled_seats
+        required = max(self.headcount_required or 1, 1)
+        if filled <= 0:
+            return DemandStatusEnum.open
+        if filled < required:
+            return DemandStatusEnum.partially_filled
+        return DemandStatusEnum.filled
 
 
 class HitlReviewEvent(Base):
@@ -1053,3 +1299,206 @@ class BenchCost(TimestampMixin, Base):
     total_cost: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
 
     employee: Mapped["Employee"] = relationship("Employee", back_populates="bench_costs")
+
+
+# =============================================================================
+# Phase 7 — Cumulative skills, CV approval, training and notifications
+# =============================================================================
+
+class EmployeeSkillEvidence(Base):
+    """Append-only provenance ledger for skills.
+
+    ``employee_skills`` stores the current effective union; this table keeps
+    every origin (CV, project, training, manual) for audit and diff views.
+    """
+
+    __tablename__ = "employee_skill_evidence"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("skills.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source: Mapped[SkillOriginEnum] = mapped_column(
+        SQLEnum(SkillOriginEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+    )
+    source_ref: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
+
+    employee: Mapped["Employee"] = relationship(
+        "Employee", back_populates="skill_evidence"
+    )
+    skill: Mapped["Skill"] = relationship("Skill")
+
+
+class CvReviewRequest(TimestampMixin, Base):
+    """Manager approval task created for every staged employee CV upload."""
+
+    __tablename__ = "cv_review_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    manager_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[CvApprovalStatusEnum] = mapped_column(
+        SQLEnum(CvApprovalStatusEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+        default=CvApprovalStatusEnum.pending_approval,
+    )
+    proposed_skills: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    proposed_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    manager_comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    document: Mapped["Document"] = relationship(
+        "Document", back_populates="cv_review"
+    )
+    employee: Mapped["Employee"] = relationship(
+        "Employee",
+        foreign_keys=[employee_id],
+        back_populates="cv_review_requests",
+    )
+    manager: Mapped[Optional["Employee"]] = relationship(
+        "Employee", foreign_keys=[manager_id]
+    )
+    reviewer: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[reviewed_by]
+    )
+
+
+class TrainingAssignment(TimestampMixin, Base):
+    """Active training / upskilling path assigned to an employee."""
+
+    __tablename__ = "training_assignments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    employee_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    project_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    demand_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("project_demands.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    targeted_skills: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    ai_upskilling_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[TrainingStatusEnum] = mapped_column(
+        SQLEnum(TrainingStatusEnum, native_enum=True, create_constraint=True),
+        nullable=False,
+        default=TrainingStatusEnum.assigned,
+    )
+    assigned_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
+    target_completion_date: Mapped[Optional[date]] = mapped_column(
+        Date, nullable=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    employee: Mapped["Employee"] = relationship(
+        "Employee", back_populates="training_assignments"
+    )
+    project: Mapped[Optional["Project"]] = relationship("Project")
+    demand: Mapped[Optional["ProjectDemand"]] = relationship("ProjectDemand")
+    assigner: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[assigned_by]
+    )
+
+
+class EmailNotification(Base):
+    """Outbox + audit trail for asynchronous email notifications."""
+
+    __tablename__ = "email_notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    recipient_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    recipient_employee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    subject: Mapped[str] = mapped_column(String(500), nullable=False)
+    body_text: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="queued"
+    )
+    provider: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
+    sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    recipient: Mapped[Optional["Employee"]] = relationship(
+        "Employee", foreign_keys=[recipient_employee_id]
+    )

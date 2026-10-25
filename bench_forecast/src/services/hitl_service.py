@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
 
@@ -24,6 +24,18 @@ from src.database.models import (
     Project,
     HiringRecommendation,
     HiringRecommendationStatusEnum,
+    TrainingAssignment,
+    TrainingStatusEnum,
+)
+from src.services.skills_service import (
+    apply_project_skills,
+    get_skill_names,
+    skills_from_demand,
+)
+from src.services.workforce_service import (
+    CapacityExceededError,
+    CapacityService,
+    recalculate_allocation,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,7 +108,13 @@ class HITLService:
                 ]),
             )
         )
-        if (remaining.scalar() or 0) == 0:
+        remaining_hires = await self.session.execute(
+            select(func.count(HiringRecommendation.id)).where(
+                HiringRecommendation.forecast_run_id == forecast_run_id,
+                HiringRecommendation.status == HiringRecommendationStatusEnum.open,
+            )
+        )
+        if (remaining.scalar() or 0) == 0 and (remaining_hires.scalar() or 0) == 0:
             run = await self.session.get(ForecastRun, forecast_run_id)
             if run and run.status in ("queued", "running", "paused_for_review"):
                 run.status = "completed"
@@ -117,36 +135,93 @@ class HITLService:
             raise ValueError(f"Cannot approve allocation in status '{allocation.status}'")
 
         with self._review_workflow(allocation, "approve", reviewer_id):
+            employee = await self.session.get(Employee, allocation.employee_id)
+            demand = (
+                await self.session.get(ProjectDemand, allocation.demand_id)
+                if allocation.demand_id
+                else None
+            )
+
+            if (
+                demand is not None
+                and allocation.status
+                in (
+                    AllocationStatusEnum.proposed_by_ai,
+                    AllocationStatusEnum.pending_manager_approval,
+                )
+                and (demand.headcount_needed or 0) <= 0
+            ):
+                raise ValueError(
+                    f"Demand {demand.id} is already fully filled"
+                )
+
+            # Capacity re-check at approval time. The allocation's own
+            # pending/reserved hours are excluded so it does not collide with
+            # itself, while all other committed/reserved work is respected.
+            hours = (
+                demand.hours_per_day
+                if demand is not None and demand.hours_per_day is not None
+                else allocation.allocated_hours_per_day
+            )
+            if hours is None:
+                hours = Decimal("8.00")
+            if employee is not None:
+                capacity_service = CapacityService(self.session)
+                summary = await capacity_service.assert_capacity(
+                    allocation.employee_id,
+                    hours,
+                    exclude_allocation_id=allocation.id,
+                    on_date=allocation.start_date or date.today(),
+                    employee=employee,
+                )
+                recalculate_allocation(allocation, employee, hours)
+
             allocation.status = AllocationStatusEnum.approved_by_manager
             allocation.approved_by = reviewer_id
             allocation.approved_at = datetime.utcnow()
 
             # Update the associated Employee's bench status and current project
-            employee = await self.session.get(Employee, allocation.employee_id)
             if employee:
                 employee.bench_status = BenchStatusEnum.on_project
                 employee.bench_start_date = None
 
                 project_name = None
-                if allocation.demand_id:
-                    demand = await self.session.get(ProjectDemand, allocation.demand_id)
-                    if demand:
-                        if demand.project_id:
-                            proj = await self.session.get(Project, demand.project_id)
-                            if proj:
-                                project_name = proj.name
-                        if not project_name and demand.role:
-                            project_name = f"Project ({demand.role})"
+                if demand:
+                    if demand.project_id:
+                        proj = await self.session.get(Project, demand.project_id)
+                        if proj:
+                            project_name = proj.name
+                    if not project_name and demand.role:
+                        project_name = f"Project ({demand.role})"
 
-                        if demand.headcount_needed and demand.headcount_needed > 0:
-                            demand.headcount_needed -= 1
-                        if demand.headcount_needed <= 0:
-                            demand.status = DemandStatusEnum.filled
+                    if demand.headcount_needed and demand.headcount_needed > 0:
+                        demand.headcount_needed -= 1
+                    required = max(int(demand.headcount_required or 1), 1)
+                    if demand.headcount_needed <= 0:
+                        demand.status = DemandStatusEnum.filled
+                    elif int(demand.headcount_needed) < required:
+                        demand.status = DemandStatusEnum.partially_filled
 
                 if not project_name:
                     project_name = allocation.role_on_project or "Assigned Project"
 
                 employee.current_project = project_name
+
+                if demand is not None:
+                    # A train-category proposal is represented by a non-empty
+                    # upskilling path. It creates an active training assignment
+                    # and does NOT pre-grant the missing role skills; those are
+                    # granted when the training is completed.
+                    if allocation.ai_upskilling_path:
+                        await self._ensure_training_assignment(
+                            allocation, demand, employee, reviewer_id
+                        )
+                    else:
+                        # Cumulative skills: the role's required skills become
+                        # permanently attached (and locked) on approval.
+                        await apply_project_skills(
+                            self.session, employee.id, demand
+                        )
 
             event = HitlReviewEvent(
                 forecast_run_id=allocation.forecast_run_id,
@@ -171,6 +246,59 @@ class HITLService:
             )
             res = await self.session.execute(stmt)
             return res.scalars().first()
+
+    async def _ensure_training_assignment(
+        self,
+        allocation: Allocation,
+        demand: ProjectDemand,
+        employee: Employee,
+        reviewer_id: uuid.UUID,
+    ) -> TrainingAssignment:
+        """Create the active training path for an approved 'train' proposal."""
+        existing = await self.session.execute(
+            select(TrainingAssignment).where(
+                TrainingAssignment.employee_id == employee.id,
+                TrainingAssignment.demand_id == demand.id,
+                TrainingAssignment.status.in_([
+                    TrainingStatusEnum.assigned,
+                    TrainingStatusEnum.in_progress,
+                ]),
+            )
+        )
+        training = existing.scalars().first()
+        if training is not None:
+            return training
+
+        current = {name.lower() for name in await get_skill_names(self.session, employee.id)}
+        targeted = [
+            skill
+            for skill in skills_from_demand(demand)
+            if skill.lower() not in current
+        ]
+        if not targeted:
+            targeted = skills_from_demand(demand)
+
+        training = TrainingAssignment(
+            employee_id=employee.id,
+            project_id=demand.project_id,
+            demand_id=demand.id,
+            title=f"{demand.role} upskilling path",
+            targeted_skills=targeted,
+            ai_upskilling_path=allocation.ai_upskilling_path,
+            status=TrainingStatusEnum.assigned,
+            assigned_by=reviewer_id,
+            assigned_at=datetime.utcnow(),
+            target_completion_date=date.today() + timedelta(days=60),
+            notes=f"Created from approved HITL training proposal {allocation.id}.",
+        )
+        self.session.add(training)
+        await self.session.flush()
+        logger.info(
+            "Created training assignment %s for approved train proposal %s",
+            training.id,
+            allocation.id,
+        )
+        return training
 
     async def reject_allocation(self, allocation_id: uuid.UUID, reviewer_id: uuid.UUID, feedback: str, time_to_decision_seconds: int = None) -> Allocation:
         """Rejects an allocation with manager feedback.
@@ -249,10 +377,14 @@ class HITLService:
             return None
 
         demand = await self.session.get(ProjectDemand, demand_id)
-        if not demand or demand.status != DemandStatusEnum.open:
+        if not demand or demand.status not in (
+            DemandStatusEnum.open,
+            DemandStatusEnum.partially_filled,
+        ):
             return None
         if demand.headcount_needed is not None and demand.headcount_needed <= 0:
             return None
+        demand_hours = Decimal(str(demand.hours_per_day or 8))
 
         # Reuse the deterministic scoring helpers from the agent nodes so the
         # replacement is evaluated exactly like an AI-proposed allocation.
@@ -306,35 +438,29 @@ class HITLService:
             if emp_id:
                 excluded.add(str(emp_id))
 
-        # Also exclude anyone already in-flight or staffed elsewhere so the
-        # replacement does not double-book a candidate across projects.
-        busy_res = await self.session.execute(
-            select(Allocation.employee_id).where(
-                Allocation.status.in_([
-                    AllocationStatusEnum.proposed_by_ai,
-                    AllocationStatusEnum.pending_manager_approval,
-                    AllocationStatusEnum.approved_by_manager,
-                    AllocationStatusEnum.active,
-                ])
-            )
-        )
-        for emp_id in busy_res.scalars().all():
-            if emp_id:
-                excluded.add(str(emp_id))
-
-        # Available bench talent, with each candidate's skill profile resolved
-        # once so we can apply the feedback hard-filter and score in one pass.
+        # Available talent with enough remaining daily hours. Employees may
+        # already be partially allocated elsewhere (4h + 4h) but can never be
+        # overbooked; the capacity property subtracts committed + reserved.
         emp_res = await self.session.execute(
             select(Employee)
-            .options(selectinload(Employee.employee_costs))
+            .options(
+                selectinload(Employee.employee_costs),
+                selectinload(Employee.allocations),
+            )
             .where(
                 Employee.is_active == True,
-                Employee.bench_status.in_([BenchStatusEnum.bench, BenchStatusEnum.upcoming_bench]),
+                Employee.bench_status.in_([
+                    BenchStatusEnum.bench,
+                    BenchStatusEnum.upcoming_bench,
+                    BenchStatusEnum.on_project,
+                ]),
             )
         )
         candidate_profiles = []
         for emp in emp_res.scalars().all():
             if str(emp.id) in excluded:
+                continue
+            if emp.remaining_daily_hours < demand_hours:
                 continue
             profile = _employee_skill_profile({
                 "skills": getattr(emp, "skills", None),
@@ -436,7 +562,8 @@ class HITLService:
             employee_id=emp.id,
             demand_id=demand_id,
             role_on_project=role_title,
-            allocation_pct=Decimal("100.00"),
+            allocated_hours_per_day=demand_hours,
+            allocation_pct=Decimal("0"),
             status=AllocationStatusEnum.pending_manager_approval,
             ai_justification=justification,
             ai_match_score=Decimal(str(round(min(1.0, max(0.0, best_score)), 4))),
@@ -446,6 +573,7 @@ class HITLService:
             created_by=rejected.created_by,
             start_date=date.today(),
         )
+        recalculate_allocation(replacement, emp)
         self.session.add(replacement)
         await self.session.flush()
         return replacement
@@ -508,6 +636,7 @@ class HITLService:
         if not rec:
             raise ValueError(f"Hiring recommendation {recommendation_id} not found")
         rec.status = HiringRecommendationStatusEnum.dismissed
+        await self._maybe_complete_run(rec.forecast_run_id)
         await self.session.commit()
         return rec
 
