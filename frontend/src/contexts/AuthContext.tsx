@@ -1,9 +1,11 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 
+export type UserRole = 'admin' | 'manager' | 'employee'
+
 export interface User {
   id: string
   username: string
-  role: 'manager' | 'employee'
+  role: UserRole
   full_name: string
   employee_id: string | null
 }

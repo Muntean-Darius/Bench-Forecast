@@ -1,8 +1,8 @@
 import uuid
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -10,7 +10,7 @@ from sqlalchemy import select
 from src.api.deps import get_current_user
 from src.database.database import get_db
 from src.database.models import ForecastRun
-from src.services.forecast_runner import run_forecast_pipeline
+from src.services.forecast_runner import create_forecast_run, execute_forecast_run
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,8 @@ router = APIRouter(
 
 class RunForecastRequest(BaseModel):
     horizon_days: int = Field(default=90, ge=30, le=365, description="Look-ahead window in days")
+    project_id: Optional[uuid.UUID] = Field(default=None, description="Optional target project ID to run forecast specifically for")
+    min_win_probability: float = Field(default=0.75, ge=0.0, le=1.0, description="Exclude pipeline demands below this win probability")
 
 class RunForecastResponse(BaseModel):
     forecast_run_id: str
@@ -37,41 +39,46 @@ class ForecastRunStatusResponse(BaseModel):
 @router.post("/run", response_model=RunForecastResponse, status_code=status.HTTP_202_ACCEPTED)
 async def trigger_forecast_run(
     payload: RunForecastRequest,
+    background_tasks: BackgroundTasks,
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """
-    Triggers the forecast pipeline asynchronously.
-    Returns the forecast_run_id and initial paused state metadata.
+    """Queue a forecast run and return immediately.
+
+    The planner runs in a background task; the client polls
+    ``GET /forecast/runs/{id}`` until the status is no longer ``queued`` /
+    ``running``. All state is persisted in PostgreSQL, so the run survives a
+    restart.
     """
     user_uuid = uuid.UUID(current_user["id"])
-    logger.info(f"User {user_uuid} triggering forecast run with horizon {payload.horizon_days} days.")
-    
+    logger.info(
+        f"User {user_uuid} queuing forecast run (horizon={payload.horizon_days}d, "
+        f"project={payload.project_id}, min_win={payload.min_win_probability})"
+    )
+
     try:
-        # run_forecast_pipeline blocks until human_review_node interrupt fires,
-        # at which point it returns the paused state.
-        result_state = await run_forecast_pipeline(
-            horizon_days=payload.horizon_days,
-            user_id=user_uuid
+        run_id = await create_forecast_run(payload.horizon_days, user_uuid)
+        background_tasks.add_task(
+            execute_forecast_run,
+            run_id,
+            payload.horizon_days,
+            user_uuid,
+            payload.project_id,
+            payload.min_win_probability,
         )
-        
-        forecast_run_id = result_state.get("forecast_run_id")
-        if not forecast_run_id:
-            raise ValueError("Pipeline did not return a forecast_run_id in state.")
-            
         return RunForecastResponse(
-            forecast_run_id=forecast_run_id,
-            status="paused_for_review",
+            forecast_run_id=str(run_id),
+            status="queued",
             state_metadata={
-                "revision_count": result_state.get("revision_count", 0),
-                "decisions": result_state.get("decisions", []),
-                "min_win_probability": result_state.get("min_win_probability", 0.75)
-            }
+                "revision_count": 0,
+                "decisions": [],
+                "min_win_probability": payload.min_win_probability,
+            },
         )
     except Exception as e:
-        logger.error(f"Failed to trigger forecast run: {e}", exc_info=True)
+        logger.error(f"Failed to queue forecast run: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Forecast pipeline execution failed: {str(e)}"
+            detail=f"Could not queue forecast run: {str(e)}",
         )
 
 @router.get("/runs/{run_id}", response_model=ForecastRunStatusResponse, status_code=status.HTTP_200_OK)

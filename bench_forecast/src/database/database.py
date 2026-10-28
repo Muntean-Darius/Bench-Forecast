@@ -147,6 +147,17 @@ def get_sync_db() -> Generator[Session, None, None]:
 # Startup / health helpers
 # ---------------------------------------------------------------------------
 
+# Idempotent column additions for databases created before these fields
+# existed. ``create_all`` only creates missing tables, never new columns, so we
+# apply these explicitly (PostgreSQL supports ADD COLUMN IF NOT EXISTS).
+_LIGHT_MIGRATIONS = [
+    "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS decision_metrics JSONB",
+    "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS latency_seconds NUMERIC(10, 2)",
+    "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(50)",
+    "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS llm_model VARCHAR(120)",
+]
+
+
 async def init_db() -> None:
     """Create all tables that do not yet exist (async, idempotent).
 
@@ -161,6 +172,8 @@ async def init_db() -> None:
 
     async with _async_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for stmt in _LIGHT_MIGRATIONS:
+            await conn.execute(text(stmt))
     logger.info("PostgreSQL schema initialised via async engine")
 
 
@@ -186,6 +199,9 @@ def init_db_sync() -> None:
     from src.database.models import Base  # local import to avoid circular deps
 
     Base.metadata.create_all(bind=_sync_engine)
+    with _sync_engine.begin() as conn:
+        for stmt in _LIGHT_MIGRATIONS:
+            conn.execute(text(stmt))
     logger.info("PostgreSQL schema initialised via sync engine")
 
 

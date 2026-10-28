@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_COLLECTION = "employee_cvs"
+DEFAULT_COLLECTION = "employee_profiles"
 DEFAULT_CHUNK_SIZE = 512    # Characters per text chunk
 DEFAULT_CHUNK_OVERLAP = 64  # Overlapping characters between consecutive chunks
 
@@ -114,29 +114,21 @@ class RAGPipeline:
                               Defaults to <project_root>/data/chroma_store.
             collection_name:  ChromaDB collection name.
         """
-        if persist_dir is None:
-            base_dir = Path(__file__).resolve().parents[2]
-            self.persist_dir = str(base_dir / "chroma_data")
-        else:
-            self.persist_dir = persist_dir
-
-        os.makedirs(self.persist_dir, exist_ok=True)
-
-        self.client = chromadb.PersistentClient(path=self.persist_dir)
-        
-        from chromadb.utils import embedding_functions
+        # Always use the single shared client/collection (see chroma_client.py).
         from src.core.config import Config
-        self.embedding_fn = embedding_functions.OllamaEmbeddingFunction(
-            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
-            model_name=Config.EMBEDDING_MODEL,
+        from src.database.chroma_client import (
+            EMPLOYEE_COLLECTION,
+            get_chroma_client,
+            get_embedding_function,
+            get_employee_collection,
         )
 
-        self.collection = self.client.get_or_create_collection(
-            name="employee_profiles",
-            metadata={"hnsw:space": "cosine"},
-        )
+        self.persist_dir = Config.CHROMA_PERSIST_DIR
+        self.client = get_chroma_client()
+        self.embedding_fn = get_embedding_function()
+        self.collection = get_employee_collection()
         logger.info(
-            f"RAGPipeline initialised: collection='{collection_name}' "
+            f"RAGPipeline initialised: collection='{EMPLOYEE_COLLECTION}' "
             f"docs={self.collection.count()} persist_dir={self.persist_dir}"
         )
 
@@ -456,6 +448,69 @@ class RAGPipeline:
             f"(cost_rate < {target_bill_rate}) for role: {role_description[:60]}..."
         )
         return candidates
+
+    # ------------------------------------------------------------------
+    # On-the-fly semantic similarity (fallback for un-indexed employees)
+    # ------------------------------------------------------------------
+
+    def semantic_similarity(
+        self,
+        query: str,
+        texts: List[str],
+        cache: Optional[Dict[str, List[float]]] = None,
+    ) -> List[float]:
+        """Cosine similarity between *query* and each text via the embedding model.
+
+        Used when bench employees are not present in the vector collection
+        (e.g. stale index / never-ingested CVs): their profile text is embedded
+        on demand so match scores remain meaningful and varied instead of
+        collapsing to a single hard-coded fallback value.
+
+        Args:
+            query: Role description / title text.
+            texts: Candidate profile texts to compare against.
+            cache: Optional dict reused across calls to avoid re-embedding the
+                   same profile text for every demand.
+
+        Returns:
+            List of cosine similarities in ``[0.0, 1.0]``, one per text.
+        """
+        if not texts:
+            return []
+
+        cache = cache if cache is not None else {}
+        import math  # noqa: PLC0415
+
+        def _cosine(a: List[float], b: List[float]) -> float:
+            na = math.sqrt(sum(x * x for x in a))
+            nb = math.sqrt(sum(x * x for x in b))
+            if na == 0 or nb == 0:
+                return 0.0
+            return max(0.0, min(1.0, sum(x * y for x, y in zip(a, b)) / (na * nb)))
+
+        try:
+            query_vec = list(self.embedding_fn([query])[0])
+        except Exception as exc:
+            logger.warning(f"semantic_similarity: query embedding failed ({exc})")
+            return [0.0] * len(texts)
+
+        to_embed = [t for t in texts if t and t not in cache]
+        if to_embed:
+            try:
+                vectors = self.embedding_fn(to_embed)
+                for text, vec in zip(to_embed, vectors):
+                    cache[text] = list(vec)
+            except Exception as exc:
+                logger.warning(f"semantic_similarity: document embedding failed ({exc})")
+
+        scores: List[float] = []
+        for text in texts:
+            doc_vec = cache.get(text)
+            if doc_vec is not None and len(doc_vec) > 0:
+                scores.append(_cosine(query_vec, doc_vec))
+            else:
+                scores.append(0.0)
+        return scores
 
     # ------------------------------------------------------------------
     # Utility

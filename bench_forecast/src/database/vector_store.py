@@ -4,10 +4,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import chromadb
 from chromadb.config import Settings
-from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
 
-# Instrument ChromaDB for Phoenix Tracing
-ChromaInstrumentor().instrument()
+# ChromaDB instrumentation is owned by the ai-observability SDK (its retriever
+# interceptor) when the platform is active. Only fall back to the standalone
+# OpenTelemetry instrumentor for the legacy Phoenix setup — installing both
+# would double-wrap Collection.query and emit duplicate spans.
+from src.core.observability import is_observability_active
+
+if not is_observability_active():
+    try:
+        from opentelemetry.instrumentation.chromadb import ChromaInstrumentor
+
+        ChromaInstrumentor().instrument()
+    except Exception:  # optional dependency / already instrumented
+        pass
 
 
 class VectorStoreManager:
@@ -16,29 +26,22 @@ class VectorStoreManager:
     def __init__(
         self,
         persist_dir: Optional[str] = None,
-        collection_name: str = "employee_profiles",
+        collection_name: Optional[str] = None,
     ) -> None:
-        if persist_dir is None:
-            # Default to chroma_data relative to bench_forecast root (matches seed script)
-            base_dir = Path(__file__).resolve().parents[2]
-            self.persist_dir = str(base_dir / "chroma_data")
-        else:
-            self.persist_dir = persist_dir
-
-        os.makedirs(self.persist_dir, exist_ok=True)
-        self.client = chromadb.PersistentClient(path=self.persist_dir)
-        
-        from chromadb.utils import embedding_functions
+        # Always use the single shared client/collection (see chroma_client.py).
+        # persist_dir / collection_name are accepted for backwards compatibility
+        # but no longer change the underlying store.
         from src.core.config import Config
-        self.embedding_fn = embedding_functions.OllamaEmbeddingFunction(
-            url=f"{Config.OLLAMA_BASE_URL}/api/embeddings",
-            model_name=Config.EMBEDDING_MODEL,
+        from src.database.chroma_client import (
+            get_chroma_client,
+            get_embedding_function,
+            get_employee_collection,
         )
 
-        self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+        self.persist_dir = Config.CHROMA_PERSIST_DIR
+        self.client = get_chroma_client()
+        self.embedding_fn = get_embedding_function()
+        self.collection = get_employee_collection()
 
     def index_employees(self, employees: List[Dict[str, Any]]) -> int:
         """Indexes employee unstructured bios and skills into ChromaDB."""

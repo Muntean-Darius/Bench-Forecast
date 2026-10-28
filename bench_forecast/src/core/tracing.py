@@ -37,15 +37,28 @@ class PhoenixTracer:
         If connection fails, tracing is silently disabled.
         """
         try:
+            # The ai-observability SDK owns the SDK TracerProvider and installs
+            # the OpenInference LangChain instrumentor itself. Instrumenting a
+            # second time here would create duplicate spans and hand LangChain
+            # to the wrong provider.
+            from src.core.observability import is_observability_active
+
+            if is_observability_active():
+                logger.info(
+                    "AI observability SDK is active — skipping the legacy Phoenix "
+                    "LangChain instrumentor (avoids duplicate spans)"
+                )
+                return
+
             from phoenix.trace.langchain import LangChainInstrumentor
-            
+
             logger.info(f"Initializing Phoenix tracer: {self.endpoint}")
-            
+
             # Configure LangChain instrumentation for automatic tracing
             LangChainInstrumentor().instrument()
-            
+
             logger.info("✓ Phoenix tracing enabled")
-            
+
         except Exception as e:
             logger.warning(f"Phoenix initialization failed (tracing disabled): {e}")
             self.enabled = False

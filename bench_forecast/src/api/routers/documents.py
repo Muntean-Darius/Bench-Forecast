@@ -33,58 +33,59 @@ Dependencies
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import uuid
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from langchain_core.messages import HumanMessage
+from src.core.llm import LLMFactory
+
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import (
+    assert_can_manage_employee,
+    get_current_user,
+    get_optional_user,
+)
 from src.core.config import Config
 from src.database.database import get_db
-from src.database.models import Document, Employee, IngestionStatusEnum
-from src.ingestion.chroma_store import ChromaIngestionStore
+from src.database.models import (
+    CvApprovalStatusEnum,
+    CvReviewRequest,
+    Document,
+    Employee,
+    IngestionStatusEnum,
+)
 from src.ingestion.document_crud import (
     create_document_record,
     get_document_by_id,
     get_next_version,
     mark_failed,
-    mark_ingested,
     set_text_content,
 )
-from src.ingestion.embedder import OllamaEmbedder
 from src.ingestion.pdf_extractor import chunk_text, extract_text_from_bytes
+from src.services.cv_review_service import CvReviewService
+from src.services.notifications import NotificationService, schedule_notification
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
-
-# ---------------------------------------------------------------------------
-# Module-level singletons (created once, reused across requests)
-# ---------------------------------------------------------------------------
-
-_embedder: Optional[OllamaEmbedder] = None
-_chroma_store: Optional[ChromaIngestionStore] = None
-
-
-def _get_embedder() -> OllamaEmbedder:
-    global _embedder
-    if _embedder is None:
-        _embedder = OllamaEmbedder()
-    return _embedder
-
-
-def _get_chroma_store() -> ChromaIngestionStore:
-    global _chroma_store
-    if _chroma_store is None:
-        _chroma_store = ChromaIngestionStore()
-    return _chroma_store
-
 
 # ---------------------------------------------------------------------------
 # Storage helpers (MinIO preferred, local FS fallback)
@@ -158,8 +159,12 @@ class DocumentUploadResponse(BaseModel):
     version: int
     chroma_doc_id: str
     ingestion_status: str
+    approval_status: str
+    review_id: Optional[str] = None
     chunks_ingested: int
     message: str
+    summary: Optional[str] = None
+    extracted_skills: Optional[list] = None
 
 
 class DocumentMetadataResponse(BaseModel):
@@ -173,6 +178,9 @@ class DocumentMetadataResponse(BaseModel):
     is_current: bool
     chroma_doc_id: Optional[str]
     ingestion_status: str
+    approval_status: str
+    review_id: Optional[str] = None
+    review_comment: Optional[str] = None
     uploaded_at: str
 
 
@@ -200,9 +208,16 @@ async def upload_cv(
     file: Annotated[UploadFile, File(description="CV PDF file")],
     employee_id: Annotated[str, Form(description="UUID of the employee this CV belongs to")],
     document_type: Annotated[str, Form(description="Document type: cv | certification | contract | performance_review | training_record")] = "cv",
+    background_tasks: BackgroundTasks = None,
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
 ) -> DocumentUploadResponse:
-    """Full CV ingestion pipeline — upload, extract, embed, store."""
+    """Upload a CV.
+
+    * employee upload → staged as ``pending_approval`` (no profile/Chroma write)
+    * manager uploading their own CV → auto-approved and ingested
+    * admin upload for another employee → auto-approved and ingested
+    """
 
     # ------------------------------------------------------------------
     # 0. Validate inputs
@@ -232,6 +247,27 @@ async def upload_cv(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Employee with id='{employee_id}' not found.",
         )
+
+    uploader_role = str(user.get("role") or "").lower()
+    uploader_employee_id = user.get("employee_id")
+    is_self_upload = (
+        uploader_employee_id is not None
+        and str(uploader_employee_id) == str(emp_uuid)
+    )
+    if uploader_role == "admin" and is_self_upload:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin accounts do not upload personal CVs.",
+        )
+    if uploader_role in ("employee", "manager") and not is_self_upload:
+        await assert_can_manage_employee(db, user, emp_uuid)
+    if uploader_role not in ("admin", "manager", "employee"):
+        raise HTTPException(status_code=403, detail="Unsupported role")
+
+    auto_approve = (
+        (uploader_role == "admin" and not is_self_upload)
+        or (uploader_role == "manager" and is_self_upload)
+    )
 
     employee_name = f"{employee.first_name} {employee.last_name}"
     experience_level = str(employee.experience_level.value if hasattr(employee.experience_level, 'value') else employee.experience_level)
@@ -284,14 +320,18 @@ async def upload_cv(
         file_size_bytes=file_size,
         mime_type="application/pdf",
         version=version,
+        is_current=False,
     )
     doc_id: uuid.UUID = doc.id
 
-    # Commit the pending row immediately so it's visible even if ingestion fails
+    # Commit the pending row immediately so it's visible even if extraction fails
     await db.commit()
 
     chroma_doc_id: str = ""
     chunks_ingested: int = 0
+    review_id: Optional[str] = None
+    approval_status = CvApprovalStatusEnum.pending_approval.value
+    pending_notifications = []
 
     try:
         # ------------------------------------------------------------------
@@ -306,17 +346,7 @@ async def upload_cv(
                 "The file may be image-only or password-protected."
             )
 
-        # Update employee's profile_text and cv_document_uri in database
-        from datetime import datetime
-        await db.execute(
-            update(Employee)
-            .where(Employee.id == emp_uuid)
-            .values(
-                profile_text=full_text,
-                cv_document_uri=file_path,
-                updated_at=datetime.utcnow()
-            )
-        )
+        # Save raw extracted text to documents table for audit
         await set_text_content(db, doc_id, full_text)
         await db.commit()
 
@@ -330,7 +360,7 @@ async def upload_cv(
                 logger.warning(f"Failed to write fallback CV to {s_dir}: {e_save}")
 
         # ------------------------------------------------------------------
-        # 6. Chunk the text
+        # 6. Chunk the text (only needed for the auto-approve/ingest path)
         # ------------------------------------------------------------------
         chunks = chunk_text(full_text)
         if not chunks:
@@ -343,53 +373,146 @@ async def upload_cv(
         )
 
         # ------------------------------------------------------------------
-        # 7. Embed chunks with Ollama nomic-embed-text
+        # 6b. LLM CV Summarization (Excluding Personal Data)
         # ------------------------------------------------------------------
+        logger.info("Generating anonymized professional CV summary via LLM: document_id=%s", doc_id)
+        cv_summary: Optional[str] = None
+        skills_list: list = []
+        try:
+            llm = LLMFactory.get_chat_model()
+            summary_prompt = (
+                "You are an expert HR and workforce allocation analyst.\n"
+                "Analyze the following candidate CV and create a comprehensive professional summary in JSON format.\n\n"
+                "CRITICAL PRIVACY RULE:\n"
+                "Strictly EXCLUDE ALL personal data (candidate name, email address, phone number, physical address, age, gender, personal social links).\n\n"
+                "IMPORTANT INFORMATION TO INCLUDE:\n"
+                "- professional_summary: Detailed professional summary containing core strengths, domains, and career highlights.\n"
+                "- seniority_level: Junior, Mid, Senior, Lead, or Principal.\n"
+                "- years_of_experience: Number of years (float or int).\n"
+                "- core_skills: Array of primary technical skills, frameworks, languages, and tools.\n"
+                "- key_achievements: Array of notable projects or deliverables.\n"
+                "- domain_expertise: Array of business domains (e.g. FinTech, Healthcare, Cloud, etc.).\n\n"
+                "JSON schema:\n"
+                "{\n"
+                '  "professional_summary": "string",\n'
+                '  "seniority_level": "string",\n'
+                '  "years_of_experience": float,\n'
+                '  "core_skills": ["string"],\n'
+                '  "key_achievements": ["string"],\n'
+                '  "domain_expertise": ["string"]\n'
+                "}\n\n"
+                f"Candidate CV text:\n{full_text[:6000]}"
+            )
+            llm_res = await asyncio.to_thread(llm.invoke, [HumanMessage(content=summary_prompt)])
+            parsed_summary = LLMFactory.parse_json_response(llm_res.content)
+
+            prof_sum = parsed_summary.get("professional_summary") or ""
+            skills_list = parsed_summary.get("core_skills", [])
+            domains_list = parsed_summary.get("domain_expertise", [])
+            achieve_list = parsed_summary.get("key_achievements", [])
+
+            summary_parts = []
+            if prof_sum:
+                summary_parts.append(prof_sum)
+            if skills_list:
+                summary_parts.append(f"Core Skills: {', '.join(skills_list)}")
+            if domains_list:
+                summary_parts.append(f"Domains: {', '.join(domains_list)}")
+            if achieve_list:
+                summary_parts.append(f"Key Achievements: {'; '.join(achieve_list)}")
+
+            if summary_parts:
+                cv_summary = "\n\n".join(summary_parts)
+                logger.info("✓ LLM CV summary successfully generated: document_id=%s (%d chars)", doc_id, len(cv_summary))
+        except Exception as e_sum:
+            logger.warning(f"LLM CV summarization failed (falling back to extracted text): {e_sum}")
+
+        # ------------------------------------------------------------------
+        # 6c. Extract skills from the CV. These are STAGED, never written to
+        #     the employee until a manager approves the review.
+        # ------------------------------------------------------------------
+        from src.agents.nodes import _extract_skills_from_text
+
+        cv_skills: list = []
+        for raw_skill in skills_list:
+            if raw_skill and str(raw_skill).strip():
+                cv_skills.append(str(raw_skill).strip())
+        cv_skills.extend(_extract_skills_from_text(full_text))
+
+        seen_skills: set = set()
+        deduped_skills: list = []
+        for skill in cv_skills:
+            key = skill.lower()
+            if key and key not in seen_skills:
+                seen_skills.add(key)
+                deduped_skills.append(skill)
+
+        extracted_skills = deduped_skills[:25]
         logger.info(
-            "Generating embeddings: document_id=%s model=nomic-embed-text chunks=%d",
-            doc_id,
-            len(chunks),
-        )
-        embedder = _get_embedder()
-        embeddings = embedder.embed_chunks(chunks)
-
-        # ------------------------------------------------------------------
-        # 8. Upsert chunks into ChromaDB
-        # ------------------------------------------------------------------
-        logger.info("Upserting to ChromaDB: document_id=%s", doc_id)
-        chroma_store = _get_chroma_store()
-        # Clean up any existing chunks for this employee to update embeddings cleanly
-        chroma_store.delete_employee_chunks(str(emp_uuid))
-        chroma_doc_id = chroma_store.upsert_document_chunks(
-            document_id=str(doc_id),
-            employee_id=str(emp_uuid),
-            employee_name=employee_name,
-            document_type=document_type,
-            experience_level=experience_level,
-            internal_hourly_cost=internal_hourly_cost,
-            chunks=chunks,
-            embeddings=embeddings,
-        )
-        chunks_ingested = len(chunks)
-
-        # ------------------------------------------------------------------
-        # 9. Update documents row: chroma_doc_id + ingestion_status=ingested
-        # ------------------------------------------------------------------
-        await mark_ingested(db, doc_id, chroma_doc_id)
-        await db.commit()
-
-        logger.info(
-            "✓ CV ingestion complete: document_id=%s employee=%s "
-            "chroma_doc_id=%s chunks=%d",
-            doc_id,
+            "Extracted %d skill(s) from CV for employee=%s: %s",
+            len(extracted_skills),
             employee_name,
-            chroma_doc_id,
-            chunks_ingested,
+            extracted_skills[:10],
         )
+
+        await db.refresh(doc)
+        review_service = CvReviewService(db)
+        review = await review_service.stage_cv(
+            employee=employee,
+            document=doc,
+            extracted_skills=extracted_skills,
+            summary=cv_summary if cv_summary else full_text[:6000],
+        )
+        review_id = str(review.id)
+
+        if auto_approve:
+            approved = await review_service.approve(
+                review,
+                reviewer_id=uuid.UUID(user["id"]),
+                comment="Auto-approved upload (manager self / admin).",
+            )
+            doc = await get_document_by_id(db, doc_id)
+            chroma_doc_id = doc.chroma_doc_id or ""
+            chunks_ingested = 0
+            approval_status = CvApprovalStatusEnum.approved.value
+            logger.info(
+                "✓ CV auto-approved: document_id=%s employee=%s",
+                doc_id,
+                employee_name,
+            )
+            try:
+                pending_notifications.append(
+                    await NotificationService(db).notify_cv_decision(
+                        employee,
+                        approved,
+                        approved=True,
+                        comment="Auto-approved upload.",
+                    )
+                )
+                await db.commit()
+            except Exception:
+                logger.exception("Could not queue cv_approved notification")
+                await db.rollback()
+        else:
+            try:
+                pending_notifications.append(
+                    await NotificationService(db).notify_cv_approval_needed(
+                        employee, doc, review
+                    )
+                )
+            except Exception:
+                logger.exception("Could not queue cv_approval_needed notification")
+            await db.commit()
+            approval_status = CvApprovalStatusEnum.pending_approval.value
+            logger.info(
+                "CV staged for manager approval: document_id=%s review_id=%s",
+                doc_id,
+                review_id,
+            )
 
     except Exception as exc:
         logger.error(
-            "✗ CV ingestion failed: document_id=%s reason=%s",
+            "✗ CV upload failed: document_id=%s reason=%s",
             doc_id,
             exc,
             exc_info=True,
@@ -404,11 +527,14 @@ async def upload_cv(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
-                f"CV ingestion failed at the embedding/ChromaDB stage: {exc}. "
-                f"The document row (id={doc_id}) has been marked ingestion_status='failed'. "
-                "Check Ollama is running and nomic-embed-text is pulled."
+                f"CV upload failed: {exc}. The document row (id={doc_id}) "
+                "has been marked ingestion_status='failed'."
             ),
         )
+
+    for notification in pending_notifications:
+        if notification.status == "queued":
+            schedule_notification(notification.id, background_tasks)
 
     return DocumentUploadResponse(
         document_id=str(doc_id),
@@ -418,12 +544,21 @@ async def upload_cv(
         file_size_bytes=file_size,
         version=version,
         chroma_doc_id=chroma_doc_id,
-        ingestion_status=IngestionStatusEnum.ingested.value,
+        ingestion_status=(
+            IngestionStatusEnum.ingested.value
+            if approval_status == CvApprovalStatusEnum.approved.value
+            else IngestionStatusEnum.pending.value
+        ),
+        approval_status=approval_status,
+        review_id=review_id,
         chunks_ingested=chunks_ingested,
         message=(
-            f"CV successfully ingested. {chunks_ingested} chunk(s) embedded "
-            f"into ChromaDB collection 'employee_profiles'."
+            "CV approved and embedded into ChromaDB."
+            if approval_status == CvApprovalStatusEnum.approved.value
+            else "CV submitted for manager approval. Your live profile has not changed yet."
         ),
+        summary=cv_summary,
+        extracted_skills=extracted_skills,
     )
 
 
@@ -456,6 +591,12 @@ async def get_document(
             detail=f"Document '{document_id}' not found.",
         )
 
+    review = (
+        await db.execute(
+            select(CvReviewRequest).where(CvReviewRequest.document_id == doc.id)
+        )
+    ).scalars().first()
+
     return DocumentMetadataResponse(
         document_id=str(doc.id),
         employee_id=str(doc.employee_id),
@@ -467,6 +608,9 @@ async def get_document(
         is_current=doc.is_current,
         chroma_doc_id=doc.chroma_doc_id,
         ingestion_status=str(doc.ingestion_status.value if hasattr(doc.ingestion_status, 'value') else doc.ingestion_status),
+        approval_status=str(doc.approval_status.value if hasattr(doc.approval_status, 'value') else doc.approval_status),
+        review_id=str(review.id) if review else None,
+        review_comment=doc.review_comment,
         uploaded_at=doc.uploaded_at.isoformat(),
     )
 
@@ -483,6 +627,7 @@ async def get_document(
 async def list_employee_documents(
     employee_id: str,
     db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
 ) -> list[DocumentMetadataResponse]:
     """Return all document rows for a given employee, newest first."""
     try:
@@ -493,12 +638,23 @@ async def list_employee_documents(
             detail=f"'{employee_id}' is not a valid UUID.",
         )
 
+    await assert_can_manage_employee(db, user, emp_uuid)
+
     result = await db.execute(
         select(Document)
         .where(Document.employee_id == emp_uuid)
         .order_by(Document.uploaded_at.desc())
     )
     docs = result.scalars().all()
+
+    reviews = (
+        await db.execute(
+            select(CvReviewRequest).where(
+                CvReviewRequest.document_id.in_([doc.id for doc in docs])
+            )
+        )
+    ).scalars().all() if docs else []
+    review_by_doc = {review.document_id: review for review in reviews}
 
     return [
         DocumentMetadataResponse(
@@ -512,10 +668,28 @@ async def list_employee_documents(
             is_current=d.is_current,
             chroma_doc_id=d.chroma_doc_id,
             ingestion_status=str(d.ingestion_status.value if hasattr(d.ingestion_status, 'value') else d.ingestion_status),
+            approval_status=str(d.approval_status.value if hasattr(d.approval_status, 'value') else d.approval_status),
+            review_id=(
+                str(review_by_doc[d.id].id) if d.id in review_by_doc else None
+            ),
+            review_comment=d.review_comment,
             uploaded_at=d.uploaded_at.isoformat(),
         )
         for d in docs
     ]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/documents/employee/{employee_id}/download
+# ---------------------------------------------------------------------------
+
+# CVs are mutable (a new upload overwrites the previous file), so responses
+# must never be cached by the browser / PDF viewer plugin.
+_CV_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
 
 
 @router.get(
@@ -525,8 +699,9 @@ async def list_employee_documents(
 async def download_employee_cv(
     employee_id: str,
     db: AsyncSession = Depends(get_db),
+    user: Optional[dict] = Depends(get_optional_user),
 ):
-    """Returns the CV PDF file for an employee, or generates one if only profile text is available."""
+    """Returns the current approved CV PDF for an employee."""
     from fastapi.responses import FileResponse, Response
     try:
         emp_uuid = uuid.UUID(employee_id)
@@ -536,16 +711,24 @@ async def download_employee_cv(
             detail=f"'{employee_id}' is not a valid UUID.",
         )
 
+    if user is not None:
+        await assert_can_manage_employee(db, user, emp_uuid)
+
     emp_res = await db.execute(select(Employee).where(Employee.id == emp_uuid))
     employee = emp_res.scalar_one_or_none()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    # 1. Check for documents row
+    # Prefer the current approved CV; fall back to the latest upload so the
+    # uploader can still inspect a pending document when necessary.
     doc_res = await db.execute(
         select(Document)
         .where(Document.employee_id == emp_uuid)
-        .order_by(Document.uploaded_at.desc())
+        .order_by(
+            Document.is_current.desc(),
+            Document.approval_status.desc(),
+            Document.uploaded_at.desc(),
+        )
     )
     doc = doc_res.scalars().first()
 
@@ -569,6 +752,7 @@ async def download_employee_cv(
                 media_type="application/pdf",
                 filename=filename,
                 content_disposition_type="inline",
+                headers=_CV_NO_CACHE_HEADERS,
             )
 
     # If no file exists but profile_text exists, generate PDF dynamically
@@ -591,13 +775,17 @@ async def download_employee_cv(
                 media_type="application/pdf",
                 filename=f"{employee.first_name}_{employee.last_name}_CV.pdf",
                 content_disposition_type="inline",
+                headers=_CV_NO_CACHE_HEADERS,
             )
         except Exception as e:
             logger.warning(f"Could not generate PDF on the fly: {e}")
             return Response(
                 content=employee.profile_text,
                 media_type="text/plain",
-                headers={"Content-Disposition": f"inline; filename={employee.first_name}_{employee.last_name}_CV.txt"}
+                headers={
+                    "Content-Disposition": f"inline; filename={employee.first_name}_{employee.last_name}_CV.txt",
+                    **_CV_NO_CACHE_HEADERS,
+                },
             )
 
     raise HTTPException(status_code=404, detail="No CV document found for this employee")

@@ -14,9 +14,25 @@ from typing import Literal
 
 from dotenv import load_dotenv
 
-# Load .env from the bench_forecast directory (one level above src/)
-_env_path = Path(__file__).resolve().parents[2] / ".env"
+# Single project-wide .env at the repository root:
+#   <repo>/.env
+# `config.py` lives at <repo>/bench_forecast/src/core/config.py, so parents[3]
+# is the repository root and parents[2] is the backend root.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_BACKEND_ROOT = Path(__file__).resolve().parents[2]
+_env_path = _PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=_env_path)
+
+
+def _abs_under_backend(value: str) -> str:
+    """Resolve a path against the backend root if it is relative.
+
+    Keeps filesystem paths CWD-independent so the app, seeder and scripts
+    always agree on where data lives (e.g. the ChromaDB directory). Relative
+    paths in the root .env are anchored to ``bench_forecast/``.
+    """
+    p = Path(value)
+    return str(p if p.is_absolute() else (_BACKEND_ROOT / p))
 
 
 class Config:
@@ -25,34 +41,41 @@ class Config:
     # -----------------------------------------------------------------------
     # LLM Configuration
     # -----------------------------------------------------------------------
-    LLM_PROVIDER: Literal["groq", "ollama"] = os.getenv("LLM_PROVIDER", "ollama")
+    LLM_PROVIDER: Literal["groq", "ollama", "openai_compatible"] = os.getenv("LLM_PROVIDER", "ollama")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama2")
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Shared generation settings. Lower temperature keeps JSON decisions stable.
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+    LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "4"))
+    LLM_TIMEOUT: float = float(os.getenv("LLM_TIMEOUT", "60"))
+    # Generic OpenAI-compatible endpoint (works with OpenCode Go / Groq / vLLM /
+    # LM Studio / any OpenAI-compatible gateway). Set LLM_PROVIDER=openai_compatible.
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "")
+    LLM_API_KEY: str = os.getenv("LLM_API_KEY", "")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "")
     # Embedding model served by Ollama — used by the Phase 2 ingestion pipeline.
     # Pull with: ollama pull nomic-embed-text
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 
     # -----------------------------------------------------------------------
-    # PostgreSQL Configuration (migrated from SQLite)
+    # PostgreSQL Configuration
     # -----------------------------------------------------------------------
-    USE_POSTGRES: bool = os.getenv("USE_POSTGRES", "false").lower() in ("true", "1", "yes")
-    POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "localhost")
-    POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5432")
+    POSTGRES_HOST: str = os.getenv("POSTGRES_HOST", "127.0.0.1")
+    # 5434 avoids colliding with a locally installed PostgreSQL on 5432.
+    POSTGRES_PORT: str = os.getenv("POSTGRES_PORT", "5434")
     POSTGRES_DB: str = os.getenv("POSTGRES_DB", "bench_forecast")
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "postgres")
 
     # -----------------------------------------------------------------------
-    # Legacy SQLite (kept for backward compat with existing mock data tooling)
-    # -----------------------------------------------------------------------
-    SQLITE_DB_PATH: str = os.getenv("SQLITE_DB_PATH", "./data/mock_db.sqlite")
-
-    # -----------------------------------------------------------------------
     # Vector Store Configuration
+    # Single embedded ChromaDB path shared by the seeder, the agent and CV
+    # ingestion (see src/database/chroma_client.py). Absolute by default so the
+    # app and scripts never diverge based on the current working directory.
     # -----------------------------------------------------------------------
-    CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
+    CHROMA_PERSIST_DIR: str = _abs_under_backend(os.getenv("CHROMA_PERSIST_DIR", "chroma_data"))
 
     # -----------------------------------------------------------------------
     # LangSmith Tracing Configuration
@@ -94,9 +117,23 @@ class Config:
                     "GROQ_API_KEY is required when LLM_PROVIDER=groq. "
                     "Set it in .env or switch to LLM_PROVIDER=ollama for local inference."
                 )
-        elif cls.LLM_PROVIDER not in ("groq", "ollama"):
+        elif cls.LLM_PROVIDER == "openai_compatible":
+            missing = [
+                name for name, val in (
+                    ("LLM_BASE_URL", cls.LLM_BASE_URL),
+                    ("LLM_API_KEY", cls.LLM_API_KEY),
+                    ("LLM_MODEL", cls.LLM_MODEL),
+                ) if not val
+            ]
+            if missing:
+                raise ValueError(
+                    "LLM_PROVIDER=openai_compatible requires "
+                    f"{', '.join(missing)} to be set in .env."
+                )
+        elif cls.LLM_PROVIDER not in ("groq", "ollama", "openai_compatible"):
             raise ValueError(
-                f"LLM_PROVIDER must be 'groq' or 'ollama', got '{cls.LLM_PROVIDER}'"
+                "LLM_PROVIDER must be 'groq', 'ollama' or 'openai_compatible', "
+                f"got '{cls.LLM_PROVIDER}'"
             )
 
         if cls.LANGCHAIN_TRACING_V2.lower() == "true" and not cls.LANGCHAIN_API_KEY:
@@ -111,6 +148,26 @@ class Config:
     # -----------------------------------------------------------------------
     CHROMA_HOST: str = os.getenv("CHROMA_HOST", "localhost")
     CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8200"))
+
+    # -----------------------------------------------------------------------
+    # Email notifications (console by default in development)
+    # -----------------------------------------------------------------------
+    EMAILS_ENABLED: bool = os.getenv("EMAILS_ENABLED", "true").lower() == "true"
+    EMAIL_PROVIDER: Literal["console", "smtp", "sendgrid"] = os.getenv(
+        "EMAIL_PROVIDER", "console"
+    ).lower()
+    EMAIL_FROM: str = os.getenv("EMAIL_FROM", "noreply@bench-forecast.local")
+    SMTP_HOST: str = os.getenv("SMTP_HOST", "")
+    SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+    SMTP_USER: str = os.getenv("SMTP_USER", "")
+    SMTP_PASSWORD: str = os.getenv("SMTP_PASSWORD", "")
+    SMTP_USE_TLS: bool = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+    SMTP_USE_SSL: bool = os.getenv("SMTP_USE_SSL", "false").lower() == "true"
+    SMTP_TIMEOUT: float = float(os.getenv("SMTP_TIMEOUT", "15"))
+    SENDGRID_API_KEY: str = os.getenv("SENDGRID_API_KEY", "")
+    CAPACITY_SCAN_INTERVAL_HOURS: int = int(
+        os.getenv("CAPACITY_SCAN_INTERVAL_HOURS", "0")
+    )
 
     # -----------------------------------------------------------------------
     # MinIO / S3 object storage

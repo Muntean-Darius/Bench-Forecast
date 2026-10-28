@@ -20,6 +20,8 @@ export interface Employee {
   experience_years?: number
   current_project?: string | null
   cost_rate?: number | null
+  bench_status?: string | null
+  job_title?: string | null
 }
 
 export interface Project {
@@ -73,6 +75,7 @@ export interface AllocationProposal {
   reasoning: string
   missing_skills: string[]
   training_recommendation?: string | null
+  ai_upskilling_path?: string | null
   rag_passages: string[]
   created_at: string
   revision_count?: number
@@ -102,6 +105,7 @@ export interface PendingAllocation {
   ai_justification?: string | null
   ai_match_score?: number | null
   ai_projected_margin?: number | null
+  ai_upskilling_path?: string | null
   project_demand?: {
     id: string
     role: string
@@ -112,6 +116,19 @@ export interface PendingAllocation {
 }
 
 // ─── Document types ───────────────────────────────────────────────────────────
+
+export interface HiringRecommendation {
+  id: string
+  project_id?: string | null
+  project_name?: string | null
+  demand_id?: string | null
+  role: string
+  required_skills: string[]
+  headcount: number
+  justification?: string | null
+  status: string
+  created_at?: string | null
+}
 
 export interface DocumentMetadata {
   document_id: string
@@ -124,6 +141,9 @@ export interface DocumentMetadata {
   is_current: boolean
   chroma_doc_id?: string | null
   ingestion_status: 'pending' | 'ingested' | 'failed'
+  approval_status?: CvApprovalState
+  review_id?: string | null
+  review_comment?: string | null
   uploaded_at: string
 }
 
@@ -166,8 +186,262 @@ export function marginBadgeClass(margin: number): string {
 
 export function categoryBadge(cat: ProposalCategory) {
   switch (cat) {
-    case 'direct':   return { cls: 'badge badge-green',  dot: '🟢', label: 'Direct Allocation' }
-    case 'training': return { cls: 'badge badge-yellow', dot: '🟡', label: 'Training Allocation' }
-    case 'hiring':   return { cls: 'badge badge-red',    dot: '🔴', label: 'Hiring Recommendation' }
+    case 'direct':   return { cls: 'badge badge-green',  dot: '', label: 'Direct Allocation' }
+    case 'training': return { cls: 'badge badge-yellow', dot: '', label: 'Training Allocation' }
+    case 'hiring':   return { cls: 'badge badge-red',    dot: '', label: 'Hiring Recommendation' }
   }
+}
+
+// ─── Financial helpers ────────────────────────────────────────────────────────
+
+/**
+ * Resolve the effective hourly bill rate for a proposal.
+ *
+ * `projected_margin` is the canonical figure produced by the backend (it is
+ * what the action queue lists). `ProjectDemand.target_bill_rate` is nullable,
+ * so when it is missing we derive the bill rate from the employee's cost rate
+ * and the canonical margin — bill = cost / (1 - margin/100) — instead of
+ * fabricating a default. This keeps the HITL financial block consistent with
+ * the projected margin shown in the queue.
+ */
+export function resolveBillRate(
+  targetBillRate: number | null | undefined,
+  costRate: number | null | undefined,
+  margin: number | null | undefined,
+): number {
+  const round2 = (n: number) => Math.round(n * 100) / 100
+
+  const bill = Number(targetBillRate)
+  if (Number.isFinite(bill) && bill > 0) return round2(bill)
+
+  const cost = Number(costRate)
+  const m = Number(margin)
+  if (cost > 0 && Number.isFinite(m) && m !== 0 && m < 100) {
+    return round2(cost / (1 - m / 100))
+  }
+  return 0
+}
+
+// ─── Phase 4: project / team / CV / training types ──────────────────────────
+
+export type RosterStatus =
+  | 'open'
+  | 'partially_filled'
+  | 'filled'
+  | 'requires_training'
+
+export type AllocationState =
+  | 'proposed_by_ai'
+  | 'pending_manager_approval'
+  | 'approved_by_manager'
+  | 'rejected_by_manager'
+  | 'active'
+  | 'completed'
+  | 'cancelled'
+
+export type CvApprovalState =
+  | 'not_required'
+  | 'pending_approval'
+  | 'approved'
+  | 'rejected'
+
+export interface ProjectSummary {
+  id: string
+  name: string
+  client_name?: string | null
+  status: string
+  probability: number
+  total_budget: number
+  target_margin: number
+  start_date?: string | null
+  end_date?: string | null
+  open_roles: number
+  filled_roles: number
+  partially_filled_roles: number
+  total_roles: number
+  open_seats: number
+  open_demands_count: number
+}
+
+export interface ProjectUtilization {
+  demanded_hours_per_day: number
+  allocated_hours_per_day: number
+  filled_seats: number
+  required_seats: number
+  utilization_pct: number
+}
+
+export interface ProjectAssignment {
+  allocation_id: string
+  employee_id: string
+  employee_name: string
+  job_title?: string | null
+  allocated_hours_per_day: number
+  allocation_pct: number
+  remaining_available_hours: number
+  status: AllocationState
+  ai_match_score?: number | null
+  ai_justification?: string | null
+  start_date?: string | null
+  end_date?: string | null
+}
+
+export interface RosterDemand {
+  demand_id: string
+  role: string
+  description?: string | null
+  seniority_level?: string | null
+  hours_per_day: number
+  headcount_required: number
+  headcount_filled: number
+  headcount_needed: number
+  status: RosterStatus
+  required_skills: string[]
+  target_bill_rate?: number | null
+  target_margin?: number | null
+  needed_by_date?: string | null
+  assignments: ProjectAssignment[]
+}
+
+export interface ProjectDetail {
+  project: ProjectSummary
+  utilization: ProjectUtilization
+  roster: RosterDemand[]
+}
+
+export interface CapacityAllocation {
+  allocation_id: string
+  project_id?: string | null
+  project_name?: string | null
+  role_on_project: string
+  allocated_hours_per_day: number
+  allocation_pct: number
+  status: AllocationState
+  start_date?: string | null
+  end_date?: string | null
+}
+
+export interface TeamMember {
+  employee_id: string
+  employee_name: string
+  job_title: string
+  manager_id?: string | null
+  manager_name?: string | null
+  employment_type: string
+  daily_capacity_hours: number
+  committed_hours_per_day: number
+  reserved_hours_per_day: number
+  remaining_available_hours: number
+  utilization_pct: number
+  bench_status: string
+  allocations: CapacityAllocation[]
+  next_rolloff_date?: string | null
+  pending_cv_reviews: number
+}
+
+export interface Candidate {
+  employee_id: string
+  employee_name: string
+  job_title: string
+  manager_id?: string | null
+  remaining_available_hours: number
+  daily_capacity_hours: number
+  match_score: number
+  matched_skills: string[]
+  missing_skills: string[]
+  current_allocations: CapacityAllocation[]
+}
+
+export interface EmployeeCapacity {
+  employee_id: string
+  employee_name: string
+  employment_type: string
+  daily_capacity_hours: number
+  committed_hours_per_day: number
+  reserved_hours_per_day: number
+  remaining_available_hours: number
+  utilization_pct: number
+  allocations: CapacityAllocation[]
+}
+
+export interface CvReviewSummary {
+  review_id: string
+  document_id: string
+  employee_id: string
+  employee_name: string
+  manager_id?: string | null
+  manager_name?: string | null
+  status: CvApprovalState
+  proposed_skills: string[]
+  requested_at: string
+  reviewed_at?: string | null
+  manager_comment?: string | null
+  document?: {
+    file_name: string
+    version: number
+    download_url: string
+  } | null
+}
+
+export interface CvDiff {
+  review_id: string
+  document_id: string
+  employee_id: string
+  employee_name: string
+  document: {
+    document_id: string
+    employee_id: string
+    file_name: string
+    file_path: string
+    version: number
+    approval_status: CvApprovalState
+    ingestion_status: string
+    is_current: boolean
+    uploaded_at?: string | null
+    download_url?: string
+  }
+  existing_skills: string[]
+  proposed_skills: string[]
+  new_skills: string[]
+  retained_skills: string[]
+  project_earned_skills: string[]
+  summary_before?: string | null
+  summary_after?: string | null
+  status: CvApprovalState
+  manager_comment?: string | null
+}
+
+export type CvStatusState = 'live' | 'pending_approval' | 'changes_requested'
+
+export interface CvStatus {
+  employee_id: string
+  state: CvStatusState
+  label: string
+  document_id?: string | null
+  version?: number | null
+  submitted_at?: string | null
+  manager_id?: string | null
+  manager_name?: string | null
+  manager_comment?: string | null
+  review_id?: string | null
+  proposed_skills: string[]
+}
+
+export type TrainingState = 'assigned' | 'in_progress' | 'completed' | 'cancelled'
+
+export interface TrainingAssignment {
+  id: string
+  employee_id: string
+  employee_name?: string | null
+  project_id?: string | null
+  project_name?: string | null
+  demand_id?: string | null
+  title: string
+  targeted_skills: string[]
+  ai_upskilling_path?: string | null
+  status: TrainingState
+  assigned_at: string
+  target_completion_date?: string | null
+  completed_at?: string | null
+  notes?: string | null
 }
