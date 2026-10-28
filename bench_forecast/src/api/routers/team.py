@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional
 
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -359,4 +360,237 @@ async def update_schedule(
             else str(employee.employment_type)
         ),
         "daily_capacity_hours": float(employee.daily_capacity_hours),
+    }
+
+
+# __ Employee Creation ___________________________________________________________
+
+class _EmployeeCreate(BaseModel):
+    first_name: str = Field(..., min_length=1, max_length=100)
+    last_name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., min_length=5)
+    job_title: str = Field(..., min_length=1, max_length=200)
+    experience_level: str = "mid"
+    employment_type: str = "full_time"
+    bench_status: str = "bench"
+    hourly_cost_rate: float = 65.00
+    skills: list[str] = Field(default_factory=list)
+    location: str = "Bucharest"
+
+
+@router.post("/employees", status_code=status.HTTP_201_CREATED)
+async def create_employee(
+    payload: _EmployeeCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("manager", "admin")),
+):
+    """Create a new employee with cost record and user account atomically."""
+    from src.database.models import EmployeeCost, ExperienceLevelEnum, BenchStatusEnum, User
+    from src.auth.auth import hash_password
+
+    # Uniqueness checks
+    existing_emp = await db.execute(select(Employee).where(Employee.email == payload.email))
+    if existing_emp.scalars().first():
+        raise HTTPException(status_code=409, detail=f"Email '{payload.email}' is already registered as an employee.")
+
+    from src.database.models import User as UserModel
+    existing_user = await db.execute(select(UserModel).where(UserModel.email == payload.email))
+    if existing_user.scalars().first():
+        raise HTTPException(status_code=409, detail=f"Email '{payload.email}' already has a user account.")
+
+    emp_number = f"EMP-{uuid.uuid4().hex[:6].upper()}"
+
+    bench_start = date.today() if payload.bench_status == "bench" else None
+
+    skills_str = ", ".join(payload.skills)
+    profile_text = (
+        f"{payload.first_name} {payload.last_name} — {payload.job_title} "
+        f"({payload.experience_level.capitalize()}) — Skills: {skills_str or 'Not specified'}"
+    )
+
+    try:
+        exp_level = ExperienceLevelEnum(payload.experience_level)
+    except ValueError:
+        exp_level = ExperienceLevelEnum.mid
+
+    try:
+        bench_st = BenchStatusEnum(payload.bench_status)
+    except ValueError:
+        bench_st = BenchStatusEnum.bench
+
+    try:
+        from src.database.models import EmploymentTypeEnum as ET
+        emp_type = ET(payload.employment_type)
+    except ValueError:
+        from src.database.models import EmploymentTypeEnum as ET
+        emp_type = ET.full_time
+
+    emp = Employee(
+        employee_number=emp_number,
+        first_name=payload.first_name,
+        last_name=payload.last_name,
+        email=payload.email,
+        job_title=payload.job_title,
+        experience_level=exp_level,
+        employment_type=emp_type,
+        bench_status=bench_st,
+        hire_date=date.today(),
+        bench_start_date=bench_start,
+        location=payload.location,
+        profile_text=profile_text,
+        is_active=True,
+        # Legacy shims
+        full_name=f"{payload.first_name} {payload.last_name}",
+        primary_role=payload.job_title,
+        seniority=payload.experience_level,
+        hourly_cost_rate=Decimal(str(payload.hourly_cost_rate)),
+        skills=skills_str,
+    )
+    db.add(emp)
+    await db.flush()
+
+    hourly = Decimal(str(payload.hourly_cost_rate))
+    daily = hourly * 8
+    annual = daily * 220
+
+    cost = EmployeeCost(
+        employee_id=emp.id,
+        effective_date=date.today(),
+        internal_hourly_cost=hourly,
+        internal_daily_cost=daily,
+        annual_salary=annual,
+        currency="EUR",
+        overhead_multiplier=Decimal("1.35"),
+    )
+    db.add(cost)
+    await db.flush()
+
+    first_lower = payload.first_name.lower()
+    last_lower = payload.last_name.lower()
+    base_username = f"{first_lower}.{last_lower}"
+    existing_unames = {u[0] for u in (await db.execute(select(UserModel.username))).all()}
+    username = base_username
+    if username in existing_unames:
+        username = f"{base_username}.{emp.id.hex[:4]}"
+
+    user = UserModel(
+        username=username,
+        password_hash=hash_password(username),
+        email=payload.email,
+        full_name=f"{payload.first_name} {payload.last_name}",
+        role="employee",
+        employee_id=emp.id,
+        is_active=True,
+    )
+    db.add(user)
+    await db.commit()
+
+    logger.info(f"Employee created: {emp.id} '{emp.first_name} {emp.last_name}' username='{username}'")
+
+    return {
+        "id": str(emp.id),
+        "employee_number": emp.employee_number,
+        "first_name": emp.first_name,
+        "last_name": emp.last_name,
+        "email": emp.email,
+        "job_title": emp.job_title,
+        "experience_level": payload.experience_level,
+        "employment_type": payload.employment_type,
+        "bench_status": payload.bench_status,
+        "location": emp.location,
+        "username": username,
+        "message": f"Employee created. Login: username='{username}', password='{username}'",
+    }
+
+
+# __ Admin Manager Management ___________________________________________________
+
+class _ManagerCreate(BaseModel):
+    full_name: str = Field(..., min_length=2, max_length=255)
+    email: str = Field(..., min_length=5)
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=100)
+    department_id: Optional[uuid.UUID] = None
+    employee_id: Optional[uuid.UUID] = None
+
+
+@router.get("/admin/managers", status_code=status.HTTP_200_OK)
+async def list_managers(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("admin")),
+):
+    """List all manager accounts with direct-report counts."""
+    from src.database.models import User as UserModel
+
+    result = await db.execute(select(UserModel).where(UserModel.role == "manager").where(UserModel.is_active.is_(True)))
+    managers = result.scalars().all()
+
+    # Count direct reports per manager employee_id
+    emp_ids = [m.employee_id for m in managers if m.employee_id]
+    dr_counts = {}
+    if emp_ids:
+        dr_result = await db.execute(select(Employee).where(Employee.manager_id.in_(emp_ids)))
+        dr_emps = dr_result.scalars().all()
+        for e in dr_emps:
+            dr_counts[e.manager_id] = dr_counts.get(e.manager_id, 0) + 1
+
+    return [
+        {
+            "id": str(m.id),
+            "username": m.username,
+            "email": m.email,
+            "full_name": m.full_name,
+            "role": m.role,
+            "employee_id": str(m.employee_id) if m.employee_id else None,
+            "department_id": str(m.department_id) if m.department_id else None,
+            "is_active": m.is_active,
+            "direct_reports_count": dr_counts.get(m.employee_id, 0) if m.employee_id else 0,
+        }
+        for m in managers
+    ]
+
+
+@router.post("/admin/managers", status_code=status.HTTP_201_CREATED)
+async def create_manager(
+    payload: _ManagerCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("admin")),
+):
+    """Create a new manager user account (admin only)."""
+    from src.database.models import User as UserModel
+    from src.auth.auth import hash_password
+
+    # Uniqueness checks
+    existing_uname = await db.execute(select(UserModel).where(UserModel.username == payload.username))
+    if existing_uname.scalars().first():
+        raise HTTPException(status_code=409, detail=f"Username '{payload.username}' is already taken.")
+
+    existing_email = await db.execute(select(UserModel).where(UserModel.email == payload.email))
+    if existing_email.scalars().first():
+        raise HTTPException(status_code=409, detail=f"Email '{payload.email}' is already registered.")
+
+    new_manager = UserModel(
+        username=payload.username,
+        password_hash=hash_password(payload.password),
+        email=payload.email,
+        full_name=payload.full_name,
+        role="manager",
+        department_id=payload.department_id,
+        employee_id=payload.employee_id,
+        is_active=True,
+    )
+    db.add(new_manager)
+    await db.commit()
+    await db.refresh(new_manager)
+
+    logger.info(f"Manager created: {new_manager.id} username='{new_manager.username}' by admin {current_user.get('id')}")
+
+    return {
+        "id": str(new_manager.id),
+        "username": new_manager.username,
+        "email": new_manager.email,
+        "full_name": new_manager.full_name,
+        "role": "manager",
+        "is_active": True,
+        "message": f"Manager account created. Login: username='{payload.username}', password='{payload.password}'",
     }

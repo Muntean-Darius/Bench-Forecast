@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+﻿import { useState, useEffect, useMemo } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
@@ -185,6 +185,18 @@ export default function ActionQueue() {
   const [fetchingPending, setFetchingPending] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  // SSE Forecast Stepper
+  const [showStepper, setShowStepper] = useState(false)
+  const [stepperSteps, setStepperSteps] = useState<{key: string; label: string; status: 'pending'|'active'|'completed'|'error'}[]>([
+    { key: 'data_extractor',    label: 'Data Extraction',            status: 'pending' },
+    { key: 'skill_matcher',     label: 'Semantic Skill Matching',     status: 'pending' },
+    { key: 'allocation_decider',label: 'Margin & Capacity Optimization', status: 'pending' },
+    { key: 'forecast_planner',  label: 'Plan Formulation',            status: 'pending' },
+  ])
+  const [stepperLogs, setStepperLogs] = useState<string[]>([])
+  const [stepperDone, setStepperDone] = useState(false)
+  const [stepperError, setStepperError] = useState<string | null>(null)
+
   // Sync selectedProjectId with searchParams if URL changes
   useEffect(() => {
     const pId = searchParams.get('project_id')
@@ -247,22 +259,23 @@ export default function ActionQueue() {
     return projects.find((p) => p.id === selectedProjectId) || null
   }, [projects, selectedProjectId])
 
-  // The planner runs as a long background job; poll until it finishes. No
-  // artificial cap — a local model can legitimately take several minutes.
-  async function waitForRun(runId: string) {
-    const start = Date.now()
-    for (;;) {
-      const run = await api.getForecastRun(runId)
-      if (run.status === 'paused_for_review' || run.status === 'completed') return
-      if (run.status === 'failed') throw new Error('Forecast run failed — check the backend logs')
-      setRunElapsed(Math.round((Date.now() - start) / 1000))
-      await new Promise((r) => setTimeout(r, 2500))
-    }
+  function resetStepper() {
+    setStepperSteps([
+      { key: 'data_extractor',    label: 'Data Extraction',               status: 'pending' },
+      { key: 'skill_matcher',     label: 'Semantic Skill Matching',        status: 'pending' },
+      { key: 'allocation_decider',label: 'Margin & Capacity Optimization', status: 'pending' },
+      { key: 'forecast_planner',  label: 'Plan Formulation',               status: 'pending' },
+    ])
+    setStepperLogs([])
+    setStepperDone(false)
+    setStepperError(null)
   }
 
   async function handleRunForecast() {
     setLoading(true)
     setError(null)
+    resetStepper()
+    setShowStepper(true)
     setRunElapsed(0)
     try {
       const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
@@ -270,18 +283,72 @@ export default function ActionQueue() {
       const targetProjId = selectedProjectId !== 'all' ? selectedProjectId : undefined
 
       const res = await api.runForecast(horizonDays, targetProjId, minWinProb)
-
       setForecastRunId(res.forecast_run_id)
       sessionStorage.setItem('bf_cached_forecast_run_id', res.forecast_run_id)
 
-      await waitForRun(res.forecast_run_id)
+      const streamUrl = api.getForecastStreamUrl(res.forecast_run_id)
+      const es = new EventSource(streamUrl)
 
-      // Refresh pending allocations + hiring recommendations from the database
-      await refreshQueue()
+      es.addEventListener('step', (e: any) => {
+        try {
+          const data = JSON.parse(e.data)
+          const ts = new Date().toLocaleTimeString()
+          setStepperLogs((logs) => [...logs, '[' + ts + '] ' + data.label])
+          setStepperSteps((steps) =>
+            steps.map((s) => {
+              if (s.key === data.step) return { ...s, status: data.status || 'active' }
+              const stepKeys = ['data_extractor', 'skill_matcher', 'allocation_decider', 'forecast_planner']
+              const stepIdx = stepKeys.indexOf(data.step)
+              const sIdx = stepKeys.indexOf(s.key)
+              if (sIdx < stepIdx) return { ...s, status: 'completed' }
+              return s
+            })
+          )
+        } catch (err) {
+          console.error('Error parsing SSE step event:', err)
+        }
+      })
+
+      es.addEventListener('complete', () => {
+        es.close()
+        setStepperSteps((steps) => steps.map((s) => ({ ...s, status: 'completed' })))
+        setStepperDone(true)
+        setLoading(false)
+        refreshQueue()
+      })
+
+      es.addEventListener('error', (e: any) => {
+        es.close()
+        let msg = 'Forecast run failed'
+        try {
+          if (e.data) {
+            const data = JSON.parse(e.data)
+            msg = data.error || msg
+          }
+        } catch {
+          // ignore
+        }
+        setStepperError(msg)
+        setError(msg)
+        setStepperSteps((steps) =>
+          steps.map((s) => (s.status === 'active' ? { ...s, status: 'error' } : s))
+        )
+        setLoading(false)
+      })
+
+      es.onerror = () => {
+        es.close()
+        setStepperError('Connection to forecast stream lost')
+        setError('Connection to forecast stream lost')
+        setStepperSteps((steps) =>
+          steps.map((s) => (s.status === 'active' ? { ...s, status: 'error' } : s))
+        )
+        setLoading(false)
+      }
     } catch (e: any) {
       console.error(e)
       setError(e.message ?? 'Failed to run forecast')
-    } finally {
+      setStepperError(e.message ?? 'Failed to run forecast')
       setLoading(false)
     }
   }
@@ -609,6 +676,79 @@ export default function ActionQueue() {
                   </div>
                 </div>
               ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Forecast Stepper Modal */}
+      {showStepper && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs">
+          <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-2xl w-full max-w-lg mx-4 p-6 flex flex-col gap-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Running AI Forecast Agent</h2>
+                <p className="text-xs text-gray-500 dark:text-gray-400 font-mono mt-0.5">
+                  {selectedProjectObj ? 'Project: ' + selectedProjectObj.name : 'All Projects'}
+                </p>
+              </div>
+              {(stepperDone || stepperError) && (
+                <button onClick={() => setShowStepper(false)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-lg cursor-pointer">&times;</button>
+              )}
+            </div>
+
+            {/* Steps */}
+            <div className="flex flex-col gap-3">
+              {stepperSteps.map((step, idx) => (
+                <div key={step.key} className="flex items-start gap-3">
+                  <div className="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold border-2 mt-0.5">
+                    {step.status === 'completed' ? (
+                      <span className="text-green-600 border-green-400 w-7 h-7 rounded-full flex items-center justify-center border-2 bg-green-50 dark:bg-green-950/40">✓</span>
+                    ) : step.status === 'active' ? (
+                      <span className="text-blue-600 border-blue-400 w-7 h-7 rounded-full flex items-center justify-center border-2 bg-blue-50 dark:bg-blue-950/40 animate-pulse">{idx + 1}</span>
+                    ) : step.status === 'error' ? (
+                      <span className="text-red-600 border-red-400 w-7 h-7 rounded-full flex items-center justify-center border-2 bg-red-50 dark:bg-red-950/40">!</span>
+                    ) : (
+                      <span className="text-gray-400 border-gray-200 dark:border-gray-600 w-7 h-7 rounded-full flex items-center justify-center border-2">{idx + 1}</span>
+                    )}
+                  </div>
+                  <div className="flex-1 pt-0.5">
+                    <p className={'text-xs font-medium ' + (
+                      step.status === 'completed' ? 'text-green-700 dark:text-green-400' :
+                      step.status === 'active' ? 'text-blue-700 dark:text-blue-400' :
+                      step.status === 'error' ? 'text-red-700 dark:text-red-400' : 'text-gray-400 dark:text-gray-500'
+                    )}>{step.label}</p>
+                    {step.status === 'active' && (
+                      <div className="mt-1 h-1 bg-gray-100 dark:bg-gray-700 rounded-full overflow-hidden">
+                        <div className="h-full bg-blue-500 rounded-full animate-pulse" style={{ width: '60%' }} />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Log console */}
+            {stepperLogs.length > 0 && (
+              <div className="bg-gray-900 text-green-400 text-[10px] font-mono p-3 max-h-24 overflow-y-auto rounded">
+                {stepperLogs.map((log, i) => <div key={i}>{log}</div>)}
+              </div>
+            )}
+
+            {/* Footer */}
+            {stepperDone && (
+              <div className="border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30 text-green-800 dark:text-green-300 text-xs px-3 py-2 flex items-center justify-between rounded">
+                <span>✓ Forecast completed — proposals ready for review</span>
+                <button onClick={() => setShowStepper(false)} className="btn-primary text-xs ml-3 cursor-pointer">
+                  View Proposals
+                </button>
+              </div>
+            )}
+            {stepperError && (
+              <div className="border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/30 text-red-700 dark:text-red-300 text-xs px-3 py-2 flex items-center justify-between rounded">
+                <span>✗ {stepperError}</span>
+                <button onClick={() => setShowStepper(false)} className="btn-ghost text-xs ml-3 cursor-pointer">Close</button>
+              </div>
             )}
           </div>
         </div>

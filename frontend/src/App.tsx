@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
+﻿import { BrowserRouter, Routes, Route, NavLink, Navigate, useLocation } from 'react-router-dom'
 import clsx from 'clsx'
 import { AuthProvider, useAuth, type UserRole } from './contexts/AuthContext'
 import Login from './pages/Login'
@@ -13,6 +13,7 @@ import ProjectDetail from './pages/ProjectDetail'
 import Team from './pages/Team'
 import CVApprovals from './pages/CVApprovals'
 import Trainings from './pages/Trainings'
+import AdminManagers from './pages/AdminManagers'
 import { usePendingCvCount } from './hooks/usePendingCvCount'
 
 // ─── Icons (inline SVG, no external dep) ─────────────────────────────────────
@@ -58,6 +59,7 @@ const ADMIN_NAV: NavItem[] = [
   { to: '/bench', label: 'Bench & Pipeline', icon: ICONS.bench },
   { to: '/queue', label: 'AI Action Queue', icon: ICONS.queue },
   { to: '/settings', label: 'Settings', icon: ICONS.settings },
+  { to: '/admin/managers', label: 'Managers', icon: ICONS.team },
 ]
 
 const MANAGER_NAV: NavItem[] = [
@@ -173,6 +175,7 @@ function ManagerLayout({ role }: { role: 'admin' | 'manager' }) {
           <Route path="/queue" element={<ActionQueue />} />
           <Route path="/queue/:id" element={<HITLApproval />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/admin/managers" element={<AdminManagers />} />
           <Route path="*" element={<Navigate to={role === 'admin' ? '/' : '/team'} replace />} />
         </Routes>
       </main>

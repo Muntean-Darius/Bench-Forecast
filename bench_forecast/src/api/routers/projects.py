@@ -1,4 +1,4 @@
-"""Project list/detail, role roster, demands and candidate recommendations."""
+﻿"""Project list/detail, role roster, demands and candidate recommendations."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Any, Optional
 
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -235,6 +236,88 @@ async def _allocations_by_employee(
         grouped.setdefault(allocation.employee_id, []).append(allocation)
     return grouped
 
+
+
+
+# __ Project Creation ___________________________________________________________
+
+class _InitialDemandCreate(BaseModel):
+    role: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+    required_skills: list[str] = Field(default_factory=list)
+    headcount_needed: int = Field(default=1, ge=1, le=50)
+    hours_per_day: Decimal = Field(default=Decimal("8.00"))
+    target_bill_rate: Optional[float] = Field(default=None, ge=0)
+    needed_by_date: Optional[date] = None
+
+
+class _ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255)
+    client_name: Optional[str] = Field(default=None, max_length=255)
+    status: str = Field(default="Pipeline")
+    probability: int = Field(default=75, ge=0, le=100)
+    target_margin: float = Field(default=35.0, ge=0.0, le=100.0)
+    total_budget: float = Field(default=0.0, ge=0.0)
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    initial_demands: list[_InitialDemandCreate] = Field(default_factory=list)
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_project(
+    payload: _ProjectCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("manager", "admin")),
+):
+    """Create a new project with optional initial role demands."""
+    proj = Project(
+        name=payload.name,
+        client_name=payload.client_name,
+        status=payload.status,
+        probability=payload.probability,
+        target_margin=Decimal(str(payload.target_margin)),
+        total_budget=Decimal(str(payload.total_budget)),
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+    )
+    db.add(proj)
+    await db.flush()  # get proj.id
+
+    demand_ids = []
+    for d in payload.initial_demands:
+        demand = ProjectDemand(
+            project_id=proj.id,
+            role=d.role,
+            description=d.description,
+            required_skills=d.required_skills or [],
+            headcount_needed=d.headcount_needed,
+            headcount_required=d.headcount_needed,
+            hours_per_day=d.hours_per_day,
+            target_bill_rate=Decimal(str(d.target_bill_rate)) if d.target_bill_rate is not None else None,
+            target_margin=Decimal(str(payload.target_margin)),
+            win_probability=Decimal(str(payload.probability / 100.0)),
+            status=DemandStatusEnum.open,
+            needed_by_date=d.needed_by_date,
+        )
+        db.add(demand)
+        await db.flush()
+        demand_ids.append(str(demand.id))
+
+    await db.commit()
+    logger.info(f"Project created: {proj.id} '{proj.name}' by user {current_user.get('id')}")
+
+    return {
+        "id": str(proj.id),
+        "name": proj.name,
+        "client_name": proj.client_name,
+        "status": proj.status,
+        "probability": proj.probability,
+        "target_margin": float(proj.target_margin),
+        "total_budget": float(proj.total_budget),
+        "start_date": proj.start_date,
+        "end_date": proj.end_date,
+        "demand_ids": demand_ids,
+    }
 
 @router.get("", status_code=status.HTTP_200_OK)
 @router.get("/", include_in_schema=False)
