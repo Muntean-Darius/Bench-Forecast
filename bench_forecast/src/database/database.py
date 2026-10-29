@@ -151,6 +151,7 @@ def get_sync_db() -> Generator[Session, None, None]:
 # existed. ``create_all`` only creates missing tables, never new columns, so we
 # apply these explicitly (PostgreSQL supports ADD COLUMN IF NOT EXISTS).
 _LIGHT_MIGRATIONS = [
+    "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS current_stage VARCHAR(50)",
     "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS decision_metrics JSONB",
     "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS latency_seconds NUMERIC(10, 2)",
     "ALTER TABLE forecast_runs ADD COLUMN IF NOT EXISTS llm_provider VARCHAR(50)",

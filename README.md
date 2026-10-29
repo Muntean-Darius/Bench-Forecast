@@ -828,12 +828,20 @@ AI_OBSERVABILITY_ENDPOINT=http://localhost:8000
 
 Notes:
 
+- Use `ai-observability-sdk>=0.3.1` (it deduplicates `ChatOllama`/`ChatGroq`
+  spans against the raw clients). The wrapper remains compatible with 0.2.x.
 - Tracing is disabled automatically when neither key nor endpoint is set.
 - The SDK is optional at runtime.
+- The startup endpoint preflight is advisory: an unreachable collector logs a
+  warning and tracing still initialises; check
+  `GET /api/v1/health → observability` for export health. Set
+  `AI_OBSERVABILITY_PREFLIGHT_STRICT=true` for fail-fast behaviour.
 - If the local observability platform also uses port 8000, run the backend on
   `API_PORT=8001` or change the observability endpoint.
 - The SDK appends `/v1/traces` itself.
 - Legacy Arize Phoenix is only used when the platform SDK is not active.
+- Forecast runs, HITL reviews, CV uploads and CV approvals each run inside one
+  `workflow()`, so their LLM/RETRIEVER spans render as one execution.
 
 Relevant files:
 

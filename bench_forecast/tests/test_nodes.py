@@ -521,6 +521,68 @@ def test_allocation_decider_uses_llm_chosen_candidate(mock_rag_pipeline, mock_ll
     assert decision["action_type"] == "train"
 
 
+def test_allocation_decider_revalidates_hire_after_reconsideration(
+    mock_rag_pipeline, mock_llm_factory
+):
+    """A late 'hire' must not beat a perfect, financially viable bench match.
+
+    Guard 1 runs before the margin guards. When a below-target choice triggers a
+    reconsideration that returns ``hire``, the final guard must re-check the
+    candidate pool instead of leaving a perfect bench match unused.
+    """
+    good_id = str(uuid.uuid4())
+    partial_id = str(uuid.uuid4())
+    target_id = str(uuid.uuid4())
+    demand_id = str(uuid.uuid4())
+    state = {
+        "bench_employees": [
+            {"id": good_id, "name": "Good Match", "seniority": "Senior",
+             "hourly_cost": 70.0, "skills": ["Python", "FastAPI", "PostgreSQL", "Docker"],
+             "job_title": "Backend Engineer", "remaining_available_hours": 8.0},
+            {"id": partial_id, "name": "Partial Match", "seniority": "Mid",
+             "hourly_cost": 85.0, "skills": ["Python"], "job_title": "Engineer",
+             "remaining_available_hours": 8.0},
+            {"id": target_id, "name": "Target Margin", "seniority": "Mid",
+             "hourly_cost": 55.0, "skills": ["Python", "FastAPI"], "job_title": "Engineer",
+             "remaining_available_hours": 8.0},
+        ],
+        "open_demands": [{
+            "id": demand_id,
+            "project_id": str(uuid.uuid4()),
+            "role": "Backend Python Developer",
+            "description": "Build FastAPI services on PostgreSQL",
+            "required_skills": ["Python", "FastAPI", "PostgreSQL", "Docker"],
+            "target_bill_rate": 120.0,
+            "target_margin": 50.0,
+            "hours_per_day": 8.0,
+        }],
+        "skill_matches": [],
+    }
+
+    mock_rag_pipeline.retrieve_candidates.return_value = [
+        {"employee_id": good_id, "full_name": "Good Match"},
+        {"employee_id": partial_id, "full_name": "Partial Match"},
+        {"employee_id": target_id, "full_name": "Target Margin"},
+    ]
+    # The model initially picks the below-target partial match.
+    mock_llm_factory.parse_json_response.return_value = {
+        "action_type": "allocate",
+        "employee_id": partial_id,
+        "projected_margin": 29.2,
+        "justification": "Selected the cheapest candidate for the role.",
+    }
+
+    with patch(
+        "src.agents.nodes._reconsider_decision",
+        return_value=("hire", None, "External hire."),
+    ):
+        updates = allocation_decider_node(state)
+
+    decision = updates["decisions"][0]
+    assert decision["employee_id"] == good_id
+    assert decision["action_type"] == "allocate"
+
+
 def test_forecast_planner_node_fallback_on_unparseable_json(mock_llm_factory):
     """Test forecast_planner_node synthesizes a plan from decisions when LLM JSON is malformed."""
     emp_id = str(uuid.uuid4())

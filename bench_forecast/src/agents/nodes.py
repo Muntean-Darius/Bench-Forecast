@@ -31,7 +31,7 @@ from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional
 
 from langchain_core.messages import HumanMessage
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 
 # Importing Config loads the root .env before the module-level os.getenv reads
@@ -128,6 +128,29 @@ def _log_state_exit(node_name: str, updates: Dict[str, Any]) -> None:
         f"    STATE DELTA:\n{json.dumps(summary, default=str, indent=4)}\n"
         f"{'='*70}"
     )
+
+
+def _mark_stage(forecast_run_id: Any, stage: str) -> None:
+    """Persist the node currently executing for the live SSE stepper.
+
+    The write is best-effort: a failure to record cosmetic progress must never
+    interrupt the planner. A dedicated short-lived sync session is used because
+    LangGraph invokes the (sync) nodes from worker threads.
+    """
+    if not forecast_run_id:
+        return
+    try:
+        from src.database.database import SyncSessionLocal
+
+        with SyncSessionLocal() as db:
+            db.execute(
+                update(ForecastRun)
+                .where(ForecastRun.id == uuid.UUID(str(forecast_run_id)))
+                .values(current_stage=stage)
+            )
+            db.commit()
+    except Exception:
+        logger.debug("Could not persist forecast stage '%s'", stage, exc_info=True)
 
 
 from sqlalchemy.orm import selectinload
@@ -690,6 +713,7 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
     """Deterministic extraction of bench talent and open project demands using AsyncSession.
     """
     _log_state_entry("data_extractor_node", state)
+    _mark_stage(state.get("forecast_run_id"), "data_extractor")
 
     horizon_days: int = state.get("horizon_days", 90)
     min_win_prob: float = state.get("min_win_probability", 0.75)
@@ -863,6 +887,7 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
 def skill_matcher_node(state: State) -> Dict[str, Any]:
     """RAG-augmented semantic matching of employee profiles against demands."""
     _log_state_entry("skill_matcher_node", state)
+    _mark_stage(state.get("forecast_run_id"), "skill_matcher")
 
     employees = state.get("bench_employees", [])
     demands = state.get("open_demands", [])
@@ -987,6 +1012,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     ``train`` from the chosen candidate's actual missing skills.
     """
     _log_state_entry("allocation_decider_node", state)
+    _mark_stage(state.get("forecast_run_id"), "allocation_decider")
 
     demands = state.get("open_demands", [])
     if not demands:
@@ -1009,15 +1035,21 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
     bench_employees = state.get("bench_employees", [])
     bench_ids = [str(emp["id"]) for emp in bench_employees if emp.get("id")]
     emp_by_id = {str(emp["id"]): emp for emp in bench_employees}
-    remaining_hours_by_emp: Dict[str, float] = {
-        str(emp["id"]): float(
-            emp.get("remaining_available_hours")
-            or emp.get("daily_capacity_hours")
-            or 8.0
-        )
-        for emp in bench_employees
-        if emp.get("id")
-    }
+    remaining_hours_by_emp: Dict[str, float] = {}
+    for emp in bench_employees:
+        if not emp.get("id"):
+            continue
+        # ``or`` here would turn a legitimately fully-committed employee
+        # (remaining == 0) into an 8-hour one, allowing over-allocation.
+        raw_remaining = emp.get("remaining_available_hours")
+        if raw_remaining is None:
+            raw_remaining = emp.get("daily_capacity_hours")
+        if raw_remaining is None:
+            raw_remaining = 8.0
+        try:
+            remaining_hours_by_emp[str(emp["id"])] = float(raw_remaining)
+        except (TypeError, ValueError):
+            remaining_hours_by_emp[str(emp["id"])] = 0.0
 
     def _has_hours(emp_id: str, hours: float) -> bool:
         # Legacy/unit-test candidate pools may not include bench_employees.
@@ -1384,6 +1416,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
         target_bill_rate = item["target_bill_rate"]
         target_margin = item["target_margin"]
         required_skills = item["required_skills"]
+        demand_hours = float(item.get("hours_per_day") or 8.0)
         candidates = item["candidates"]
 
         def _parse(content: str) -> Dict[str, Any]:
@@ -1503,6 +1536,7 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 if c.get("skill_coverage") == 1.0
                 and _candidate_margin(c) is not None
                 and float(_candidate_margin(c)) >= _MIN_ACCEPTABLE_MARGIN
+                and _has_hours(_candidate_id(c), demand_hours)
             ]
             if full_matches:
                 best = max(full_matches, key=_candidate_rank)
@@ -1516,6 +1550,52 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                     decision.employee_id = best_id
                     chosen_emp_id = best_id
                     chosen_cand = best
+                    decision.projected_margin = round(
+                        float(_candidate_margin(best) or 0.0), 2
+                    )
+                    decision.upskilling_path = None
+                    decision.justification = ""
+                    margin_note = None
+
+        # Guard 1b: an internal candidate who fully covers the role should not
+        # lose to a partial match the LLM happened to prefer — but only when the
+        # full match also meets the role's target margin, so the model's
+        # cost/quality trade-offs are still respected.
+        if decision.action_type in ("allocate", "train") and required_skills:
+            chosen_coverage = (
+                float(chosen_cand.get("skill_coverage") or 0.0)
+                if chosen_cand is not None
+                else 0.0
+            )
+            if chosen_cand is not None and chosen_coverage < 1.0:
+                full_matches = [
+                    c for c in candidates
+                    if c.get("skill_coverage") == 1.0
+                    and _candidate_margin(c) is not None
+                    and float(_candidate_margin(c)) >= max(
+                        _MIN_ACCEPTABLE_MARGIN, target_margin
+                    )
+                    and _has_hours(_candidate_id(c), demand_hours)
+                ]
+                if full_matches:
+                    best = max(full_matches, key=_candidate_rank)
+                    best_id = _candidate_id(best)
+                    if best_id and best_id != chosen_emp_id:
+                        logger.info(
+                            f"allocation_decider: '{role_title}' — preferring full "
+                            f"skill coverage from {best_id} over "
+                            f"{_candidate_id(chosen_cand)} ({chosen_coverage:.0%})."
+                        )
+                        chosen_cand = best
+                        chosen_emp_id = best_id
+                        decision.employee_id = best_id
+                        decision.action_type = "allocate"
+                        decision.projected_margin = round(
+                            float(_candidate_margin(best) or 0.0), 2
+                        )
+                        decision.upskilling_path = None
+                        decision.justification = ""
+                        margin_note = None
 
         # Guard 2: no meaningful internal match → recommend an external hire.
         # (Best candidate covers less than half the required skills.)
@@ -1544,8 +1624,8 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
         if decision.action_type in ("allocate", "train") and chosen_emp_id:
             if not _has_hours(chosen_emp_id, demand_hours):
                 logger.warning(
-                    f"allocation_decider: Employee {chosen_emp_id} has no "
-                    f"{demand_hours}h/day remaining; picking another candidate."
+                    f"allocation_decider: '{role_title}' employee {chosen_emp_id} "
+                    f"has no {demand_hours}h/day remaining; picking another candidate."
                 )
                 alt = _best_candidate(
                     [
@@ -1731,6 +1811,47 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                     )
         elif decision.action_type == "hire":
             decision.projected_margin = 0.0
+
+        # Guard 5: a hire produced *after* guard 1 (for example by the
+        # margin-driven reconsideration in guard 4) must be re-validated. A
+        # perfect bench match should never become an external hire just because
+        # the LLM answered "hire" when asked to reconsider.
+        if decision.action_type == "hire" and required_skills and candidates:
+            internal_matches = [
+                c for c in candidates
+                if _candidate_id(c)
+                and _has_hours(_candidate_id(c), demand_hours)
+                and _candidate_margin(c) is not None
+                and float(_candidate_margin(c)) >= _MIN_ACCEPTABLE_MARGIN
+                and float(c.get("skill_coverage") or 0.0) >= 0.5
+            ]
+            if internal_matches:
+                best = max(internal_matches, key=_candidate_rank)
+                best_id = _candidate_id(best)
+                best_coverage = float(best.get("skill_coverage") or 0.0)
+                if best_id:
+                    logger.info(
+                        f"allocation_decider: '{role_title}' — replacing external "
+                        f"hire with internal candidate {best_id} "
+                        f"({best_coverage:.0%} skill coverage)."
+                    )
+                    chosen_cand = best
+                    chosen_emp_id = best_id
+                    decision.employee_id = best_id
+                    # The missing-skills pass below decides allocate vs train.
+                    decision.action_type = (
+                        "allocate" if best_coverage >= 0.99 else "train"
+                    )
+                    decision.projected_margin = round(
+                        float(_candidate_margin(best) or 0.0), 2
+                    )
+                    decision.match_score = float(
+                        best.get("similarity_score") or 0.0
+                    )
+                    decision.upskilling_path = None
+                    decision.justification = ""
+                    margin_note = None
+                    _reserve_hours(best_id, demand_hours)
 
         # Resolve the chosen employee's metadata with DB/extractor fallbacks so
         # the HITL UI always has cost rate, seniority and name available.
@@ -2036,6 +2157,7 @@ def forecast_planner_node(state: State) -> Dict[str, Any]:
         State delta: recommendations dict.
     """
     _log_state_entry("forecast_planner_node", state)
+    _mark_stage(state.get("forecast_run_id"), "forecast_planner")
 
     matches = state.get("skill_matches", [])
     employees = state.get("bench_employees", [])
