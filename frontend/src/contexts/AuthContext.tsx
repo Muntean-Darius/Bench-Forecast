@@ -47,6 +47,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         })
         .catch(() => {
           localStorage.removeItem('bf_token')
+          sessionStorage.removeItem('bf_show_cost_rates')
           setToken(null)
           setUser(null)
           setIsLoading(false)
@@ -76,6 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = () => {
     localStorage.removeItem('bf_token')
+    sessionStorage.removeItem('bf_show_cost_rates')
     setToken(null)
     setUser(null)
   }

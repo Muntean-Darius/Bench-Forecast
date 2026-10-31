@@ -86,6 +86,10 @@ async def startup():
     logger.info(f"LLM Provider: {Config.LLM_PROVIDER}")
     if Config.LLM_PROVIDER == "groq":
         logger.info(f"Groq Model: {Config.GROQ_MODEL}")
+    elif Config.LLM_PROVIDER == "deepseek":
+        logger.info(
+            f"DeepSeek Model: {Config.DEEPSEEK_MODEL} @ {Config.DEEPSEEK_BASE_URL}"
+        )
     elif Config.LLM_PROVIDER == "openai_compatible":
         logger.info(f"OpenAI-compatible Model: {Config.LLM_MODEL} @ {Config.LLM_BASE_URL}")
     else:
@@ -576,6 +580,8 @@ async def list_models():
     """
     if Config.LLM_PROVIDER == "groq":
         model_id = Config.GROQ_MODEL
+    elif Config.LLM_PROVIDER == "deepseek":
+        model_id = Config.DEEPSEEK_MODEL
     elif Config.LLM_PROVIDER == "openai_compatible":
         model_id = Config.LLM_MODEL
     else:

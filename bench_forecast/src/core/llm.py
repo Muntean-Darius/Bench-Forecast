@@ -229,7 +229,7 @@ class MatchJustification(BaseModel):
 # ===========================================================================
 
 class LLMFactory:
-    """Unified factory for Groq and Ollama inference clients."""
+    """Unified factory for Groq, DeepSeek and Ollama inference clients."""
 
     @staticmethod
     def get_chat_model(
@@ -239,11 +239,12 @@ class LLMFactory:
         """Get a chat model instance based on configuration.
 
         Args:
-            provider:   'groq' or 'ollama' (defaults to Config.LLM_PROVIDER).
-            model_name: Model identifier (defaults to configured model).
+            provider:   'groq', 'deepseek', 'openai_compatible' or 'ollama'
+                        (defaults to Config.LLM_PROVIDER).
+            model_name: Model identifier (defaults to the configured model).
 
         Returns:
-            ChatOllama or ChatGroq instance.
+            ChatOllama, ChatGroq or ChatOpenAI instance.
 
         Raises:
             ValueError: If provider is invalid or required credentials missing.
@@ -264,6 +265,32 @@ class LLMFactory:
                 max_retries=Config.LLM_MAX_RETRIES,
                 timeout=Config.LLM_TIMEOUT,
             )
+
+        elif provider == "deepseek":
+            if not Config.DEEPSEEK_API_KEY:
+                raise ValueError(
+                    "DeepSeek provider selected but DEEPSEEK_API_KEY not set. "
+                    "Set it in .env or switch to LLM_PROVIDER=ollama"
+                )
+            from langchain_openai import ChatOpenAI  # noqa: PLC0415
+
+            deepseek_model = model_name or Config.DEEPSEEK_MODEL
+            logger.info(
+                f"Initializing DeepSeek client: model={deepseek_model} "
+                f"base_url={Config.DEEPSEEK_BASE_URL}"
+            )
+            client_kwargs: dict[str, Any] = {
+                "base_url": Config.DEEPSEEK_BASE_URL,
+                "api_key": Config.DEEPSEEK_API_KEY,
+                "model": deepseek_model,
+                "max_retries": Config.LLM_MAX_RETRIES,
+                "timeout": Config.LLM_TIMEOUT,
+            }
+            # deepseek-reasoner rejects sampling parameters; only send
+            # temperature for the chat model.
+            if "reasoner" not in deepseek_model.lower():
+                client_kwargs["temperature"] = Config.LLM_TEMPERATURE
+            return ChatOpenAI(**client_kwargs)
 
         elif provider == "ollama":
             logger.info(f"Initializing Ollama client: model={Config.OLLAMA_MODEL}")
@@ -295,6 +322,8 @@ class LLMFactory:
                 api_key=Config.LLM_API_KEY,
                 model=model_name or Config.LLM_MODEL,
                 temperature=Config.LLM_TEMPERATURE,
+                max_retries=Config.LLM_MAX_RETRIES,
+                timeout=Config.LLM_TIMEOUT,
             )
 
         else:

@@ -305,8 +305,11 @@ One shared `.env` at the repository root. See `.env.example` for the full list.
 Key groups:
 
 - **LLM**
-  - `LLM_PROVIDER=ollama | groq | openai_compatible`
-  - `OLLAMA_*`, `GROQ_*`, `LLM_*`
+  - `LLM_PROVIDER=ollama | groq | deepseek | openai_compatible`
+  - `OLLAMA_*`, `GROQ_*`, `DEEPSEEK_*`, `LLM_*`
+  - DeepSeek: `LLM_PROVIDER=deepseek`, `DEEPSEEK_API_KEY=<key>`,
+    `DEEPSEEK_MODEL=deepseek-chat` (or `deepseek-reasoner`). Embeddings still
+    come from Ollama.
 - **Embeddings**
   - `EMBEDDING_MODEL=nomic-embed-text`
   - `OLLAMA_BASE_URL`

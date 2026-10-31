@@ -5,6 +5,8 @@ import { marginColor } from '../types'
 import { format } from 'date-fns'
 import { api } from '../api/client'
 import { useAuth } from '../contexts/AuthContext'
+import { useCostVisibility, maskCost, maskAmount } from '../hooks/useCostVisibility'
+import { CostVisibilityToggle } from '../components/shared/CostVisibilityToggle'
 import {
   CheckIcon,
   CloseIcon,
@@ -28,6 +30,7 @@ interface FinancialProjectionProps {
   margin: number
   targetMargin: number
   hoursPerMonth?: number
+  showRates: boolean
 }
 
 function FinancialProjectionCard({
@@ -36,6 +39,7 @@ function FinancialProjectionCard({
   margin,
   targetMargin,
   hoursPerMonth = 160,
+  showRates,
 }: FinancialProjectionProps) {
   const delta = margin - targetMargin
   const isHealthy = delta >= 0
@@ -81,20 +85,20 @@ function FinancialProjectionCard({
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Internal Cost Rate</p>
-          <p className="text-2xl font-bold font-mono text-red-600 mt-1">€{costRate.toFixed(2)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
+          <p className="text-2xl font-bold font-mono text-red-600 mt-1">{maskCost(costRate, showRates)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
           <p className="text-[11px] text-gray-400 mt-1">Loaded salary + overhead</p>
         </div>
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Hourly Gross Spread</p>
-          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">€{marginPerHour.toFixed(2)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
+          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">{maskCost(marginPerHour, showRates)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
           <p className="text-[11px] text-gray-400 mt-1">Net profit contribution / hr</p>
         </div>
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Monthly Net Profit</p>
-          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">€{monthlyProfit.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}<span className="text-xs text-gray-500 font-normal">/mo</span></p>
-          <p className="text-[11px] text-gray-400 mt-1">Cost: €{monthlyCost.toLocaleString('en-US', { maximumFractionDigits: 0 })} · Rev: €{monthlyRevenue.toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo</p>
+          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">{maskAmount(monthlyProfit, showRates)}<span className="text-xs text-gray-500 font-normal">/mo</span></p>
+          <p className="text-[11px] text-gray-400 mt-1">Cost: {maskAmount(monthlyCost, showRates)} · Rev: €{monthlyRevenue.toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo</p>
         </div>
       </div>
 
@@ -135,6 +139,7 @@ export default function HITLApproval() {
   const navigate = useNavigate()
   const { state } = useLocation()
   const { user } = useAuth()
+  const { visible: showRates, toggle: toggleRates, canView: canViewRates } = useCostVisibility()
 
   const [decision, setDecision] = useState<'idle' | 'approved' | 'training' | 'rejected'>('idle')
   const [feedback, setFeedback] = useState('')
@@ -430,6 +435,9 @@ export default function HITLApproval() {
         </div>
 
         <div className="flex items-center gap-3 text-xs font-mono text-gray-500">
+          {canViewRates && (
+            <CostVisibilityToggle visible={showRates} onToggle={toggleRates} />
+          )}
           <span className="bg-gray-100 px-2 py-0.5 rounded text-gray-600">{project.name}</span>
           <span>{createdAtStr}</span>
         </div>
@@ -497,7 +505,7 @@ export default function HITLApproval() {
                 {margin.toFixed(1)}% <span className="text-xs font-normal text-gray-400">(vs {targetMargin.toFixed(1)}% target)</span>
               </p>
               <p className="text-xs text-gray-500 mt-0.5">
-                Spread: €{(billRate - costRate).toFixed(2)}/hr net
+                Spread: {maskCost(billRate - costRate, showRates)}/hr net
               </p>
             </div>
 
@@ -592,7 +600,7 @@ export default function HITLApproval() {
               <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
                 <div className="p-2.5 bg-gray-50 rounded border border-gray-100">
                   <p className="text-[10px] font-mono text-gray-400 uppercase">Internal Hourly Cost</p>
-                  <p className="font-mono font-bold text-red-600 text-base mt-0.5">€{costRate.toFixed(2)}/h</p>
+                  <p className="font-mono font-bold text-red-600 text-base mt-0.5">{maskCost(costRate, showRates)}/h</p>
                 </div>
                 <div className="p-2.5 bg-gray-50 rounded border border-gray-100">
                   <p className="text-[10px] font-mono text-gray-400 uppercase">Total Experience</p>
@@ -684,6 +692,7 @@ export default function HITLApproval() {
           costRate={costRate}
           margin={margin}
           targetMargin={targetMargin}
+          showRates={showRates}
         />
 
         {/* ── Human-In-The-Loop Decision Suite ────────────────────────────────── */}

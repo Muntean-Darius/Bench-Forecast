@@ -98,7 +98,7 @@ function Sidebar({
         </div>
         <div>
           <p className="text-xs font-semibold text-gray-900 leading-none">Bench Forecast</p>
-          <p className="text-[10px] text-gray-400 font-mono mt-0.5">AI · v2.0</p>
+          <p className="text-[10px] text-gray-400 font-mono mt-0.5">AI</p>
         </div>
       </div>
 

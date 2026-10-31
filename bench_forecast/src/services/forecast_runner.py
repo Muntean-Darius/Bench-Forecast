@@ -80,13 +80,14 @@ async def execute_forecast_run(
     (LangGraph nodes, LLM/TOOL/RETRIEVER spans) is captured automatically by the
     SDK's instrumentors.
     """
-    model_name = (
-        Config.GROQ_MODEL
-        if Config.LLM_PROVIDER == "groq"
-        else Config.LLM_MODEL
-        if Config.LLM_PROVIDER == "openai_compatible"
-        else Config.OLLAMA_MODEL
-    )
+    if Config.LLM_PROVIDER == "groq":
+        model_name = Config.GROQ_MODEL
+    elif Config.LLM_PROVIDER == "deepseek":
+        model_name = Config.DEEPSEEK_MODEL
+    elif Config.LLM_PROVIDER == "openai_compatible":
+        model_name = Config.LLM_MODEL
+    else:
+        model_name = Config.OLLAMA_MODEL
     context = {
         "horizon_days": horizon_days,
         "min_win_probability": min_win_probability,
@@ -295,6 +296,8 @@ async def _execute_forecast_run(
                     mix[a] += 1
             if Config.LLM_PROVIDER == "groq":
                 model_name = Config.GROQ_MODEL
+            elif Config.LLM_PROVIDER == "deepseek":
+                model_name = Config.DEEPSEEK_MODEL
             elif Config.LLM_PROVIDER == "openai_compatible":
                 model_name = Config.LLM_MODEL
             else:

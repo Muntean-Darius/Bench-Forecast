@@ -4,6 +4,8 @@ import clsx from 'clsx'
 import { type Employee, type ProjectRole } from '../types'
 import { format } from 'date-fns'
 import { api } from '../api/client'
+import { useCostVisibility, maskCost } from '../hooks/useCostVisibility'
+import { CostVisibilityToggle } from '../components/shared/CostVisibilityToggle'
 import {
   DocumentIcon,
   DownloadIcon,
@@ -129,11 +131,13 @@ function BenchTable({
   employees,
   onOpenCV,
   onAssign,
+  showRates,
 }: {
   filter: string
   employees: Employee[]
   onOpenCV: (emp: Employee) => void
   onAssign: (emp: Employee) => void
+  showRates: boolean
 }) {
   const q = filter.trim().toLowerCase()
   const filtered = employees.filter((e) => {
@@ -203,7 +207,7 @@ function BenchTable({
                   </td>
                   <td className="text-gray-600">{e.primary_role ?? 'Engineer'}</td>
                   <td className="tabnum font-mono text-red-700">
-                    €{Number(e.hourly_cost_rate ?? 0).toFixed(2)}/h
+                    {maskCost(e.hourly_cost_rate, showRates)}/h
                   </td>
                   <td className="tabnum font-mono text-gray-500">{formattedDate}</td>
                   <td className="max-w-[200px]">
@@ -258,11 +262,13 @@ function AssignedTable({
   employees,
   onOpenCV,
   onRelease,
+  showRates,
 }: {
   filter: string
   employees: Employee[]
   onOpenCV: (emp: Employee) => void
   onRelease: (emp: Employee) => void
+  showRates: boolean
 }) {
   const q = filter.trim().toLowerCase()
   const filtered = employees.filter((e) => {
@@ -333,7 +339,7 @@ function AssignedTable({
                     </span>
                   </td>
                   <td className="tabnum font-mono text-gray-800">
-                    €{Number(e.hourly_cost_rate ?? 0).toFixed(2)}/h
+                    {maskCost(e.hourly_cost_rate, showRates)}/h
                   </td>
                   <td className="max-w-[200px]">
                     <div className="flex flex-wrap gap-1">
@@ -514,11 +520,13 @@ function AssignModal({
   demands,
   onClose,
   onSuccess,
+  showRates,
 }: {
   employee: Employee | null
   demands: ProjectRole[]
   onClose: () => void
   onSuccess: (empId: string, projectName: string) => void
+  showRates: boolean
 }) {
   if (!employee) return null
 
@@ -556,7 +564,7 @@ function AssignModal({
               Assign {employee.full_name ?? employee.name}
             </h2>
             <p className="text-xs text-gray-500 font-mono mt-0.5">
-              {employee.seniority} · {employee.primary_role} · €{Number(employee.hourly_cost_rate ?? 0).toFixed(2)}/h
+              {employee.seniority} · {employee.primary_role} · {maskCost(employee.hourly_cost_rate, showRates)}/h
             </p>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 p-1 cursor-pointer" title="Close">
@@ -635,9 +643,11 @@ function AssignModal({
 function CVModal({
   employee,
   onClose,
+  showRates,
 }: {
   employee: Employee | null
   onClose: () => void
+  showRates: boolean
 }) {
   if (!employee) return null
 
@@ -675,7 +685,7 @@ function CVModal({
               {employee.full_name ?? employee.name}
             </h2>
             <p className="text-xs text-gray-500 font-mono mt-0.5">
-              {employee.seniority} · {employee.primary_role} · €{Number(employee.hourly_cost_rate ?? 0).toFixed(2)}/h
+              {employee.seniority} · {employee.primary_role} · {maskCost(employee.hourly_cost_rate, showRates)}/h
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -784,6 +794,7 @@ export default function BenchPipeline() {
   const [error, setError] = useState<string | null>(null)
   const [selectedEmpCV, setSelectedEmpCV] = useState<Employee | null>(null)
   const [assigningEmp, setAssigningEmp] = useState<Employee | null>(null)
+  const { visible: showRates, toggle: toggleRates, canView: canViewRates } = useCostVisibility()
 
   const loadData = async () => {
     try {
@@ -863,14 +874,19 @@ export default function BenchPipeline() {
             Workforce Allocation &amp; Demand Management · {benchEmployees.length} on bench · {assignedEmployees.length} assigned · {demands.length} project roles
           </p>
         </div>
-        <div className="relative">
-          <input
-            type="text"
-            placeholder="Filter by name, role, skills, project…"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            className="text-sm border border-gray-200 bg-white px-3 py-1.5 w-72 focus:outline-none focus:ring-1 focus:ring-gray-400 placeholder:text-gray-400"
-          />
+        <div className="flex items-center gap-2">
+          {canViewRates && (
+            <CostVisibilityToggle visible={showRates} onToggle={toggleRates} />
+          )}
+          <div className="relative">
+            <input
+              type="text"
+              placeholder="Filter by name, role, skills, project…"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="text-sm border border-gray-200 bg-white px-3 py-1.5 w-72 focus:outline-none focus:ring-1 focus:ring-gray-400 placeholder:text-gray-400"
+            />
+          </div>
         </div>
       </div>
 
@@ -941,6 +957,7 @@ export default function BenchPipeline() {
           employees={benchEmployees}
           onOpenCV={(emp) => setSelectedEmpCV(emp)}
           onAssign={(emp) => setAssigningEmp(emp)}
+          showRates={showRates}
         />
       )}
 
@@ -950,6 +967,7 @@ export default function BenchPipeline() {
           employees={assignedEmployees}
           onOpenCV={(emp) => setSelectedEmpCV(emp)}
           onRelease={handleRelease}
+          showRates={showRates}
         />
       )}
 
@@ -958,12 +976,13 @@ export default function BenchPipeline() {
       )}
 
       {/* Modals */}
-      <CVModal employee={selectedEmpCV} onClose={() => setSelectedEmpCV(null)} />
+      <CVModal employee={selectedEmpCV} onClose={() => setSelectedEmpCV(null)} showRates={showRates} />
       <AssignModal
         employee={assigningEmp}
         demands={demands.filter((d) => d.status === 'Open')}
         onClose={() => setAssigningEmp(null)}
         onSuccess={handleAssignSuccess}
+        showRates={showRates}
       />
     </div>
   )
