@@ -1108,6 +1108,8 @@ class ForecastRun(Base):
     forecast_horizon_days: Mapped[int] = mapped_column(Integer, nullable=False)
     triggered_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="in_progress")
+    # Name of the LangGraph node currently executing (used by the SSE stepper).
+    current_stage: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     
     # RAGAS Evaluation Metrics

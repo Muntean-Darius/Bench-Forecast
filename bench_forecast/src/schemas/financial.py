@@ -200,7 +200,10 @@ class MonthlyBenchBurnResponse(BaseModel):
     month: int
     period_start: str
     period_end: str
-    total_bench_cost: float
+    # None when no bench-cost periods overlap the requested month (e.g. the
+    # current month before any data has been generated) — the UI shows "—"
+    # instead of a misleading €0.
+    total_bench_cost: Optional[float] = None
     employee_count: int
     currency: str
 

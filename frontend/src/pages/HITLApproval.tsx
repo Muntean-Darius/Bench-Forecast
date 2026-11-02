@@ -5,6 +5,8 @@ import { marginColor } from '../types'
 import { format } from 'date-fns'
 import { api } from '../api/client'
 import { useAuth } from '../contexts/AuthContext'
+import { useCostVisibility, maskCost, maskAmount } from '../hooks/useCostVisibility'
+import { CostVisibilityToggle } from '../components/shared/CostVisibilityToggle'
 import {
   CheckIcon,
   CloseIcon,
@@ -28,6 +30,7 @@ interface FinancialProjectionProps {
   margin: number
   targetMargin: number
   hoursPerMonth?: number
+  showRates: boolean
 }
 
 function FinancialProjectionCard({
@@ -36,6 +39,7 @@ function FinancialProjectionCard({
   margin,
   targetMargin,
   hoursPerMonth = 160,
+  showRates,
 }: FinancialProjectionProps) {
   const delta = margin - targetMargin
   const isHealthy = delta >= 0
@@ -81,20 +85,20 @@ function FinancialProjectionCard({
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Internal Cost Rate</p>
-          <p className="text-2xl font-bold font-mono text-red-600 mt-1">€{costRate.toFixed(2)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
+          <p className="text-2xl font-bold font-mono text-red-600 mt-1">{maskCost(costRate, showRates)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
           <p className="text-[11px] text-gray-400 mt-1">Loaded salary + overhead</p>
         </div>
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Hourly Gross Spread</p>
-          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">€{marginPerHour.toFixed(2)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
+          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">{maskCost(marginPerHour, showRates)}<span className="text-xs text-gray-500 font-normal">/h</span></p>
           <p className="text-[11px] text-gray-400 mt-1">Net profit contribution / hr</p>
         </div>
 
         <div className="bg-gray-50/70 p-3.5 rounded border border-gray-100">
           <p className="text-[10px] font-mono uppercase tracking-wider text-gray-500">Monthly Net Profit</p>
-          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">€{monthlyProfit.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })}<span className="text-xs text-gray-500 font-normal">/mo</span></p>
-          <p className="text-[11px] text-gray-400 mt-1">Cost: €{monthlyCost.toLocaleString('en-US', { maximumFractionDigits: 0 })} · Rev: €{monthlyRevenue.toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo</p>
+          <p className="text-2xl font-bold font-mono text-gray-900 mt-1">{maskAmount(monthlyProfit, showRates)}<span className="text-xs text-gray-500 font-normal">/mo</span></p>
+          <p className="text-[11px] text-gray-400 mt-1">Cost: {maskAmount(monthlyCost, showRates)} · Rev: €{monthlyRevenue.toLocaleString('en-US', { maximumFractionDigits: 0 })}/mo</p>
         </div>
       </div>
 
@@ -135,9 +139,11 @@ export default function HITLApproval() {
   const navigate = useNavigate()
   const { state } = useLocation()
   const { user } = useAuth()
+  const { visible: showRates, toggle: toggleRates, canView: canViewRates } = useCostVisibility()
 
   const [decision, setDecision] = useState<'idle' | 'approved' | 'training' | 'rejected'>('idle')
   const [feedback, setFeedback] = useState('')
+  const [replacement, setReplacement] = useState<{ name: string; training: boolean; justification: string } | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [decisionStartTime] = useState<number>(Date.now())
@@ -229,6 +235,23 @@ export default function HITLApproval() {
   }, [id, proposal])
 
   const allocationId: string = state?.allocationId ?? id ?? ''
+
+  // After a rejection, the backend synchronously generates the replacement
+  // proposal (pending_manager_approval) for the same demand. Return to the
+  // queue automatically so the manager sees it — the queue refetches from the
+  // DB on mount. The old behaviour left the manager on a static popup and made
+  // it look like "nothing happened".
+  useEffect(() => {
+    if (decision !== 'rejected') return
+    // Land on the SAME project filter the manager was reviewing, so the queue
+    // does not dump every project's stale proposals on them.
+    const projectId = proposal?.project?.id
+    const projectParam = projectId
+      ? `?project_id=${encodeURIComponent(String(projectId))}`
+      : ''
+    const timer = window.setTimeout(() => navigate(`/queue${projectParam}`), 2600)
+    return () => window.clearTimeout(timer)
+  }, [decision, navigate, proposal])
 
   if (!proposal) {
     return (
@@ -327,9 +350,37 @@ export default function HITLApproval() {
             }
           }
         } else if (action === 'rejected') {
+          // Do NOT swallow errors here: if the re-selection fails, the manager
+          // must see it instead of a false "re-evaluation triggered" popup.
+          await api.rejectAllocation(allocationId, user.id, feedback, timeToDecision)
+
+          // The backend synchronously creates the replacement proposal (same
+          // demand, pending_manager_approval). Fetch it now so the manager
+          // sees immediately that the feedback was applied — no full forecast
+          // re-run required.
           try {
-            await api.rejectAllocation(allocationId, user.id, feedback, timeToDecision)
-          } catch {}
+            const pending = await api.getPendingAllocations()
+            const demandId = role?.id ? String(role.id) : ''
+            const match = pending.find((a: any) => {
+              const sameDemand =
+                demandId && a.demand_id && String(a.demand_id) === demandId
+              const notRejected = String(a.id) !== String(allocationId)
+              return sameDemand && notRejected
+            })
+            if (match) {
+              const empName = match.employee
+                ? `${match.employee.first_name || ''} ${match.employee.last_name || ''}`.trim()
+                : 'a bench employee'
+              const isTraining = Boolean(match.ai_upskilling_path)
+              setReplacement({
+                name: empName,
+                training: isTraining,
+                justification: match.ai_justification || '',
+              })
+            }
+          } catch (fetchErr) {
+            console.error('Failed to fetch replacement proposal:', fetchErr)
+          }
         }
       } else if ((action === 'approved' || action === 'training') && emp?.id) {
         try {
@@ -385,11 +436,18 @@ export default function HITLApproval() {
           <p className="text-sm text-gray-600 mt-2 max-w-lg leading-relaxed">
             {decision === 'approved'  ? `${emp.full_name} is now successfully staffed to ${project.name} as ${role.title}.` :
              decision === 'training'  ? `Training pathway initiated for ${emp.full_name}. Staffing will take effect following upskilling milestones.` :
-                                        'Rejection feedback recorded. The engine is re-selecting a candidate for this role (or will recommend an external hire if none qualifies).' }
+                                        'Rejection feedback recorded. A replacement candidate has been re-selected for this role (or an external-hire recommendation raised). Returning to the action queue…' }
           </p>
           {decision === 'rejected' && feedback && (
             <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded text-xs text-gray-600 font-mono text-left max-w-md mx-auto">
               <strong>Manager Feedback:</strong> &ldquo;{feedback}&rdquo;
+            </div>
+          )}
+          {decision === 'rejected' && replacement && (
+            <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded text-xs text-gray-700 text-left max-w-md mx-auto">
+              <strong className="text-green-800">✓ New proposal generated for this demand:</strong>{' '}
+              {replacement.name} — {replacement.training ? 'upskilling / training allocation' : 'direct allocation'}.
+              <p className="mt-1 text-[11px] text-gray-600 line-clamp-3">{replacement.justification}</p>
             </div>
           )}
         </div>
@@ -430,6 +488,9 @@ export default function HITLApproval() {
         </div>
 
         <div className="flex items-center gap-3 text-xs font-mono text-gray-500">
+          {canViewRates && (
+            <CostVisibilityToggle visible={showRates} onToggle={toggleRates} />
+          )}
           <span className="bg-gray-100 px-2 py-0.5 rounded text-gray-600">{project.name}</span>
           <span>{createdAtStr}</span>
         </div>
@@ -497,7 +558,7 @@ export default function HITLApproval() {
                 {margin.toFixed(1)}% <span className="text-xs font-normal text-gray-400">(vs {targetMargin.toFixed(1)}% target)</span>
               </p>
               <p className="text-xs text-gray-500 mt-0.5">
-                Spread: €{(billRate - costRate).toFixed(2)}/hr net
+                Spread: {maskCost(billRate - costRate, showRates)}/hr net
               </p>
             </div>
 
@@ -592,7 +653,7 @@ export default function HITLApproval() {
               <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
                 <div className="p-2.5 bg-gray-50 rounded border border-gray-100">
                   <p className="text-[10px] font-mono text-gray-400 uppercase">Internal Hourly Cost</p>
-                  <p className="font-mono font-bold text-red-600 text-base mt-0.5">€{costRate.toFixed(2)}/h</p>
+                  <p className="font-mono font-bold text-red-600 text-base mt-0.5">{maskCost(costRate, showRates)}/h</p>
                 </div>
                 <div className="p-2.5 bg-gray-50 rounded border border-gray-100">
                   <p className="text-[10px] font-mono text-gray-400 uppercase">Total Experience</p>
@@ -684,6 +745,7 @@ export default function HITLApproval() {
           costRate={costRate}
           margin={margin}
           targetMargin={targetMargin}
+          showRates={showRates}
         />
 
         {/* ── Human-In-The-Loop Decision Suite ────────────────────────────────── */}

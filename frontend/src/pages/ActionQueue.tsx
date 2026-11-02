@@ -1,7 +1,8 @@
-import { useState, useEffect, useMemo } from 'react'
+﻿import { useState, useEffect, useMemo } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
+import { useAuth } from '../contexts/AuthContext'
 import { categoryBadge, marginColor, type ProposalCategory } from '../types'
 import type { HiringRecommendation } from '../types'
 import { format } from 'date-fns'
@@ -13,7 +14,52 @@ import {
   DirectEmotion,
   TrainingEmotion,
   HiringEmotion,
+  BrainIcon,
+  CheckIcon,
+  AlertIcon,
+  CloseIcon,
+  ClockIcon,
+  ClipboardIcon,
+  CoinsIcon,
+  TargetIcon,
 } from '../components/icons/Icons'
+
+type StepperStatus = 'pending' | 'active' | 'completed' | 'error'
+
+const FORECAST_STEPS: {
+  key: string
+  label: string
+  description: string
+  Icon: (props: { className?: string }) => JSX.Element
+}[] = [
+  {
+    key: 'data_extractor',
+    label: 'Data Extraction',
+    description: 'Scanning bench supply and open pipeline demand',
+    Icon: ClipboardIcon,
+  },
+  {
+    key: 'skill_matcher',
+    label: 'Semantic Skill Matching',
+    description: 'Embedding CVs and scoring candidate fit',
+    Icon: BrainIcon,
+  },
+  {
+    key: 'allocation_decider',
+    label: 'Margin & Capacity Optimization',
+    description: 'Balancing billable utilisation, margin and remaining hours',
+    Icon: CoinsIcon,
+  },
+  {
+    key: 'forecast_planner',
+    label: 'Plan Formulation',
+    description: 'Compiling allocation proposals and hiring recommendations',
+    Icon: TargetIcon,
+  },
+]
+
+const makeStepperSteps = () =>
+  FORECAST_STEPS.map((step) => ({ ...step, status: 'pending' as StepperStatus }))
 
 const CATEGORY_FILTERS: { value: ProposalCategory | 'all'; label: string }[] = [
   { value: 'all',      label: 'All Proposals' },
@@ -157,6 +203,7 @@ function allocationToProposal(a: any) {
 export default function ActionQueue() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
+  const { user } = useAuth()
 
   const [projects, setProjects] = useState<any[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<string>(
@@ -184,6 +231,12 @@ export default function ActionQueue() {
   const [runElapsed, setRunElapsed] = useState(0)
   const [fetchingPending, setFetchingPending] = useState(true)
   const [error, setError] = useState<string | null>(null)
+
+  // SSE Forecast Stepper
+  const [showStepper, setShowStepper] = useState(false)
+  const [stepperSteps, setStepperSteps] = useState(() => makeStepperSteps())
+  const [stepperDone, setStepperDone] = useState(false)
+  const [stepperError, setStepperError] = useState<string | null>(null)
 
   // Sync selectedProjectId with searchParams if URL changes
   useEffect(() => {
@@ -233,6 +286,17 @@ export default function ActionQueue() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Live elapsed timer while the forecast is running.
+  useEffect(() => {
+    if (!loading) return
+    const started = Date.now()
+    setRunElapsed(0)
+    const id = window.setInterval(() => {
+      setRunElapsed(Math.max(0, Math.floor((Date.now() - started) / 1000)))
+    }, 1000)
+    return () => window.clearInterval(id)
+  }, [loading])
+
   async function handleDismissHiring(id: string) {
     try {
       await api.dismissHiring(id)
@@ -242,27 +306,47 @@ export default function ActionQueue() {
     }
   }
 
+  // Admin utility: purge every stale pending proposal + open hiring
+  // recommendation (e.g. leftovers from interrupted test runs) without
+  // executing a full forecast.
+  async function handleClearQueue() {
+    if (
+      !window.confirm(
+        'Delete ALL pending allocation proposals and open hiring recommendations? ' +
+        'This cannot be undone.'
+      )
+    ) {
+      return
+    }
+    try {
+      const res = await api.clearPendingQueue()
+      await refreshQueue()
+      window.alert(
+        `Queue cleared: ${res.cleared_allocations} proposal(s), ` +
+        `${res.cleared_hiring_recommendations} hiring recommendation(s).`
+      )
+    } catch (e) {
+      console.error('Failed to clear the pending queue:', e)
+      window.alert('Failed to clear the queue. Check the browser console.')
+    }
+  }
+
   const selectedProjectObj = useMemo(() => {
     if (selectedProjectId === 'all') return null
     return projects.find((p) => p.id === selectedProjectId) || null
   }, [projects, selectedProjectId])
 
-  // The planner runs as a long background job; poll until it finishes. No
-  // artificial cap — a local model can legitimately take several minutes.
-  async function waitForRun(runId: string) {
-    const start = Date.now()
-    for (;;) {
-      const run = await api.getForecastRun(runId)
-      if (run.status === 'paused_for_review' || run.status === 'completed') return
-      if (run.status === 'failed') throw new Error('Forecast run failed — check the backend logs')
-      setRunElapsed(Math.round((Date.now() - start) / 1000))
-      await new Promise((r) => setTimeout(r, 2500))
-    }
+  function resetStepper() {
+    setStepperSteps(makeStepperSteps())
+    setStepperDone(false)
+    setStepperError(null)
   }
 
   async function handleRunForecast() {
     setLoading(true)
     setError(null)
+    resetStepper()
+    setShowStepper(true)
     setRunElapsed(0)
     try {
       const horizonDays = Number(localStorage.getItem('bf_horizon_days') ?? 90)
@@ -270,18 +354,70 @@ export default function ActionQueue() {
       const targetProjId = selectedProjectId !== 'all' ? selectedProjectId : undefined
 
       const res = await api.runForecast(horizonDays, targetProjId, minWinProb)
-
       setForecastRunId(res.forecast_run_id)
       sessionStorage.setItem('bf_cached_forecast_run_id', res.forecast_run_id)
 
-      await waitForRun(res.forecast_run_id)
+      const streamUrl = api.getForecastStreamUrl(res.forecast_run_id)
+      const es = new EventSource(streamUrl)
+      let settled = false
 
-      // Refresh pending allocations + hiring recommendations from the database
-      await refreshQueue()
+      const closeStream = () => {
+        settled = true
+        es.close()
+      }
+
+      es.addEventListener('step', (e: any) => {
+        try {
+          const data = JSON.parse(e.data)
+          const status: StepperStatus = data.status === 'completed' ? 'completed' : 'active'
+          setStepperSteps((steps) => {
+            const stepIdx = FORECAST_STEPS.findIndex((s) => s.key === data.step)
+            return steps.map((s, sIdx) => {
+              if (s.key === data.step) return { ...s, status }
+              if (status === 'active' && sIdx < stepIdx) return { ...s, status: 'completed' }
+              if (status === 'completed' && sIdx > stepIdx && s.status === 'active') {
+                return { ...s, status: 'pending' }
+              }
+              return s
+            })
+          })
+        } catch (err) {
+          console.error('Error parsing SSE step event:', err)
+        }
+      })
+
+      es.addEventListener('complete', () => {
+        if (settled) return
+        closeStream()
+        setStepperSteps((steps) => steps.map((s) => ({ ...s, status: 'completed' })))
+        setStepperDone(true)
+        setLoading(false)
+        refreshQueue()
+      })
+
+      es.addEventListener('error', (e: any) => {
+        if (settled) return
+        closeStream()
+        let msg = 'Connection to forecast stream lost'
+        try {
+          if (e?.data) {
+            const data = JSON.parse(e.data)
+            msg = data.error || msg
+          }
+        } catch {
+          // ignore malformed payloads
+        }
+        setStepperError(msg)
+        setError(msg)
+        setStepperSteps((steps) =>
+          steps.map((s) => (s.status === 'active' ? { ...s, status: 'error' } : s))
+        )
+        setLoading(false)
+      })
     } catch (e: any) {
       console.error(e)
       setError(e.message ?? 'Failed to run forecast')
-    } finally {
+      setStepperError(e.message ?? 'Failed to run forecast')
       setLoading(false)
     }
   }
@@ -316,20 +452,20 @@ export default function ActionQueue() {
   const showProposals = catFilter === 'all' || catFilter === 'direct' || catFilter === 'training'
   const showHiring = catFilter === 'all' || catFilter === 'hiring'
 
+  const activeStepIndex = stepperSteps.findIndex((s) => s.status === 'active')
+  const completedStepCount = stepperSteps.filter((s) => s.status === 'completed').length
+  const stepPosition = Math.min(
+    stepperSteps.length,
+    activeStepIndex >= 0 ? activeStepIndex + 1 : completedStepCount + 1,
+  )
+
   return (
     <div className="p-6 flex flex-col gap-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-lg font-semibold text-gray-900">AI Action Queue</h1>
-          <p className="text-xs text-gray-500 font-mono mt-0.5">
-            Prioritized allocation proposals pending human review · Scoped per project
-          </p>
-        </div>
+        <h1 className="text-lg font-semibold text-gray-900 shrink-0">AI Action Queue</h1>
 
-        <div className="flex items-center gap-3 flex-wrap">
-          {error && <span className="text-xs text-red-600 font-mono">{error}</span>}
-
+        <div className="flex items-center gap-3">
           {/* Project Selector Dropdown */}
           <div className="flex items-center gap-2 bg-white border border-gray-300 rounded-md px-3 py-1.5 shadow-sm">
             <span className="text-xs font-mono uppercase text-gray-400 font-semibold">Project:</span>
@@ -364,27 +500,47 @@ export default function ActionQueue() {
           <button
             onClick={handleRunForecast}
             disabled={loading}
-            className="btn-primary flex items-center gap-1.5 cursor-pointer text-xs"
+            title={
+              selectedProjectObj
+                ? `Run forecast for ${selectedProjectObj.name}`
+                : 'Run forecast for all projects'
+            }
+            className="btn-primary flex items-center justify-center gap-1.5 cursor-pointer text-xs whitespace-nowrap shrink-0 min-w-[9.5rem] px-3 py-1.5"
           >
             {loading ? (
               <>
-                <SpinnerIcon className="w-3.5 h-3.5" />
-                <span>Running Forecast Agent… {runElapsed > 0 ? `(${runElapsed}s)` : ''}</span>
-              </>
-            ) : selectedProjectObj ? (
-              <>
-                <PlayIcon className="w-3 h-3 text-white" />
-                <span>Run Forecast: {selectedProjectObj.name}</span>
+                <SpinnerIcon className="w-3.5 h-3.5 animate-spin" />
+                <span>Running…</span>
               </>
             ) : (
               <>
                 <PlayIcon className="w-3 h-3 text-white" />
-                <span>Run Forecast (All Projects)</span>
+                <span>Run Forecast</span>
               </>
             )}
           </button>
+
+          {user?.role === 'admin' && (
+            <button
+              onClick={handleClearQueue}
+              disabled={loading}
+              title="Delete all stale pending proposals and hiring recommendations"
+              className="btn-ghost flex items-center gap-1.5 cursor-pointer text-xs text-red-600 border border-red-200 rounded-md px-3 py-1.5 hover:bg-red-50 whitespace-nowrap shrink-0"
+            >
+              <CloseIcon className="w-3.5 h-3.5" />
+              <span>Clear Queue</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Error banner — rendered outside the button row so it never shifts
+          the controls when it appears. */}
+      {error && (
+        <div className="text-xs text-red-600 font-mono bg-red-50 border border-red-200 rounded-md px-3 py-2">
+          {error}
+        </div>
+      )}
 
       {/* Summary buckets */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -610,6 +766,205 @@ export default function ActionQueue() {
                 </div>
               ))
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Forecast Stepper Modal */}
+      {showStepper && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="forecast-stepper-title"
+        >
+          <div className="w-full max-w-xl overflow-hidden rounded-lg border border-gray-200 bg-white shadow-xl">
+            {/* Header */}
+            <div className="border-b border-gray-200 px-6 py-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="flex items-start gap-3">
+                  <span
+                    className={clsx(
+                      'mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border',
+                      stepperError
+                        ? 'border-red-200 bg-red-50 text-red-600'
+                        : stepperDone
+                          ? 'border-green-200 bg-green-50 text-green-600'
+                          : 'border-blue-200 bg-blue-50 text-blue-600',
+                    )}
+                  >
+                    {stepperError ? (
+                      <AlertIcon className="h-4 w-4" />
+                    ) : stepperDone ? (
+                      <CheckIcon className="h-4 w-4" />
+                    ) : (
+                      <BrainIcon className="h-4 w-4" />
+                    )}
+                  </span>
+                  <div>
+                    <h2 id="forecast-stepper-title" className="text-sm font-semibold text-gray-900">
+                      {stepperError
+                        ? 'Forecast failed'
+                        : stepperDone
+                          ? 'Forecast complete'
+                          : 'Running forecast'}
+                    </h2>
+                    <p className="mt-0.5 text-xs text-gray-500">
+                      {selectedProjectObj ? selectedProjectObj.name : 'All projects'}
+                      <span className="mx-1.5 text-gray-300">·</span>
+                      {stepperDone
+                        ? 'Proposals ready for review'
+                        : stepperError
+                          ? 'Run stopped'
+                          : `Step ${stepPosition} of ${stepperSteps.length}`}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="tabnum inline-flex items-center gap-1.5 rounded border border-gray-200 bg-gray-50 px-2.5 py-1 text-[11px] font-medium text-gray-600">
+                    <ClockIcon className="h-3.5 w-3.5" />
+                    {runElapsed}s
+                  </span>
+                  {(stepperDone || stepperError) && (
+                    <button
+                      onClick={() => setShowStepper(false)}
+                      aria-label="Close forecast progress"
+                      className="rounded p-1 text-gray-400 transition hover:bg-gray-100 hover:text-gray-600"
+                    >
+                      <CloseIcon className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Steps */}
+            <div className="px-6 py-5">
+              <ol className="flex flex-col">
+                {stepperSteps.map((step, idx) => {
+                  const isLast = idx === stepperSteps.length - 1
+                  const StatusIcon = step.Icon
+                  return (
+                    <li key={step.key} className="relative flex gap-3 pb-4 last:pb-0">
+                      {!isLast && (
+                        <span
+                          className={clsx(
+                            'absolute left-[13px] top-8 h-[calc(100%-2rem)] w-px',
+                            step.status === 'completed' ? 'bg-green-200' : 'bg-gray-200',
+                          )}
+                        />
+                      )}
+                      <span
+                        className={clsx(
+                          'relative z-10 mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border',
+                          step.status === 'completed'
+                            ? 'border-green-200 bg-green-50 text-green-600'
+                            : step.status === 'active'
+                              ? 'border-blue-200 bg-blue-50 text-blue-600'
+                              : step.status === 'error'
+                                ? 'border-red-200 bg-red-50 text-red-600'
+                                : 'border-gray-200 bg-white text-gray-400',
+                        )}
+                      >
+                        {step.status === 'completed' ? (
+                          <CheckIcon className="h-3.5 w-3.5" />
+                        ) : step.status === 'active' ? (
+                          <SpinnerIcon className="h-3.5 w-3.5" />
+                        ) : step.status === 'error' ? (
+                          <AlertIcon className="h-3.5 w-3.5" />
+                        ) : (
+                          <StatusIcon className="h-3.5 w-3.5" />
+                        )}
+                      </span>
+                      <div className="min-w-0 flex-1 pt-0.5">
+                        <div className="flex items-center justify-between gap-3">
+                          <p
+                            className={clsx(
+                              'text-xs font-semibold',
+                              step.status === 'completed'
+                                ? 'text-gray-700'
+                                : step.status === 'active'
+                                  ? 'text-gray-900'
+                                  : step.status === 'error'
+                                    ? 'text-red-700'
+                                    : 'text-gray-400',
+                            )}
+                          >
+                            {step.label}
+                          </p>
+                          <span
+                            className={clsx(
+                              'shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium',
+                              step.status === 'completed'
+                                ? 'border-green-200 bg-green-50 text-green-700'
+                                : step.status === 'active'
+                                  ? 'border-blue-200 bg-blue-50 text-blue-700'
+                                  : step.status === 'error'
+                                    ? 'border-red-200 bg-red-50 text-red-700'
+                                    : 'border-gray-200 bg-gray-50 text-gray-500',
+                            )}
+                          >
+                            {step.status === 'completed'
+                              ? 'Done'
+                              : step.status === 'active'
+                                ? 'Running'
+                                : step.status === 'error'
+                                  ? 'Failed'
+                                  : 'Queued'}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-[11px] leading-relaxed text-gray-500">
+                          {step.description}
+                        </p>
+                        {step.status === 'active' && (
+                          <div className="mt-2 h-1 overflow-hidden rounded-full bg-gray-100">
+                            <div className="h-full w-3/5 animate-pulse rounded-full bg-blue-500" />
+                          </div>
+                        )}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ol>
+            </div>
+
+            {/* Footer */}
+            <div className="border-t border-gray-200 px-6 py-4">
+              {stepperError ? (
+                <div className="flex items-center justify-between gap-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  <span className="flex items-center gap-1.5">
+                    <AlertIcon className="h-3.5 w-3.5" /> {stepperError}
+                  </span>
+                  <button
+                    onClick={() => setShowStepper(false)}
+                    className="btn-ghost cursor-pointer px-3 py-1 text-xs"
+                  >
+                    Close
+                  </button>
+                </div>
+              ) : stepperDone ? (
+                <div className="flex items-center justify-between gap-3 rounded border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="flex items-center gap-1.5">
+                      <CheckIcon className="h-3.5 w-3.5" /> Proposals ready for review
+                    </span>
+                    <span className="text-[10px] text-green-700">
+                      {counts.direct} direct · {counts.training} training · {counts.hiring} hiring
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => setShowStepper(false)}
+                    className="btn-primary cursor-pointer px-3 py-1 text-xs"
+                  >
+                    View proposals
+                  </button>
+                </div>
+              ) : (
+                <p className="text-[11px] text-gray-500">
+                  The forecast may take a few minutes. You can leave this window open.
+                </p>
+              )}
+            </div>
           </div>
         </div>
       )}

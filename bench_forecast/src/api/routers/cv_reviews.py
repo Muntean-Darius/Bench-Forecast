@@ -16,6 +16,7 @@ from src.api.deps import (
     manager_employee_id,
     require_roles,
 )
+from src.core.observability import workflow
 from src.database.database import get_db
 from src.database.models import CvApprovalStatusEnum, CvReviewRequest, Employee
 from src.schemas.cv import CvApproveRequest, CvRejectRequest
@@ -155,6 +156,7 @@ async def cv_review_detail(
 
 
 @router.post("/cv-reviews/{review_id}/approve", status_code=status.HTTP_200_OK)
+@workflow(name="cv-review-approval", version="v2", context={"entrypoint": "cv-approval"})
 async def approve_cv_review(
     review_id: uuid.UUID,
     background_tasks: BackgroundTasks,

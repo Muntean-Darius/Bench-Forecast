@@ -38,6 +38,18 @@ class State(TypedDict, total=False):
     skill_matches: List[Dict[str, Any]]        # LLM match results with RAG context
     decisions: List[Any] # Per-role financial allocation decisions
 
+    # -- Rejection Memory (set by data_extractor_node, consumed by the decider) --
+    # Maps demand_id → employee_ids previously rejected by a manager for that
+    # demand. Ensures "Reject & Re-run AI" and fresh forecast runs never
+    # re-propose a candidate the manager already declined.
+    rejected_by_demand: Dict[str, List[str]]
+    # Maps demand_id → skills named in rejection feedback, treated as hard
+    # requirements for that demand's next proposal.
+    feedback_skills_by_demand: Dict[str, List[str]]
+    # Open demands excluded from the plan + the reason (win probability,
+    # horizon, scope). Persisted into decision_metrics for observability.
+    skipped_demands: List[Dict[str, Any]]
+
     # -- Planning Layer --
     recommendations: Optional[Dict[str, Any]]  # Current allocation plan (aggregate)
 

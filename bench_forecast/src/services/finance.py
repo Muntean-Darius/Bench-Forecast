@@ -300,7 +300,10 @@ def get_monthly_bench_burn(
 
     row = db.execute(stmt).first()
 
-    total = row.total_cost if row and row.total_cost else Decimal("0.00")
+    # When no period overlaps the month there is genuinely no data yet — return
+    # None (instead of 0.0) so dashboards can show "—" rather than a false zero
+    # for the current month.
+    total = row.total_cost if row and row.total_cost else None
     emp_count = row.employee_count if row and row.employee_count else 0
     currency = "EUR"
 
@@ -309,7 +312,7 @@ def get_monthly_bench_burn(
         "month": month,
         "period_start": str(first_day),
         "period_end": str(last_day),
-        "total_bench_cost": float(total),
+        "total_bench_cost": float(total) if total is not None else None,
         "employee_count": emp_count,
         "currency": currency,
     }

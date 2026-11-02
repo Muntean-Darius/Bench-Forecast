@@ -80,13 +80,14 @@ async def execute_forecast_run(
     (LangGraph nodes, LLM/TOOL/RETRIEVER spans) is captured automatically by the
     SDK's instrumentors.
     """
-    model_name = (
-        Config.GROQ_MODEL
-        if Config.LLM_PROVIDER == "groq"
-        else Config.LLM_MODEL
-        if Config.LLM_PROVIDER == "openai_compatible"
-        else Config.OLLAMA_MODEL
-    )
+    if Config.LLM_PROVIDER == "groq":
+        model_name = Config.GROQ_MODEL
+    elif Config.LLM_PROVIDER == "deepseek":
+        model_name = Config.DEEPSEEK_MODEL
+    elif Config.LLM_PROVIDER == "openai_compatible":
+        model_name = Config.LLM_MODEL
+    else:
+        model_name = Config.OLLAMA_MODEL
     context = {
         "horizon_days": horizon_days,
         "min_win_probability": min_win_probability,
@@ -136,9 +137,43 @@ async def _execute_forecast_run(
         "open_demands": [],
         "skill_matches": [],
         "decisions": [],
+        "rejected_by_demand": {},
+        "feedback_skills_by_demand": {},
+        "skipped_demands": [],
     }
 
     try:
+        # Clear the slate BEFORE planning: delete stale pending proposals for
+        # this run's scope. Doing this first (rather than after the graph ran,
+        # as in earlier versions) prevents leftover pending reservations from
+        # polluting ``remaining_daily_hours`` during candidate selection — the
+        # bug where a strong candidate was invisible to the decider on one run
+        # (demand flipped to external hire) yet got staffed on the next run.
+        async with AsyncSessionLocal() as db:
+            old_allocs_stmt = select(Allocation).where(
+                Allocation.status.in_([
+                    AllocationStatusEnum.pending_manager_approval,
+                    AllocationStatusEnum.proposed_by_ai,
+                ])
+            )
+            if project_id:
+                old_allocs_stmt = (
+                    old_allocs_stmt
+                    .join(ProjectDemand, Allocation.demand_id == ProjectDemand.id)
+                    .where(ProjectDemand.project_id == project_id)
+                )
+            old_allocs = (await db.execute(old_allocs_stmt)).scalars().all()
+            for old_a in old_allocs:
+                await db.delete(old_a)
+            if old_allocs:
+                await db.commit()
+                logger.info(
+                    "Forecast run %s: cleared %d stale pending proposal(s) "
+                    "before planning",
+                    forecast_run_id,
+                    len(old_allocs),
+                )
+
         graph = build_forecast_graph()
         logger.info(f"Invoking forecast planner for run {forecast_run_id}")
         with span(
@@ -156,25 +191,6 @@ async def _execute_forecast_run(
         bench_employees = result_state.get("bench_employees", [])
 
         async with AsyncSessionLocal() as db:
-            # Replace stale pending proposals for the target scope.
-            old_allocs_stmt = select(Allocation).where(
-                Allocation.status.in_([
-                    AllocationStatusEnum.pending_manager_approval,
-                    AllocationStatusEnum.proposed_by_ai,
-                ])
-            )
-            if project_id:
-                old_allocs_stmt = (
-                    old_allocs_stmt
-                    .join(ProjectDemand, Allocation.demand_id == ProjectDemand.id)
-                    .where(ProjectDemand.project_id == project_id)
-                )
-            old_allocs = (await db.execute(old_allocs_stmt)).scalars().all()
-            for old_a in old_allocs:
-                await db.delete(old_a)
-            if old_allocs:
-                await db.flush()
-
             bench_ids_set = {str(b["id"]) for b in bench_employees if b.get("id")}
 
             for demand in open_demands:
@@ -295,6 +311,8 @@ async def _execute_forecast_run(
                     mix[a] += 1
             if Config.LLM_PROVIDER == "groq":
                 model_name = Config.GROQ_MODEL
+            elif Config.LLM_PROVIDER == "deepseek":
+                model_name = Config.DEEPSEEK_MODEL
             elif Config.LLM_PROVIDER == "openai_compatible":
                 model_name = Config.LLM_MODEL
             else:
@@ -313,6 +331,7 @@ async def _execute_forecast_run(
                     "demands": len(open_demands),
                     "bench": len(bench_employees),
                     "skill_matches": len(result_state.get("skill_matches", [])),
+                    "skipped_demands": result_state.get("skipped_demands", []),
                     # Full plan (deterministic summary + advisory alternatives)
                     # retained for audit/HITL context.
                     "plan": result_state.get("recommendations", {}),
@@ -320,6 +339,17 @@ async def _execute_forecast_run(
                 run.latency_seconds = Decimal(str(round(time.time() - started_at, 2)))
                 run.llm_provider = Config.LLM_PROVIDER
                 run.llm_model = model_name
+
+            skipped = result_state.get("skipped_demands", [])
+            if skipped:
+                logger.info(
+                    "Forecast run %s: %d open demand(s) skipped by filters — %s",
+                    forecast_run_id,
+                    len(skipped),
+                    "; ".join(
+                        f"{s.get('role')} [{s.get('reason')}]" for s in skipped
+                    ),
+                )
             await db.commit()
             logger.info(f"Forecast run {forecast_run_id} paused for review; proposals persisted.")
 

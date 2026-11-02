@@ -1,7 +1,7 @@
 """Configuration management for Bench Forecast backend.
 
 Handles environment variables with sensible defaults:
-- LLM provider toggle (groq or ollama, defaults to ollama)
+- LLM provider toggle (groq, deepseek, openai_compatible or ollama; defaults to ollama)
 - PostgreSQL database connection parameters
 - ChromaDB persistence directory
 - LangSmith tracing configuration
@@ -41,9 +41,14 @@ class Config:
     # -----------------------------------------------------------------------
     # LLM Configuration
     # -----------------------------------------------------------------------
-    LLM_PROVIDER: Literal["groq", "ollama", "openai_compatible"] = os.getenv("LLM_PROVIDER", "ollama")
+    LLM_PROVIDER: Literal["groq", "deepseek", "ollama", "openai_compatible"] = os.getenv("LLM_PROVIDER", "ollama")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    # DeepSeek exposes an OpenAI-compatible API. ``deepseek-chat`` is the fast
+    # general model; ``deepseek-reasoner`` is the slower reasoning model.
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama2")
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     # Shared generation settings. Lower temperature keeps JSON decisions stable.
@@ -117,6 +122,12 @@ class Config:
                     "GROQ_API_KEY is required when LLM_PROVIDER=groq. "
                     "Set it in .env or switch to LLM_PROVIDER=ollama for local inference."
                 )
+        elif cls.LLM_PROVIDER == "deepseek":
+            if not cls.DEEPSEEK_API_KEY:
+                raise ValueError(
+                    "DEEPSEEK_API_KEY is required when LLM_PROVIDER=deepseek. "
+                    "Set it in .env (or switch to LLM_PROVIDER=ollama)."
+                )
         elif cls.LLM_PROVIDER == "openai_compatible":
             missing = [
                 name for name, val in (
@@ -130,10 +141,10 @@ class Config:
                     "LLM_PROVIDER=openai_compatible requires "
                     f"{', '.join(missing)} to be set in .env."
                 )
-        elif cls.LLM_PROVIDER not in ("groq", "ollama", "openai_compatible"):
+        elif cls.LLM_PROVIDER not in ("groq", "deepseek", "ollama", "openai_compatible"):
             raise ValueError(
-                "LLM_PROVIDER must be 'groq', 'ollama' or 'openai_compatible', "
-                f"got '{cls.LLM_PROVIDER}'"
+                "LLM_PROVIDER must be 'groq', 'deepseek', 'ollama' or "
+                f"'openai_compatible', got '{cls.LLM_PROVIDER}'"
             )
 
         if cls.LANGCHAIN_TRACING_V2.lower() == "true" and not cls.LANGCHAIN_API_KEY:

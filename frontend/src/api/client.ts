@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Centralized API client for the FastAPI backend at /api/v1/...
  * Vite proxy forwards /api → http://localhost:8000 in development.
  */
@@ -52,9 +52,12 @@ async function parseError(res: Response): Promise<ApiError> {
 }
 
 // ─── Token helper ─────────────────────────────────────────────────────────────
+// Per-tab sessions: the JWT lives in sessionStorage, which is isolated per
+// browser tab. This allows several tabs to be logged in as different users at
+// the same time (a shared localStorage token would overwrite across tabs).
 
 function getToken(): string | null {
-  return localStorage.getItem('bf_token')
+  return sessionStorage.getItem('bf_token')
 }
 
 // ─── Core request wrapper ─────────────────────────────────────────────────────
@@ -242,6 +245,12 @@ export const api = {
   getPendingAllocations: () =>
     request<any[]>('/allocations/pending'),
 
+  clearPendingQueue: () =>
+    request<{ cleared_allocations: number; cleared_hiring_recommendations: number }>(
+      '/allocations/clear-queue',
+      { method: 'POST' }
+    ),
+
   approveAllocation: (allocationId: string, reviewerId: string, timeToDecision: number) =>
     request<any>(`/allocations/${allocationId}/approve`, {
       method: 'POST',
@@ -366,4 +375,67 @@ export const api = {
 
   getProjectBudget: (projectId: string) =>
     request<any>(`/finance/projects/${projectId}/budget`),
+
+  // -- Project creation -------------------------------------------------------
+  createProject: (payload: {
+    name: string
+    client_name?: string
+    status?: string
+    probability?: number
+    target_margin?: number
+    total_budget?: number
+    start_date?: string | null
+    end_date?: string | null
+    initial_demands?: {
+      role: string
+      description?: string
+      required_skills?: string[]
+      headcount_needed?: number
+      target_bill_rate?: number | null
+      needed_by_date?: string | null
+    }[]
+  }) =>
+    request<any>('/projects', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // -- Employee creation -------------------------------------------------------
+  createEmployee: (payload: {
+    first_name: string
+    last_name: string
+    email: string
+    job_title: string
+    experience_level?: string
+    employment_type?: string
+    bench_status?: string
+    hourly_cost_rate?: number
+    skills?: string[]
+    location?: string
+  }) =>
+    request<any>('/employees', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // -- Manager management (admin only) ----------------------------------------
+  getManagers: () =>
+    request<any[]>('/admin/managers'),
+
+  createManager: (payload: {
+    full_name: string
+    email: string
+    username: string
+    password: string
+    department_id?: string | null
+    employee_id?: string | null
+  }) =>
+    request<any>('/admin/managers', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // -- Forecast SSE stream URL -------------------------------------------------
+  getForecastStreamUrl: (runId: string) =>
+    `${BASE}/forecast/runs/${runId}/stream?token=${encodeURIComponent(getToken() || '')}`,
 }

@@ -28,7 +28,11 @@ export function useAuth() {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
-  const [token, setToken] = useState<string | null>(localStorage.getItem('bf_token'))
+  // Per-tab sessions: the JWT lives in sessionStorage so multiple tabs can be
+  // logged in as DIFFERENT users simultaneously. localStorage would share one
+  // token across every tab — logging in as another user in one tab silently
+  // re-identifies all other tabs on their next refresh.
+  const [token, setToken] = useState<string | null>(sessionStorage.getItem('bf_token'))
   const [isLoading, setIsLoading] = useState(true)
 
   useEffect(() => {
@@ -46,7 +50,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setIsLoading(false)
         })
         .catch(() => {
-          localStorage.removeItem('bf_token')
+          sessionStorage.removeItem('bf_token')
+          sessionStorage.removeItem('bf_show_cost_rates')
           setToken(null)
           setUser(null)
           setIsLoading(false)
@@ -65,7 +70,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
       if (!res.ok) return false
       const data = await res.json()
-      localStorage.setItem('bf_token', data.token)
+      sessionStorage.setItem('bf_token', data.token)
       setToken(data.token)
       setUser(data.user)
       return true
@@ -75,7 +80,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   const logout = () => {
-    localStorage.removeItem('bf_token')
+    sessionStorage.removeItem('bf_token')
+    sessionStorage.removeItem('bf_show_cost_rates')
     setToken(null)
     setUser(null)
   }

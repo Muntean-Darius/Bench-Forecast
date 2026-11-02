@@ -157,8 +157,14 @@ async def test_propose_replacement_recommends_hire_when_no_candidates():
 
 
 @pytest.mark.asyncio
-async def test_propose_replacement_honours_feedback_skill_requirement():
-    """A feedback skill nobody has (e.g. Go) must trigger an external hire."""
+async def test_propose_replacement_uses_feedback_skill_in_upskilling_path():
+    """A feedback skill nobody fully holds must NOT kill the replacement.
+
+    The old behaviour turned "I want someone who already knows Go" into an
+    external-hire recommendation and left the queue empty until a full
+    forecast re-run. The new behaviour proposes the best partial match with a
+    training path that covers the mandated skill.
+    """
     session = AsyncMock()
     service = HITLService(session)
 
@@ -171,6 +177,7 @@ async def test_propose_replacement_honours_feedback_skill_requirement():
         status=DemandStatusEnum.open,
         headcount_needed=1,
         required_skills=["Kubernetes", "Terraform"],
+        target_bill_rate=Decimal("150.00"),
     )
     rejected = _allocation_with_feedback(
         demand_id, "I want someone who already knows Go"
@@ -189,8 +196,21 @@ async def test_propose_replacement_honours_feedback_skill_requirement():
 
     replacement = await service._propose_replacement(rejected)
 
-    assert replacement is None
+    # A fresh proposal must exist for the same demand — never a silent
+    # external-hire-only outcome while a candidate has remaining hours.
+    assert replacement is not None
+    assert replacement.employee_id == candidate.id
+    assert replacement.demand_id == demand_id
+    assert replacement.status == AllocationStatusEnum.pending_manager_approval
+
+    # The mandated skill is honoured through the upskilling path and the
+    # justification visibly references the manager's feedback.
+    assert replacement.ai_upskilling_path is not None
+    assert "Go" in replacement.ai_upskilling_path
+    assert "Revised per manager feedback" in replacement.ai_justification
+    assert "Mandated skill(s) Go" in replacement.ai_justification
+
     added = [c.args[0] for c in session.add.call_args_list]
-    recs = [obj for obj in added if isinstance(obj, HiringRecommendation)]
-    assert recs, "Expected an external-hire recommendation for the missing Go skill"
-    assert "Go" in recs[0].required_skills
+    assert not any(
+        isinstance(obj, HiringRecommendation) for obj in added
+    ), "No external hire should be recommended while a bench candidate has hours"

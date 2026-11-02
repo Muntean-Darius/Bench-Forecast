@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api/client'
 import { useAuth } from '../contexts/AuthContext'
 import type { CvReviewSummary, CvStatusState, TeamMember } from '../types'
@@ -30,6 +30,15 @@ export default function Team() {
   const [reviews, setReviews] = useState<CvReviewSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [showAddEmployee, setShowAddEmployee] = useState(false)
+  const [empForm, setEmpForm] = useState({
+    first_name: '', last_name: '', email: '', job_title: '',
+    experience_level: 'mid', employment_type: 'full_time',
+    bench_status: 'bench', hourly_cost_rate: 65, skills: '', location: 'Bucharest',
+  })
+  const [empSubmitting, setEmpSubmitting] = useState(false)
+  const [empSuccess, setEmpSuccess] = useState<string | null>(null)
+  const [empError, setEmpError] = useState<string | null>(null)
   const [query, setQuery] = useState('')
 
   useEffect(() => {
@@ -103,6 +112,9 @@ export default function Team() {
         <div className="flex items-center gap-2">
           <span className="badge badge-gray">{team.length} people</span>
           <span className="badge badge-yellow">{summary.full} fully allocated</span>
+          <button onClick={() => setShowAddEmployee(true)} className="btn-primary text-xs">
+            + Add Employee
+          </button>
         </div>
       </div>
 
@@ -243,6 +255,120 @@ export default function Team() {
             </table>
           </div>
         )}
+      {/* Add Employee Modal */}
+      {showAddEmployee && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white border border-gray-200 shadow-xl w-full max-w-lg mx-4 p-6 flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-900">Add Employee</h2>
+              <button onClick={() => { setShowAddEmployee(false); setEmpSuccess(null); setEmpError(null) }} className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+            </div>
+            {empSuccess ? (
+              <div className="border border-green-200 bg-green-50 text-green-800 text-xs px-3 py-3">
+                <p className="font-semibold mb-1">&#x2713; Employee created</p>
+                <p>{empSuccess}</p>
+                <button onClick={() => { setShowAddEmployee(false); setEmpSuccess(null) }} className="mt-2 btn-primary text-xs">Close</button>
+              </div>
+            ) : (
+              <form onSubmit={async (e) => {
+                e.preventDefault()
+                setEmpSubmitting(true)
+                setEmpError(null)
+                try {
+                  const res = await api.createEmployee({
+                    first_name: empForm.first_name,
+                    last_name: empForm.last_name,
+                    email: empForm.email,
+                    job_title: empForm.job_title,
+                    experience_level: empForm.experience_level,
+                    employment_type: empForm.employment_type,
+                    bench_status: empForm.bench_status,
+                    hourly_cost_rate: empForm.hourly_cost_rate,
+                    skills: empForm.skills ? empForm.skills.split(',').map(s => s.trim()).filter(Boolean) : [],
+                    location: empForm.location,
+                  })
+                  setEmpSuccess(res.message || `Employee created. Login: "${res.username}"`)
+                  const updated = await api.getTeam()
+                  setTeam(updated)
+                } catch (err: any) {
+                  setEmpError(err?.message || 'Failed to create employee')
+                } finally {
+                  setEmpSubmitting(false)
+                }
+              }} className="flex flex-col gap-3">
+                {empError && <div className="text-xs text-red-600 border border-red-200 bg-red-50 px-3 py-2">{empError}</div>}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">First Name *</label>
+                    <input required value={empForm.first_name} onChange={e => setEmpForm(f => ({ ...f, first_name: e.target.value }))} placeholder="Ion" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Last Name *</label>
+                    <input required value={empForm.last_name} onChange={e => setEmpForm(f => ({ ...f, last_name: e.target.value }))} placeholder="Popescu" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-gray-700">Corporate Email *</label>
+                  <input required type="email" value={empForm.email} onChange={e => setEmpForm(f => ({ ...f, email: e.target.value }))} placeholder="i.popescu@company.com" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-gray-700">Job Title *</label>
+                  <input required value={empForm.job_title} onChange={e => setEmpForm(f => ({ ...f, job_title: e.target.value }))} placeholder="Senior Backend Engineer" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Seniority</label>
+                    <select value={empForm.experience_level} onChange={e => setEmpForm(f => ({ ...f, experience_level: e.target.value }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-white focus:outline-none focus:ring-1 focus:ring-gray-400">
+                      <option value="junior">Junior</option>
+                      <option value="mid">Mid</option>
+                      <option value="senior">Senior</option>
+                      <option value="lead">Lead</option>
+                      <option value="principal">Principal</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Employment</label>
+                    <select value={empForm.employment_type} onChange={e => setEmpForm(f => ({ ...f, employment_type: e.target.value }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-white focus:outline-none focus:ring-1 focus:ring-gray-400">
+                      <option value="full_time">Full Time</option>
+                      <option value="part_time">Part Time</option>
+                      <option value="contractor">Contractor</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Bench Status</label>
+                    <select value={empForm.bench_status} onChange={e => setEmpForm(f => ({ ...f, bench_status: e.target.value }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-white focus:outline-none focus:ring-1 focus:ring-gray-400">
+                      <option value="bench">Bench</option>
+                      <option value="on_project">On Project</option>
+                      <option value="upcoming_bench">Upcoming Bench</option>
+                      <option value="internal">Internal</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Hourly Cost (&#8364;/h)</label>
+                    <input type="number" min={0} value={empForm.hourly_cost_rate} onChange={e => setEmpForm(f => ({ ...f, hourly_cost_rate: Number(e.target.value) }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Location</label>
+                    <input value={empForm.location} onChange={e => setEmpForm(f => ({ ...f, location: e.target.value }))} placeholder="Bucharest" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-gray-700">Skills (comma-separated)</label>
+                  <input value={empForm.skills} onChange={e => setEmpForm(f => ({ ...f, skills: e.target.value }))} placeholder="Python, FastAPI, PostgreSQL, Docker" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                </div>
+                <div className="flex items-center gap-2 pt-2">
+                  <button type="submit" disabled={empSubmitting} className="btn-primary text-xs flex-1">
+                    {empSubmitting ? 'Creating\u2026' : 'Add Employee'}
+                  </button>
+                  <button type="button" onClick={() => setShowAddEmployee(false)} className="btn-ghost text-xs flex-1">Cancel</button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
       </div>
     </div>
   )

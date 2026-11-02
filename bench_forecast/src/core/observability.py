@@ -21,6 +21,11 @@ project:
                                     endpoint is configured, false otherwise
     AI_OBSERVABILITY_CAPTURE_PROMPTS  true to capture prompt/response payloads
     AI_OBSERVABILITY_LOOP_DETECTION   false to disable loop measurement
+    AI_OBSERVABILITY_PREFLIGHT        advisory startup reachability check
+                                    (AI_OBSERVABILITY_PREFLIGHT_STRICT=true
+                                    restores the old fail-fast behaviour)
+    AI_OBSERVABILITY_RAW_CLIENT_TRACING  opt in to raw Ollama/Groq client spans
+                                    on SDK versions older than 0.3.1
     AI_OBSERVABILITY_SERVICE_NAME     defaults to ``bench-forecast``
     OTEL_SERVICE_VERSION / OTEL_DEPLOYMENT_ENVIRONMENT are honoured as well.
 
@@ -33,6 +38,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import re
 from typing import Any, Callable, Optional
 from urllib.error import HTTPError
 from urllib.parse import urlparse
@@ -84,6 +90,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _version_tuple(value: str) -> tuple[int, ...]:
+    """Parse the leading ``X.Y.Z`` part of a version string."""
+    parts: list[int] = []
+    for token in re.split(r"[.+-]", value or ""):
+        if token.isdigit():
+            parts.append(int(token))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+def _sdk_has_builtin_raw_dedup() -> bool:
+    """SDK 0.3.1+ deduplicates ChatOllama/ChatGroq vs. raw client spans itself."""
+    version = getattr(_sdk, "__version__", "") if _sdk is not None else ""
+    return _version_tuple(str(version)) >= (0, 3, 1)
+
+
 def _endpoint_is_healthy(endpoint: str, timeout: float = 3.0) -> bool:
     """Return True when the collector answers with a non-5xx status.
 
@@ -126,14 +149,14 @@ def _warn_if_endpoint_is_this_api(endpoint: str) -> None:
 
 
 def _disable_raw_client_instrumentors() -> None:
-    """Avoid duplicate LLM spans for LangChain's Ollama/Groq chat wrappers.
+    """Avoid duplicate LLM spans on SDK versions older than 0.3.1.
 
     ``ChatOllama`` / ``ChatGroq`` call the raw ``ollama`` / ``groq`` clients
-    internally. The SDK instruments both layers, which would export two LLM
-    spans (and double the token/cost totals) for every LangChain call. This app
-    uses LangChain wrappers exclusively, so the raw interceptors are switched
-    off. Set ``AI_OBSERVABILITY_RAW_CLIENT_TRACING=true`` if you add direct
-    ``ollama``/``groq`` client calls.
+    internally. Older SDKs (<= 0.2.x) instrument both layers, which would export
+    two LLM spans (and double the token/cost totals) for every LangChain call.
+    SDK 0.3.1+ fixes this at the source, so this workaround is only applied on
+    old versions. Set ``AI_OBSERVABILITY_RAW_CLIENT_TRACING=true`` if you add
+    direct ``ollama``/``groq`` client calls.
     """
     targets = (
         ("openinference.instrumentation.ollama", "OllamaInstrumentor", "_ollama_instrumentor"),
@@ -204,18 +227,33 @@ def init_observability() -> bool:
         )
         return False
 
-    # Fail open when the collector is unreachable/unhealthy. Without this, the
-    # OTLP exporter retries every batch forever and floods the logs with
-    # timeouts while the app is otherwise healthy.
+    # Fail open when the collector is unreachable/unhealthy. The check is
+    # advisory: a cold or temporarily unreachable collector must not disable
+    # tracing for the whole process. The SDK's exporter reports failures via
+    # export_stats() and resumes exporting automatically once the collector is
+    # reachable again. Set AI_OBSERVABILITY_PREFLIGHT_STRICT=true for the old
+    # fail-fast behaviour.
     if endpoint and _env_bool("AI_OBSERVABILITY_PREFLIGHT", True):
         if not _endpoint_is_healthy(endpoint):
             logger.warning(
-                "AI observability endpoint %s is unreachable or unhealthy; "
-                "tracing disabled for this process. Fix the collector or set "
-                "AI_OBSERVABILITY_ENABLED=false to silence this check.",
+                "AI observability endpoint %s did not answer the startup "
+                "preflight; initialising anyway and reporting export health at "
+                "/health. Fix the collector or set AI_OBSERVABILITY_PREFLIGHT=false "
+                "to skip this check.",
                 endpoint,
             )
-            return False
+            if _env_bool("AI_OBSERVABILITY_PREFLIGHT_STRICT", False):
+                logger.warning(
+                    "AI_OBSERVABILITY_PREFLIGHT_STRICT=true; tracing disabled for this process"
+                )
+                return False
+
+    if not endpoint:
+        logger.warning(
+            "AI_OBSERVABILITY_ENDPOINT is not set; the SDK will use its default "
+            "http://localhost:6006 (Phoenix). Set the platform base URL to export "
+            "executions to the AI observability platform."
+        )
 
     # Cap exporter timeouts so a slow collector cannot hold a batch for 10s.
     os.environ.setdefault("OTEL_EXPORTER_OTLP_TIMEOUT", "5000")
@@ -256,7 +294,13 @@ def init_observability() -> bool:
         logger.exception("AI observability init failed; tracing disabled")
         return False
 
-    if not _env_bool("AI_OBSERVABILITY_RAW_CLIENT_TRACING", False):
+    if _sdk_has_builtin_raw_dedup():
+        logger.debug(
+            "AI observability SDK %s deduplicates LangChain/raw client spans; "
+            "keeping raw client instrumentors",
+            getattr(_sdk, "__version__", "unknown"),
+        )
+    elif not _env_bool("AI_OBSERVABILITY_RAW_CLIENT_TRACING", False):
         _disable_raw_client_instrumentors()
 
     _initialized = True
@@ -362,6 +406,8 @@ def observability_status() -> dict:
     """Compact health payload for the ``/health`` endpoint (no secrets)."""
     return {
         "sdk_available": _SDK_AVAILABLE,
+        "sdk_version": getattr(_sdk, "__version__", None),
+        "raw_dedup_native": _sdk_has_builtin_raw_dedup(),
         "enabled": _initialized,
         **export_stats(),
     }

@@ -64,6 +64,7 @@ from src.api.deps import (
     get_optional_user,
 )
 from src.core.config import Config
+from src.core.observability import workflow
 from src.database.database import get_db
 from src.database.models import (
     CvApprovalStatusEnum,
@@ -204,6 +205,7 @@ class DocumentMetadataResponse(BaseModel):
         "7. Updates `documents.chroma_doc_id` and sets `ingestion_status=ingested`"
     ),
 )
+@workflow(name="cv-ingestion", version="v2", context={"entrypoint": "cv-upload"})
 async def upload_cv(
     file: Annotated[UploadFile, File(description="CV PDF file")],
     employee_id: Annotated[str, Form(description="UUID of the employee this CV belongs to")],

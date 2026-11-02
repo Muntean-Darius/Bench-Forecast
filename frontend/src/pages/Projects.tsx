@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import type { ProjectSummary } from '../types'
@@ -19,6 +19,15 @@ export default function Projects() {
   const [error, setError] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
+  const [showNewProject, setShowNewProject] = useState(false)
+  const [newProj, setNewProj] = useState({
+    name: '', client_name: '', status: 'Pipeline',
+    probability: 75, target_margin: 35, total_budget: 0,
+    demand_role: '', demand_skills: '', demand_bill_rate: '',
+  })
+  const [projSubmitting, setProjSubmitting] = useState(false)
+  const [projSuccess, setProjSuccess] = useState<string | null>(null)
+  const [projError, setProjError] = useState<string | null>(null)
 
   useEffect(() => {
     api
@@ -60,6 +69,9 @@ export default function Projects() {
         <div className="flex items-center gap-2">
           <span className="badge badge-gray">{projects.length} projects</span>
           <span className="badge badge-yellow">{totals.open} open seats</span>
+          <button onClick={() => setShowNewProject(true)} className="btn-primary text-xs">
+            + New Project
+          </button>
         </div>
       </div>
 
@@ -184,6 +196,98 @@ export default function Projects() {
             </table>
           </div>
         )}
+      {/* New Project Modal */}
+      {showNewProject && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white border border-gray-200 shadow-xl w-full max-w-lg mx-4 p-6 flex flex-col gap-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-900">New Project</h2>
+              <button onClick={() => { setShowNewProject(false); setProjSuccess(null); setProjError(null) }} className="text-gray-400 hover:text-gray-600 text-lg">&times;</button>
+            </div>
+            {projSuccess ? (
+              <div className="border border-green-200 bg-green-50 text-green-800 text-xs px-3 py-3">
+                <p className="font-semibold">&#x2713; {projSuccess}</p>
+                <button onClick={() => { setShowNewProject(false); setProjSuccess(null) }} className="mt-2 btn-primary text-xs">Close</button>
+              </div>
+            ) : (
+              <form onSubmit={async (e) => {
+                e.preventDefault()
+                setProjSubmitting(true)
+                setProjError(null)
+                try {
+                  const initial_demands = newProj.demand_role ? [{
+                    role: newProj.demand_role,
+                    required_skills: newProj.demand_skills ? newProj.demand_skills.split(',').map(s => s.trim()).filter(Boolean) : [],
+                    target_bill_rate: newProj.demand_bill_rate ? Number(newProj.demand_bill_rate) : undefined,
+                  }] : []
+                  await api.createProject({
+                    name: newProj.name,
+                    client_name: newProj.client_name || undefined,
+                    status: newProj.status,
+                    probability: newProj.probability,
+                    target_margin: newProj.target_margin,
+                    total_budget: newProj.total_budget,
+                    initial_demands,
+                  })
+                  setProjSuccess(`Project "${newProj.name}" created successfully!`)
+                  const updated = await api.getProjects()
+                  setProjects(updated)
+                } catch (err: any) {
+                  setProjError(err?.message || 'Failed to create project')
+                } finally {
+                  setProjSubmitting(false)
+                }
+              }} className="flex flex-col gap-3">
+                {projError && <div className="text-xs text-red-600 border border-red-200 bg-red-50 px-3 py-2">{projError}</div>}
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-gray-700">Project Name *</label>
+                  <input required value={newProj.name} onChange={e => setNewProj(p => ({ ...p, name: e.target.value }))} placeholder="e.g. FinTech Core Banking" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-xs font-medium text-gray-700">Client Name</label>
+                  <input value={newProj.client_name} onChange={e => setNewProj(p => ({ ...p, client_name: e.target.value }))} placeholder="e.g. Acme Corp" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Status</label>
+                    <select value={newProj.status} onChange={e => setNewProj(p => ({ ...p, status: e.target.value }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-white focus:outline-none focus:ring-1 focus:ring-gray-400">
+                      <option>Pipeline</option>
+                      <option>Active</option>
+                      <option>Closed</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Win Probability (%)</label>
+                    <input type="number" min={0} max={100} value={newProj.probability} onChange={e => setNewProj(p => ({ ...p, probability: Number(e.target.value) }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Target Margin (%)</label>
+                    <input type="number" min={0} max={100} value={newProj.target_margin} onChange={e => setNewProj(p => ({ ...p, target_margin: Number(e.target.value) }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-xs font-medium text-gray-700">Total Budget (&#8364;)</label>
+                    <input type="number" min={0} value={newProj.total_budget} onChange={e => setNewProj(p => ({ ...p, total_budget: Number(e.target.value) }))} className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                </div>
+                <div className="border-t border-gray-100 pt-3">
+                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Initial Role (optional)</p>
+                  <div className="flex flex-col gap-2">
+                    <input value={newProj.demand_role} onChange={e => setNewProj(p => ({ ...p, demand_role: e.target.value }))} placeholder="Role title (e.g. Senior React Developer)" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                    <input value={newProj.demand_skills} onChange={e => setNewProj(p => ({ ...p, demand_skills: e.target.value }))} placeholder="Skills (comma-separated: React, TypeScript, Tailwind)" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                    <input type="number" value={newProj.demand_bill_rate} onChange={e => setNewProj(p => ({ ...p, demand_bill_rate: e.target.value }))} placeholder="Bill rate (&#8364;/h, optional)" className="w-full px-3 py-1.5 text-xs border border-gray-200 bg-gray-50 focus:outline-none focus:ring-1 focus:ring-gray-400" />
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 pt-2">
+                  <button type="submit" disabled={projSubmitting} className="btn-primary text-xs flex-1">
+                    {projSubmitting ? 'Creating\u2026' : 'Create Project'}
+                  </button>
+                  <button type="button" onClick={() => setShowNewProject(false)} className="btn-ghost text-xs flex-1">Cancel</button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
       </div>
     </div>
   )

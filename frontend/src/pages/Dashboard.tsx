@@ -78,7 +78,7 @@ interface CostMonth {
   year: number
   month: number
   label: string
-  total_bench_cost: number
+  total_bench_cost: number | null
   total_workforce_cost: number
 }
 
@@ -86,7 +86,12 @@ function FinancialHealthChart({ months }: { months: CostMonth[] }) {
   const chartData = months.map((m) => ({
     month: m.label,
     workforce: Math.round(m.total_workforce_cost),
-    bench: Math.round(m.total_bench_cost),
+    // null → Recharts renders a gap for months with no data yet, instead of
+    // a misleading plunge to €0.
+    bench:
+      m.total_bench_cost === null || m.total_bench_cost === undefined
+        ? null
+        : Math.round(m.total_bench_cost),
   }))
 
   return (

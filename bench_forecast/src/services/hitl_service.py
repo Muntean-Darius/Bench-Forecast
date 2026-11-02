@@ -469,27 +469,47 @@ class HITLService:
             })
             candidate_profiles.append((emp, profile))
 
-        # Apply the feedback's hard requirements (must possess ALL of them).
+        # Honour the manager's feedback. Candidates already holding ALL
+        # mandated skills are strongly preferred (hard requirement when
+        # satisfiable). But if nobody on the bench holds them, fall back to the
+        # best partial match with a training path that INCLUDES the mandated
+        # skills — so a rejection always surfaces a fresh proposal in the
+        # queue, instead of silently becoming an external-hire recommendation
+        # the manager only discovers after re-running the whole forecast.
         if feedback_skills:
-            _matched, missing_feedback, _cov = (None, [], None)
-            qualifying = []
+            full_matches = []
+            partial_matches = []
             for emp, profile in candidate_profiles:
-                _matched, missing_feedback, _cov = _match_skills(profile, feedback_skills)
-                if not missing_feedback:
-                    qualifying.append((emp, profile))
-            candidate_profiles = qualifying
+                _matched, missing_feedback, _cov = _match_skills(
+                    profile, feedback_skills
+                )
+                (full_matches if not missing_feedback else partial_matches).append(
+                    (emp, profile)
+                )
+            if full_matches:
+                candidate_profiles = full_matches
+            else:
+                logger.info(
+                    "reject_allocation: no bench candidate fully matches the "
+                    "manager's mandated skills %s — proposing the best partial "
+                    "match with a training path instead of an external hire.",
+                    feedback_skills,
+                )
+                candidate_profiles = partial_matches
 
-        # No bench employee (matching the manager's stated requirements) →
-        # recommend an external hire instead of forcing a poor-fit candidate.
+        # No bench employee with enough remaining hours at all → external hire.
+        # The manager's feedback is carried into the recommendation so it is
+        # never silently dropped.
         if not candidate_profiles:
             reason = (
-                f"No bench employee matches the required skills for '{role_title}'."
+                f"No bench employee with enough remaining hours matches the "
+                f"required skills for '{role_title}'."
             )
             if feedback_skills:
                 reason = (
-                    f"Manager feedback requires {', '.join(feedback_skills)}, which no "
-                    f"available bench employee possesses. External hire recommended for "
-                    f"'{role_title}'."
+                    f"Manager feedback requires {', '.join(feedback_skills)} — no "
+                    f"available bench candidate can be proposed for '{role_title}'. "
+                    f"External hire recommended."
                 )
             await self._create_hiring_recommendation(
                 demand=demand,
@@ -506,8 +526,7 @@ class HITLService:
         if bill_rate <= 0:
             bill_rate = 100.0
 
-        best = None
-        best_score = -1.0
+        scored: list = []
         for emp, profile in candidate_profiles:
             matched, missing, coverage = _match_skills(profile, scoring_skills)
 
@@ -535,15 +554,31 @@ class HITLService:
             # Weight skill coverage heavily, with a small margin tie-breaker so
             # equally-skilled candidates are ranked by financial fit.
             score = (0.85 * base) + (0.15 * min(1.0, max(0.0, margin / 100.0)))
+            scored.append((emp, profile, matched, missing, cost, margin, coverage, score))
 
-            if score > best_score:
-                best_score = score
-                best = (emp, profile, matched, missing, cost, margin)
-
-        if not best:
+        if not scored:
             return None
 
-        emp, profile, matched, missing, _cost, margin = best
+        # Align the replacement with the planner's margin discipline: prefer
+        # candidates meeting the demand's target margin, so the HITL
+        # replacement matches what a full forecast re-run would propose
+        # (previously the picker ignored the target margin and could surface a
+        # below-target candidate the manager then had to re-run to fix).
+        target_margin = float(demand.target_margin or 0.0)
+        if target_margin > 0:
+            meeting = [c for c in scored if c[5] >= target_margin]
+            pool = meeting or scored
+            if meeting and len(meeting) != len(scored):
+                logger.info(
+                    "reject_allocation: preferring %d target-margin candidate(s) "
+                    "(>= %.1f%%) for '%s'",
+                    len(meeting), target_margin, role_title,
+                )
+        else:
+            pool = scored
+        emp, profile, matched, missing, _cost, margin, _coverage, best_score = max(
+            pool, key=lambda c: c[7]
+        )
         upskilling = _build_upskilling_path(missing, role_title) if missing else None
         justification = _build_match_justification(
             f"{emp.first_name} {emp.last_name}".strip(),
@@ -556,6 +591,19 @@ class HITLService:
         )
         if feedback_text:
             justification = f"{justification} (Revised per manager feedback: \"{feedback_text}\")"
+        # Surface the feedback's mandated skills explicitly when they end up in
+        # the upskilling plan, so the manager can see the feedback was applied.
+        if feedback_skills and missing:
+            missing_lower = {m.lower() for m in missing}
+            mandated_missing = [
+                s for s in feedback_skills if s.lower() in missing_lower
+            ]
+            if mandated_missing:
+                justification = (
+                    f"{justification} Mandated skill(s) "
+                    f"{', '.join(mandated_missing)} are covered by the proposed "
+                    f"upskilling path."
+                )
 
         replacement = Allocation(
             id=uuid.uuid4(),

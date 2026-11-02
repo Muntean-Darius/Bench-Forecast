@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import List, Any, Dict, Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,6 +20,8 @@ from src.api.deps import (
 from src.database.models import (
     Allocation,
     AllocationStatusEnum,
+    HiringRecommendation,
+    HiringRecommendationStatusEnum,
     ProjectDemand,
     TrainingAssignment,
     TrainingStatusEnum,
@@ -123,6 +125,46 @@ async def approve_allocation(
         if notification.status == "queued":
             schedule_notification(notification.id, background_tasks)
     return allocation
+
+@allocations_router.post("/clear-queue", status_code=status.HTTP_200_OK)
+async def clear_pending_queue(
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_roles("admin")),
+):
+    """Admin utility: delete every pending proposal + open hiring recommendation.
+
+    Used to clear leftover demo/test rows (e.g. proposals created by an
+    interrupted test run against the live database) without having to execute
+    a full forecast. Project-scoped forecast runs deliberately only clear
+    their own scope, so stale rows on other projects otherwise linger in the
+    action queue.
+    """
+    alloc_res = await db.execute(
+        delete(Allocation).where(
+            Allocation.status.in_([
+                AllocationStatusEnum.proposed_by_ai,
+                AllocationStatusEnum.pending_manager_approval,
+            ])
+        )
+    )
+    hire_res = await db.execute(
+        delete(HiringRecommendation).where(
+            HiringRecommendation.status == HiringRecommendationStatusEnum.open
+        )
+    )
+    await db.commit()
+    logger.info(
+        "Admin %s cleared the pending queue: %d proposal(s), "
+        "%d hiring recommendation(s)",
+        user.get("id"),
+        alloc_res.rowcount,
+        hire_res.rowcount,
+    )
+    return {
+        "cleared_allocations": alloc_res.rowcount,
+        "cleared_hiring_recommendations": hire_res.rowcount,
+    }
+
 
 @allocations_router.post("/{allocation_id}/reject", response_model=AllocationPendingResponse)
 async def reject_allocation(allocation_id: uuid.UUID, payload: RejectRequest, db: AsyncSession = Depends(get_db)):
