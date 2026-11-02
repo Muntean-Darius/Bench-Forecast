@@ -143,6 +143,7 @@ export default function HITLApproval() {
 
   const [decision, setDecision] = useState<'idle' | 'approved' | 'training' | 'rejected'>('idle')
   const [feedback, setFeedback] = useState('')
+  const [replacement, setReplacement] = useState<{ name: string; training: boolean; justification: string } | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
   const [decisionStartTime] = useState<number>(Date.now())
@@ -234,6 +235,23 @@ export default function HITLApproval() {
   }, [id, proposal])
 
   const allocationId: string = state?.allocationId ?? id ?? ''
+
+  // After a rejection, the backend synchronously generates the replacement
+  // proposal (pending_manager_approval) for the same demand. Return to the
+  // queue automatically so the manager sees it — the queue refetches from the
+  // DB on mount. The old behaviour left the manager on a static popup and made
+  // it look like "nothing happened".
+  useEffect(() => {
+    if (decision !== 'rejected') return
+    // Land on the SAME project filter the manager was reviewing, so the queue
+    // does not dump every project's stale proposals on them.
+    const projectId = proposal?.project?.id
+    const projectParam = projectId
+      ? `?project_id=${encodeURIComponent(String(projectId))}`
+      : ''
+    const timer = window.setTimeout(() => navigate(`/queue${projectParam}`), 2600)
+    return () => window.clearTimeout(timer)
+  }, [decision, navigate, proposal])
 
   if (!proposal) {
     return (
@@ -332,9 +350,37 @@ export default function HITLApproval() {
             }
           }
         } else if (action === 'rejected') {
+          // Do NOT swallow errors here: if the re-selection fails, the manager
+          // must see it instead of a false "re-evaluation triggered" popup.
+          await api.rejectAllocation(allocationId, user.id, feedback, timeToDecision)
+
+          // The backend synchronously creates the replacement proposal (same
+          // demand, pending_manager_approval). Fetch it now so the manager
+          // sees immediately that the feedback was applied — no full forecast
+          // re-run required.
           try {
-            await api.rejectAllocation(allocationId, user.id, feedback, timeToDecision)
-          } catch {}
+            const pending = await api.getPendingAllocations()
+            const demandId = role?.id ? String(role.id) : ''
+            const match = pending.find((a: any) => {
+              const sameDemand =
+                demandId && a.demand_id && String(a.demand_id) === demandId
+              const notRejected = String(a.id) !== String(allocationId)
+              return sameDemand && notRejected
+            })
+            if (match) {
+              const empName = match.employee
+                ? `${match.employee.first_name || ''} ${match.employee.last_name || ''}`.trim()
+                : 'a bench employee'
+              const isTraining = Boolean(match.ai_upskilling_path)
+              setReplacement({
+                name: empName,
+                training: isTraining,
+                justification: match.ai_justification || '',
+              })
+            }
+          } catch (fetchErr) {
+            console.error('Failed to fetch replacement proposal:', fetchErr)
+          }
         }
       } else if ((action === 'approved' || action === 'training') && emp?.id) {
         try {
@@ -390,11 +436,18 @@ export default function HITLApproval() {
           <p className="text-sm text-gray-600 mt-2 max-w-lg leading-relaxed">
             {decision === 'approved'  ? `${emp.full_name} is now successfully staffed to ${project.name} as ${role.title}.` :
              decision === 'training'  ? `Training pathway initiated for ${emp.full_name}. Staffing will take effect following upskilling milestones.` :
-                                        'Rejection feedback recorded. The engine is re-selecting a candidate for this role (or will recommend an external hire if none qualifies).' }
+                                        'Rejection feedback recorded. A replacement candidate has been re-selected for this role (or an external-hire recommendation raised). Returning to the action queue…' }
           </p>
           {decision === 'rejected' && feedback && (
             <div className="mt-4 p-3 bg-gray-50 border border-gray-200 rounded text-xs text-gray-600 font-mono text-left max-w-md mx-auto">
               <strong>Manager Feedback:</strong> &ldquo;{feedback}&rdquo;
+            </div>
+          )}
+          {decision === 'rejected' && replacement && (
+            <div className="mt-4 p-3 bg-green-50 border border-green-200 rounded text-xs text-gray-700 text-left max-w-md mx-auto">
+              <strong className="text-green-800">✓ New proposal generated for this demand:</strong>{' '}
+              {replacement.name} — {replacement.training ? 'upskilling / training allocation' : 'direct allocation'}.
+              <p className="mt-1 text-[11px] text-gray-600 line-clamp-3">{replacement.justification}</p>
             </div>
           )}
         </div>

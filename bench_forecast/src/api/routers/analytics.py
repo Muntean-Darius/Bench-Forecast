@@ -122,17 +122,22 @@ def bench_burn_trend(
         last = date(year, month_index, days_in_month)
 
         bench_total = 0.0
+        has_bench_data = False
         for c in bench_rows:
             ov_start = max(c.period_start, first)
             ov_end = min(c.period_end, last)
             if ov_start <= ov_end:
+                has_bench_data = True
                 bench_total += float(c.daily_cost) * ((ov_end - ov_start).days + 1)
 
         series.append({
             "year": year,
             "month": month_index,
             "label": first.strftime("%b %Y"),
-            "total_bench_cost": round(bench_total, 2),
+            # None when no bench-cost period overlaps the month (e.g. the
+            # current month before data has rolled forward) — the frontend
+            # renders a gap instead of a misleading plunge to €0.
+            "total_bench_cost": round(bench_total, 2) if has_bench_data else None,
             "total_workforce_cost": round(workforce_daily_total * days_in_month, 2),
         })
 

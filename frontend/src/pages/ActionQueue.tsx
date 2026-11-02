@@ -2,6 +2,7 @@
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import clsx from 'clsx'
 import { api } from '../api/client'
+import { useAuth } from '../contexts/AuthContext'
 import { categoryBadge, marginColor, type ProposalCategory } from '../types'
 import type { HiringRecommendation } from '../types'
 import { format } from 'date-fns'
@@ -202,6 +203,7 @@ function allocationToProposal(a: any) {
 export default function ActionQueue() {
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
+  const { user } = useAuth()
 
   const [projects, setProjects] = useState<any[]>([])
   const [selectedProjectId, setSelectedProjectId] = useState<string>(
@@ -301,6 +303,31 @@ export default function ActionQueue() {
       setHiringRecs((prev) => prev.filter((r) => r.id !== id))
     } catch (e) {
       console.error('Failed to dismiss hiring recommendation:', e)
+    }
+  }
+
+  // Admin utility: purge every stale pending proposal + open hiring
+  // recommendation (e.g. leftovers from interrupted test runs) without
+  // executing a full forecast.
+  async function handleClearQueue() {
+    if (
+      !window.confirm(
+        'Delete ALL pending allocation proposals and open hiring recommendations? ' +
+        'This cannot be undone.'
+      )
+    ) {
+      return
+    }
+    try {
+      const res = await api.clearPendingQueue()
+      await refreshQueue()
+      window.alert(
+        `Queue cleared: ${res.cleared_allocations} proposal(s), ` +
+        `${res.cleared_hiring_recommendations} hiring recommendation(s).`
+      )
+    } catch (e) {
+      console.error('Failed to clear the pending queue:', e)
+      window.alert('Failed to clear the queue. Check the browser console.')
     }
   }
 
@@ -436,16 +463,9 @@ export default function ActionQueue() {
     <div className="p-6 flex flex-col gap-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-lg font-semibold text-gray-900">AI Action Queue</h1>
-          <p className="text-xs text-gray-500 font-mono mt-0.5">
-            Prioritized allocation proposals pending human review · Scoped per project
-          </p>
-        </div>
+        <h1 className="text-lg font-semibold text-gray-900 shrink-0">AI Action Queue</h1>
 
-        <div className="flex items-center gap-3 flex-wrap">
-          {error && <span className="text-xs text-red-600 font-mono">{error}</span>}
-
+        <div className="flex items-center gap-3">
           {/* Project Selector Dropdown */}
           <div className="flex items-center gap-2 bg-white border border-gray-300 rounded-md px-3 py-1.5 shadow-sm">
             <span className="text-xs font-mono uppercase text-gray-400 font-semibold">Project:</span>
@@ -480,27 +500,47 @@ export default function ActionQueue() {
           <button
             onClick={handleRunForecast}
             disabled={loading}
-            className="btn-primary flex items-center gap-1.5 cursor-pointer text-xs"
+            title={
+              selectedProjectObj
+                ? `Run forecast for ${selectedProjectObj.name}`
+                : 'Run forecast for all projects'
+            }
+            className="btn-primary flex items-center justify-center gap-1.5 cursor-pointer text-xs whitespace-nowrap shrink-0 min-w-[9.5rem] px-3 py-1.5"
           >
             {loading ? (
               <>
-                <SpinnerIcon className="w-3.5 h-3.5" />
-                <span>Running Forecast Agent… {runElapsed > 0 ? `(${runElapsed}s)` : ''}</span>
-              </>
-            ) : selectedProjectObj ? (
-              <>
-                <PlayIcon className="w-3 h-3 text-white" />
-                <span>Run Forecast: {selectedProjectObj.name}</span>
+                <SpinnerIcon className="w-3.5 h-3.5 animate-spin" />
+                <span>Running…</span>
               </>
             ) : (
               <>
                 <PlayIcon className="w-3 h-3 text-white" />
-                <span>Run Forecast (All Projects)</span>
+                <span>Run Forecast</span>
               </>
             )}
           </button>
+
+          {user?.role === 'admin' && (
+            <button
+              onClick={handleClearQueue}
+              disabled={loading}
+              title="Delete all stale pending proposals and hiring recommendations"
+              className="btn-ghost flex items-center gap-1.5 cursor-pointer text-xs text-red-600 border border-red-200 rounded-md px-3 py-1.5 hover:bg-red-50 whitespace-nowrap shrink-0"
+            >
+              <CloseIcon className="w-3.5 h-3.5" />
+              <span>Clear Queue</span>
+            </button>
+          )}
         </div>
       </div>
+
+      {/* Error banner — rendered outside the button row so it never shifts
+          the controls when it appears. */}
+      {error && (
+        <div className="text-xs text-red-600 font-mono bg-red-50 border border-red-200 rounded-md px-3 py-2">
+          {error}
+        </div>
+      )}
 
       {/* Summary buckets */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">

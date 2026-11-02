@@ -94,8 +94,18 @@ async def test_data_extractor_node(mock_async_session):
     
     demand_result = MagicMock()
     demand_result.scalars.return_value.all.return_value = [mock_demand]
-    
-    mock_async_session.execute.side_effect = [emp_result, demand_result]
+
+    # Extra queries added by rejection memory + skipped-demand diagnostics:
+    # (3) rejected allocations for the fetched demands, (4) all open demands
+    # for skip classification.
+    rej_result = MagicMock()
+    rej_result.scalars.return_value.all.return_value = []
+    all_dem_result = MagicMock()
+    all_dem_result.scalars.return_value.all.return_value = []
+
+    mock_async_session.execute.side_effect = [
+        emp_result, demand_result, rej_result, all_dem_result
+    ]
     
     # 2. Execute Node
     initial_state = {"horizon_days": 90, "min_win_probability": 0.75}
@@ -109,6 +119,11 @@ async def test_data_extractor_node(mock_async_session):
     assert "open_demands" in updates
     assert len(updates["open_demands"]) == 1
     assert updates["open_demands"][0]["role"] == "Backend Engineer"
+
+    # Rejection memory and skipped-demand diagnostics are always emitted.
+    assert updates["rejected_by_demand"] == {}
+    assert updates["feedback_skills_by_demand"] == {}
+    assert updates["skipped_demands"] == []
 
 
 def test_allocation_decider_node(mock_rag_pipeline, mock_llm_factory):
@@ -281,7 +296,11 @@ async def test_data_extractor_cost_fallback(mock_async_session):
     emp_res.scalars.return_value.all.return_value = [mock_emp]
     dem_res = MagicMock()
     dem_res.scalars.return_value.all.return_value = []
-    mock_async_session.execute.side_effect = [emp_res, dem_res]
+    # No fetched demands → no rejection query; the skipped-demand diagnostics
+    # query still runs (empty result).
+    all_dem_res = MagicMock()
+    all_dem_res.scalars.return_value.all.return_value = []
+    mock_async_session.execute.side_effect = [emp_res, dem_res, all_dem_res]
 
     updates = await data_extractor_node({"horizon_days": 90, "min_win_probability": 0.75})
     emp = updates["bench_employees"][0]

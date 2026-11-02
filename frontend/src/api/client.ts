@@ -52,9 +52,12 @@ async function parseError(res: Response): Promise<ApiError> {
 }
 
 // ─── Token helper ─────────────────────────────────────────────────────────────
+// Per-tab sessions: the JWT lives in sessionStorage, which is isolated per
+// browser tab. This allows several tabs to be logged in as different users at
+// the same time (a shared localStorage token would overwrite across tabs).
 
 function getToken(): string | null {
-  return localStorage.getItem('bf_token')
+  return sessionStorage.getItem('bf_token')
 }
 
 // ─── Core request wrapper ─────────────────────────────────────────────────────
@@ -242,6 +245,12 @@ export const api = {
   getPendingAllocations: () =>
     request<any[]>('/allocations/pending'),
 
+  clearPendingQueue: () =>
+    request<{ cleared_allocations: number; cleared_hiring_recommendations: number }>(
+      '/allocations/clear-queue',
+      { method: 'POST' }
+    ),
+
   approveAllocation: (allocationId: string, reviewerId: string, timeToDecision: number) =>
     request<any>(`/allocations/${allocationId}/approve`, {
       method: 'POST',
@@ -428,5 +437,5 @@ export const api = {
 
   // -- Forecast SSE stream URL -------------------------------------------------
   getForecastStreamUrl: (runId: string) =>
-    `${BASE}/forecast/runs/${runId}/stream?token=${encodeURIComponent(localStorage.getItem('bf_token') || '')}`,
+    `${BASE}/forecast/runs/${runId}/stream?token=${encodeURIComponent(getToken() || '')}`,
 }

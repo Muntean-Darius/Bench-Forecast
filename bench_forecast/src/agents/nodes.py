@@ -742,9 +742,16 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
             employees_db = emp_res.scalars().all()
 
             employees = []
+            hidden_by_reservations: List[str] = []
             for emp in employees_db:
                 remaining_hours = emp.remaining_daily_hours
                 if remaining_hours <= 0:
+                    # Fully booked by committed/reserved allocations — log WHO
+                    # is hidden so "why did this demand flip to external hire?"
+                    # questions are self-answering in the logs.
+                    hidden_by_reservations.append(
+                        f"{emp.first_name} {emp.last_name}".strip()
+                    )
                     continue
                 # Resolve seniority
                 sen = "Mid"
@@ -862,6 +869,95 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
                 
                 demands.append(dem_dict)
 
+            fetched_ids = {d.id for d in demands_db}
+
+            # Rejection memory: candidates a manager rejected for a specific
+            # demand (with optional feedback-mandated skills) are excluded from
+            # future plans for that demand. This is what makes "Reject & Re-run
+            # AI" produce a *different* proposal on the next forecast run.
+            rejected_by_demand: Dict[str, List[str]] = {}
+            feedback_skills_by_demand: Dict[str, List[str]] = {}
+            if demands_db:
+                rej_stmt = select(Allocation).where(
+                    Allocation.demand_id.in_(fetched_ids),
+                    Allocation.status == AllocationStatusEnum.rejected_by_manager,
+                )
+                rej_res = await db.execute(rej_stmt)
+                for a in rej_res.scalars().all():
+                    key = str(a.demand_id)
+                    emp_ids = rejected_by_demand.setdefault(key, [])
+                    if str(a.employee_id) not in emp_ids:
+                        emp_ids.append(str(a.employee_id))
+                    mandated = _extract_skills_from_text(a.manager_notes or "")
+                    if mandated:
+                        fb = feedback_skills_by_demand.setdefault(key, [])
+                        for skill in mandated:
+                            if skill.lower() not in {s.lower() for s in fb}:
+                                fb.append(skill)
+                if rejected_by_demand:
+                    logger.info(
+                        "data_extractor_node: rejection memory loaded — %d demand(s) "
+                        "have previously rejected candidates",
+                        len(rejected_by_demand),
+                    )
+
+            # Surface WHY other open demands were not planned (visibility for
+            # the "project has open demands but no proposals" question).
+            skipped: List[Dict[str, Any]] = []
+            all_dem_stmt = (
+                select(ProjectDemand)
+                .options(selectinload(ProjectDemand.project))
+                .where(
+                    ProjectDemand.status.in_([
+                        DemandStatusEnum.open,
+                        DemandStatusEnum.partially_filled,
+                    ])
+                )
+            )
+            if target_project_id:
+                try:
+                    all_dem_stmt = all_dem_stmt.where(
+                        ProjectDemand.project_id == uuid.UUID(target_project_id)
+                    )
+                except ValueError:
+                    pass
+            all_demands = (await db.execute(all_dem_stmt)).scalars().all()
+            for d in all_demands:
+                if d.id in fetched_ids:
+                    continue
+                proj = d.project
+                if d.win_probability is not None and d.win_probability < min_win_prob:
+                    reason = (
+                        f"win probability {float(d.win_probability):.0%} below "
+                        f"threshold {min_win_prob:.0%}"
+                    )
+                elif d.needed_by_date is not None and d.needed_by_date > cutoff:
+                    reason = "needed_by_date beyond forecast horizon"
+                else:
+                    reason = "excluded by scope or status filters"
+                skipped.append({
+                    "demand_id": str(d.id),
+                    "role": d.role,
+                    "project": proj.name if proj else None,
+                    "reason": reason,
+                })
+            if skipped:
+                logger.info(
+                    "data_extractor_node: %d open demand(s) skipped — %s",
+                    len(skipped),
+                    "; ".join(
+                        f"{s.get('role')} [{s.get('reason')}]" for s in skipped
+                    ),
+                )
+
+            if hidden_by_reservations:
+                logger.info(
+                    "data_extractor_node: %d employee(s) hidden by fully "
+                    "committed/reserved capacity: %s",
+                    len(hidden_by_reservations),
+                    ", ".join(hidden_by_reservations),
+                )
+
             logger.info(
                 f"data_extractor_node: fetched {len(employees)} employees "
                 f"(horizon={horizon_days}d), {len(demands)} demands (p>={min_win_prob:.0%})"
@@ -873,6 +969,9 @@ async def data_extractor_node(state: State) -> Dict[str, Any]:
     updates = {
         "bench_employees": employees,
         "open_demands": demands,
+        "rejected_by_demand": rejected_by_demand,
+        "feedback_skills_by_demand": feedback_skills_by_demand,
+        "skipped_demands": skipped,
         "revision_count": state.get("revision_count", 0),
         "rejection_feedback": state.get("rejection_feedback", None),
     }
@@ -1121,8 +1220,31 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 role_title, role_description, bench_employees
             )
 
+        # Rejection memory (see data_extractor_node): never re-propose an
+        # employee the manager already rejected for THIS demand, and treat
+        # skills named in the rejection feedback as hard requirements.
+        demand_id_str = demand.get("id", "")
+        reject_exclude: set = set(
+            state.get("rejected_by_demand", {}).get(demand_id_str, []) or []
+        )
+        feedback_skills = _normalize_skill_list(
+            state.get("feedback_skills_by_demand", {}).get(demand_id_str, []) or []
+        )
+        if feedback_skills:
+            req_lower = {s.lower() for s in required_skills}
+            for skill in feedback_skills:
+                if skill.lower() not in req_lower:
+                    required_skills.append(skill)
+                    req_lower.add(skill.lower())
+        if reject_exclude:
+            logger.info(
+                f"allocation_decider: '{role_title}' excluding {len(reject_exclude)} "
+                f"previously rejected candidate(s)."
+            )
+
         unallocated_bench_ids = [
-            b for b in bench_ids if _has_hours(b, demand_hours)
+            b for b in bench_ids
+            if _has_hours(b, demand_hours) and b not in reject_exclude
         ]
 
         if not unallocated_bench_ids and bench_ids:
@@ -1231,6 +1353,14 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                         f"Augmenting '{role_title}': skipped {skipped_unprofitable} "
                         f"candidate(s) below the {_MIN_ACCEPTABLE_MARGIN:.1f}% margin floor."
                     )
+
+        # Defense in depth: drop any rejected employee that survived retrieval
+        # or augmentation (the $in filter already excluded them upstream).
+        if reject_exclude:
+            candidates = [
+                c for c in candidates
+                if str(c.get("employee_id") or c.get("id")) not in reject_exclude
+            ]
 
         logger.info(
             f"  Viable bench candidates for '{role_title}': {len(candidates)} candidate(s)"
@@ -1342,7 +1472,16 @@ def allocation_decider_node(state: State) -> Dict[str, Any]:
                 "action_type": "hire",
                 "employee_id": None,
                 "projected_margin": 0.0,
-                "justification": f"No available bench candidate meets both technical and financial criteria for '{role_title}'. External hire recommended.",
+                "justification": (
+                    f"No available bench candidate meets both technical and "
+                    f"financial criteria for '{role_title}'"
+                    + (
+                        f" ({len(reject_exclude)} candidate(s) previously "
+                        f"rejected by management are excluded)"
+                        if reject_exclude else ""
+                    )
+                    + ". External hire recommended."
+                ),
                 "upskilling_path": None,
                 "role_id": demand.get("id", ""),
                 "role_title": role_title,
